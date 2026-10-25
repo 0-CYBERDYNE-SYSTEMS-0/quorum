@@ -1467,6 +1467,28 @@ export async function getExpertResponse(
  * that is likely dead on fresh installs. Whitespace-only values count as
  * empty; the returned slug is trimmed.
  */
+/**
+ * Auxiliary calls (routing, insights, closing memo) must be usable by every
+ * tier. A paid DEFAULT_AUX_MODEL would otherwise make the moderator fail for
+ * free accounts with "upgrade to Pro". Downgrade to the free budget model for
+ * non-paid tiers instead of surfacing an upgrade error mid-session.
+ */
+export async function resolveAuxModelForUser(
+  moderatorModel: string | null | undefined,
+  firstExpertModel: string | null | undefined,
+  userId?: number,
+): Promise<string | null> {
+  const model = resolveAuxModel(moderatorModel, firstExpertModel);
+  if (!model || model.endsWith(":free") || !userId) return model;
+  try {
+    const user = await storage.getUser(userId);
+    if (user && user.tier !== "pro" && user.tier !== "enterprise") return BUDGET_FALLBACK_MODEL;
+  } catch (error) {
+    console.warn("[AUX] could not resolve user tier; keeping configured aux model:", (error as Error).message);
+  }
+  return model;
+}
+
 export function resolveAuxModel(
   moderatorModel: string | null | undefined,
   firstExpertModel: string | null | undefined
@@ -1561,13 +1583,13 @@ export async function generateInsights(conversationId: number, broadcastFn?: (co
     const experts = await storage.getConversationExperts(conversationId);
     const moderatorExpert = experts.find(e => e.role === 'Moderator') ?? null;
     const firstExpertModel = experts.find(e => e.role !== 'Moderator')?.model ?? null;
-    const auxModel = resolveAuxModel(moderatorExpert?.model ?? null, firstExpertModel);
+    const conversation = await storage.getConversation(conversationId);
+    const auxModel = await resolveAuxModelForUser(moderatorExpert?.model ?? null, firstExpertModel, conversation?.userId);
     if (!auxModel) {
       console.error(`generateInsights: no aux model could be resolved for conversation ${conversationId} (no Moderator model, DEFAULT_AUX_MODEL unset, roster empty) — skipping insights.`);
       return;
     }
 
-    const conversation = await storage.getConversation(conversationId);
     const response = await callOpenRouterAPI([
       { role: "system", content: "You extract key insights from business board discussions. Respond only with the requested JSON format." },
       { role: "user", content: insightPrompt }
@@ -1677,7 +1699,7 @@ export async function getModeratorNextSpeakerSuggestion(
         // the orchestrator falls back to round-robin.
         const experts = await storage.getConversationExperts(moderatorExpert.conversationId);
         const firstExpertModel = experts.find(expert => expert.role !== "Moderator")?.model ?? null;
-        const auxModel = resolveAuxModel(moderatorExpert.model, firstExpertModel);
+        const auxModel = await resolveAuxModelForUser(moderatorExpert.model, firstExpertModel, conversation?.userId);
         if (!auxModel) {
             console.error("getModeratorNextSpeakerSuggestion: no aux model could be resolved (Moderator has no model, DEFAULT_AUX_MODEL unset, roster empty) — falling back to round-robin.");
             return null;
@@ -1760,7 +1782,7 @@ export async function generateClosingSynthesis(
     }
     const systemPrompt = generateSystemPrompt(moderatorExpert, availableRoles, companyProfile, charter);
     const firstExpertModel = experts.find(expert => expert.role !== "Moderator")?.model ?? null;
-    const closingModel = resolveAuxModel(moderatorExpert.model, firstExpertModel);
+    const closingModel = await resolveAuxModelForUser(moderatorExpert.model, firstExpertModel, conversation?.userId);
 
     const closingPrompt = buildClosingSynthesisPrompt(stanceLedger, openQuestions, charter);
 
