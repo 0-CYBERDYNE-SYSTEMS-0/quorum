@@ -17,10 +17,11 @@ import {
   Users,
 } from "lucide-react";
 import { useAuth } from "@/hooks/use-auth";
+import { useToast } from "@/hooks/use-toast";
 import { useBoardRoom } from "@/hooks/use-board-room";
 import { useTheme } from "@/lib/theme";
 import { apiRequest } from "@/lib/queryClient";
-import { EXPERT_CATALOG } from "@shared/expert-catalog";
+import { EXPERT_CATALOG, TIER_EXPERT_LIMITS } from "@shared/expert-catalog";
 import { BoardModal } from "@/components/board/board-modal";
 import { CharterModal } from "@/components/board/charter-modal";
 import { CompanyModal } from "@/components/board/company-modal";
@@ -62,7 +63,7 @@ function EmptyBoard({
             autoFocus
             value={decision}
             onChange={(event) => setDecision(event.target.value)}
-            placeholder="Should we retire the self-serve tier and move upmarket in Q1? Guardrails: gross margin ≥ 70%, no new headcount before March, keep the PLG funnel for mid-market."
+            placeholder="State the decision in one or two sentences. Add the guardrails that constrain it, and the facts the board should not have to guess."
             className="min-h-[104px] border-0 bg-transparent px-2 py-1 font-display text-[17px] leading-relaxed shadow-none focus:ring-0"
           />
           <div className="flex flex-wrap items-center justify-between gap-3 border-t border-line px-2 pt-3">
@@ -79,14 +80,17 @@ function EmptyBoard({
         <div className="mt-6">
           <div className="flex items-center justify-between">
             <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-faint-ink">Choose a starting board</p>
-            <button
-              type="button"
-              onClick={() => onConvene(decision, "empty")}
-              disabled={!decision.trim() || isCreating}
-              className="text-[10.5px] text-faint-ink hover:text-ink disabled:opacity-40"
-            >
-              Seat them manually →
-            </button>
+            <div className="flex items-center gap-3">
+              <span className="hidden text-[10px] text-faint-ink sm:inline">Associate seats 3 · Executive 8</span>
+              <button
+                type="button"
+                onClick={() => onConvene(decision, "empty")}
+                disabled={!decision.trim() || isCreating}
+                className="text-[10.5px] text-faint-ink hover:text-ink disabled:opacity-40"
+              >
+                Seat them manually →
+              </button>
+            </div>
           </div>
           <div className="mt-2 grid gap-2 sm:grid-cols-2">
             {BOARD_PRESETS.map((preset) => (
@@ -110,6 +114,13 @@ function EmptyBoard({
             ))}
           </div>
         </div>
+
+        <div className="mt-10 flex flex-wrap items-center gap-x-6 gap-y-2 border-t border-line pt-4 text-[10px] uppercase tracking-[0.14em] text-faint-ink">
+          <span>Private workspace</span>
+          <span>Your model keys</span>
+          <span>Export always</span>
+          <span className="ml-auto normal-case tracking-normal">Three seats on the house, no card.</span>
+        </div>
       </div>
     </div>
   );
@@ -130,6 +141,12 @@ function SessionIntro({
   onEditCharter: () => void;
   onOpenBoard: () => void;
 }) {
+  // The masthead already states the motion. Show only the charter text that
+  // adds to it (guardrails, stop criteria) instead of repeating the question.
+  const charterRemainder = charter
+    ? (charter.startsWith(title) ? charter.slice(title.length) : charter).replace(/^[\s—–:,-]+/, "").trim()
+    : "";
+
   return (
     <div className="border-b border-line pb-7 pt-9">
       <div className="flex items-center justify-between gap-3">
@@ -141,11 +158,11 @@ function SessionIntro({
       <h1 className="mt-3 font-display text-[clamp(1.8rem,3.2vw,2.6rem)] leading-[1.08] text-ink">
         {title}
       </h1>
-      {charter ? (
+      {charterRemainder ? (
         <div className="mt-4 border-l-2 border-bronze/50 pl-4">
-          <p className="whitespace-pre-wrap text-[13.5px] leading-relaxed text-ink-soft">{charter}</p>
+          <p className="whitespace-pre-wrap text-[13.5px] leading-relaxed text-ink-soft">{charterRemainder}</p>
         </div>
-      ) : (
+      ) : !charter ? (
         <button
           type="button"
           onClick={onEditCharter}
@@ -154,7 +171,7 @@ function SessionIntro({
           This session has no charter. Write the motion and the guardrails so every director argues
           the same question.
         </button>
-      )}
+      ) : null}
       <div className="mt-5 flex flex-wrap items-center gap-2">
         <button
           type="button"
@@ -272,6 +289,7 @@ function CommandPalette({
 
 export default function WorkspacePage() {
   const { user, isLoading, logoutMutation } = useAuth();
+  const { toast } = useToast();
   const board = useBoardRoom();
   const { theme, setTheme } = useTheme();
   const queryClient = useQueryClient();
@@ -340,21 +358,28 @@ export default function WorkspacePage() {
     if (!text) return;
     setConvening(true);
     try {
-      const title = text.length > 72 ? `${text.slice(0, 69).trimEnd()}…` : text;
+      const firstSentence = text.split(/(?<=[?.!])\s/)[0] || text;
+      const title = firstSentence.length > 140 ? `${firstSentence.slice(0, 137).trimEnd()}…` : text;
       const conversation = await board.startSession(title);
       await apiRequest("PUT", `/api/protected/conversations/${conversation.id}`, { charter: text });
       const preset = BOARD_PRESETS.find((item) => item.id === presetId);
+      // A preset can list more seats than the plan allows. Seat the first N
+      // that fit; the Chair can swap seats in Board settings afterwards.
+      const seatLimit = TIER_EXPERT_LIMITS[(user?.tier as keyof typeof TIER_EXPERT_LIMITS) ?? "free"] ?? TIER_EXPERT_LIMITS.free;
       const seats = (preset?.roles ?? [])
         .map((role) => EXPERT_CATALOG.find((entry) => entry.role === role))
         .filter((entry): entry is (typeof EXPERT_CATALOG)[number] => !!entry)
+        .slice(0, seatLimit)
         .map((entry) => ({
           name: entry.role,
           role: entry.role,
           model: entry.defaultModel,
           avatarUrl: entry.color,
         }));
-      if (seats.length > 0) {
-        await board.seatExperts(seats);
+      // Seat directly against the new id: React state for activeConversation
+      // has not committed yet inside this handler.
+      for (const seat of seats) {
+        await apiRequest("POST", `/api/protected/conversations/${conversation.id}/experts`, seat);
       }
       await queryClient.invalidateQueries({ queryKey: ["/api/protected/conversations"] });
       if (!preset) setBoardOpen(true);
@@ -363,8 +388,15 @@ export default function WorkspacePage() {
           content: text,
           userId: user.id,
         });
-        board.invalidateConversation(conversation.id);
       }
+      board.selectConversation(conversation.id);
+      board.invalidateConversation(conversation.id);
+    } catch (error) {
+      toast({
+        title: "Could not convene the board",
+        description: error instanceof Error ? error.message : "Unknown error",
+        variant: "destructive",
+      });
     } finally {
       setConvening(false);
     }

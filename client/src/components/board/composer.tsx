@@ -97,8 +97,7 @@ export function Composer({
   };
 
   return (
-    <div className="relative px-4 pb-4 pt-2 sm:px-8 sm:pb-6">
-      <div className="pointer-events-none absolute inset-x-0 -top-7 h-7 bg-gradient-to-t from-paper to-transparent" />
+    <div className="relative border-t border-line bg-paper px-4 pb-4 pt-3 sm:px-8 sm:pb-6">
       {suggestions.length > 0 && (
         <div className="absolute bottom-[calc(100%-4px)] left-4 z-30 w-72 overflow-hidden rounded-lg border border-line bg-surface shadow-lifted sm:left-8">
           <p className="border-b border-line px-3 py-1.5 text-[10px] font-medium uppercase tracking-[0.12em] text-faint-ink">
