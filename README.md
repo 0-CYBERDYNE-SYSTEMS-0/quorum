@@ -99,6 +99,9 @@ docker compose up -d --build
 **Replit** — the repo ships a `.replit` configuration for a Reserved VM or Autoscale deployment.
 See [docs/DEPLOY.md](docs/DEPLOY.md) for the exact secrets, build command, and health check.
 
+**Render** — `render.yaml` is a one-click blueprint (web service + managed Postgres). Set
+`OPENROUTER_API_KEY` and `ALLOWED_ORIGIN`; the rest is generated.
+
 **Any Node host** — `npm run build && npm start` serves the API and the built client from one port.
 
 ## Architecture
