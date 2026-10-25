@@ -1,0 +1,22 @@
+run = "npm run dev"
+entrypoint = "server/index.ts"
+modules = ["nodejs-24"]
+
+[nix]
+channel = "stable-24_05"
+
+[[ports]]
+localPort = 5001
+externalPort = 80
+
+[env]
+PORT = "5001"
+
+[deployment]
+build = ["sh", "-c", "npm ci && npm run build"]
+run = ["sh", "-c", "node scripts/migrate.mjs && npm start"]
+deploymentTarget = "cloudrun"
+
+[[deployment.ports]]
+localPort = 5001
+externalPort = 80

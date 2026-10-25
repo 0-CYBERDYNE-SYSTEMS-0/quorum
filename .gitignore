@@ -1,0 +1,16 @@
+node_modules
+dist
+.DS_Store
+server/public
+vite.config.ts.*
+*.tar.gz
+.local/
+uploads/
+.env
+.env.*
+!.env.example
+!.env.production.example
+cookies.txt
+jev-audit/
+videos/
+*.tsbuildinfo

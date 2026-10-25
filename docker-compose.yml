@@ -1,0 +1,71 @@
+# Quorum — self-hosted stack: app + PostgreSQL (+ optional Ollama profile)
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: quorum-app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "5001:5001"
+    env_file:
+      - .env.production
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-quorum}:${POSTGRES_PASSWORD:-quorum}@db:5432/${POSTGRES_DB:-quorum}
+    volumes:
+      - ./uploads:/app/uploads
+    networks:
+      - quorum-net
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:5001/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  db:
+    image: postgres:16-alpine
+    container_name: quorum-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-quorum}
+      POSTGRES_USER: ${POSTGRES_USER:-quorum}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quorum}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - quorum-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-quorum} -d ${POSTGRES_DB:-quorum}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Optional: run a local OpenAI-compatible model for directors.
+  #   docker compose --profile ollama up -d
+  # then set LOCAL_AI_BASE_URL=http://ollama:11434/v1 in .env.production
+  ollama:
+    image: ollama/ollama:latest
+    container_name: quorum-ollama
+    restart: unless-stopped
+    profiles:
+      - ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - quorum-net
+
+volumes:
+  pgdata:
+  ollama_data:
+
+networks:
+  quorum-net:
+    driver: bridge

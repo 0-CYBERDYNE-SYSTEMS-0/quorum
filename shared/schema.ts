@@ -1,0 +1,297 @@
+import { pgTable, pgEnum, text, serial, integer, boolean, timestamp, json, jsonb, uniqueIndex, primaryKey, doublePrecision, type AnyPgColumn } from "drizzle-orm/pg-core";
+import { createInsertSchema } from "drizzle-zod";
+import { sql } from "drizzle-orm";
+import { z } from "zod";
+
+export const users = pgTable("users", {
+  id: serial("id").primaryKey(),
+  username: text("username").notNull().unique(),
+  password: text("password").notNull(),
+  email: text("email").notNull(),
+  tier: text("tier").default("free"),
+  stripeCustomerId: text("stripe_customer_id"),
+  stripeSubscriptionId: text("stripe_subscription_id"),
+  subscriptionStatus: text("subscription_status").default("inactive"),
+  openRouterKey: text("open_router_key"),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+// Pricing caps: one row per user per UTC calendar month ("YYYY-MM").
+// messageCount = Chair messages; aiSpendUsd = house-key OpenRouter cost.
+export const usageMonthly = pgTable("usage_monthly", {
+  userId: integer("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  period: text("period").notNull(),
+  messageCount: integer("message_count").notNull().default(0),
+  aiSpendUsd: doublePrecision("ai_spend_usd").notNull().default(0),
+}, (table) => ({
+  pk: primaryKey({ columns: [table.userId, table.period] }),
+}));
+
+export type UsageMonthly = typeof usageMonthly.$inferSelect;
+
+// G7: minimal orchestrator snapshot persisted per turn boundary so a server
+// restart can recover honest state — dead loops (processing_*/autonomous)
+// recover to idle; paused restores paused. Never written per token.
+export interface OrchestratorSnapshot {
+  mode: "idle" | "processing_sequential" | "paused" | "autonomous";
+  currentExpertIndex: number;
+  totalAutonomousTurnsTaken: number;
+  wasInterrupted: boolean;
+  pausedFromMode: string | null;
+  isAutonomousEnabled?: boolean;
+  maxAutonomousTurns?: number;
+  sequenceFileCreatorRequestId?: number | null;
+}
+
+export const openQuestionStatus = pgEnum("open_question_status", ["open", "answered"]);
+
+export const conversations = pgTable("conversations", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id").notNull().references(() => users.id),
+  title: text("title").default("New board session"),
+  // G6: Chair-authored board charter (goal, depth, stop criteria) that
+  // governs the whole board — injected into every director, Moderator,
+  // and synthesis prompt. Nullable: optional. Hard-capped at 2,000 chars
+  // on write (API-level).
+  charter: text("charter"),
+  // G7: last known orchestrator state, written at turn boundaries only.
+  orchestratorState: jsonb("orchestrator_state").$type<OrchestratorSnapshot>(),
+  // G13: optional maximum number of turns for the next autonomous run.
+  // Nullable disables the cap; new conversations default to 25 turns.
+  turnBudget: integer("turn_budget").default(25),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+export const experts = pgTable("experts", {
+  id: serial("id").primaryKey(),
+  conversationId: integer("conversation_id").notNull().references(() => conversations.id),
+  name: text("name").notNull(),
+  role: text("role").notNull(),
+  model: text("model").notNull(),
+  systemPrompt: text("system_prompt").notNull(),
+  customInstructions: text("custom_instructions"),
+  avatarUrl: text("avatar_url"),
+});
+
+export type MessageStance = {
+  stance: "agree" | "disagree" | "conditional" | "abstain";
+  confidence: 1 | 2 | 3 | 4 | 5;
+  position: string;
+};
+
+export const messages = pgTable("messages", {
+  id: serial("id").primaryKey(),
+  conversationId: integer("conversation_id").notNull().references(() => conversations.id),
+  expertId: integer("expert_id").references(() => experts.id),
+  userId: integer("user_id").references(() => users.id),
+  content: text("content").notNull(),
+  role: text("role").notNull(),
+  expertName: text("expert_name"),
+  expertRole: text("expert_role"),
+  artifacts: json("artifacts").default([]),
+  // G4: roles @-tagged in this message, parsed once on creation (user
+  // messages in routes.ts, expert messages in ai.ts) and routed on by the
+  // orchestrator. Nullable: legacy rows have no value.
+  mentions: jsonb("mentions").$type<string[]>(),
+  // G5: true for the Moderator's closing synthesis message that ends a
+  // roundtable ('Conclude'). Nullable: legacy rows have no value.
+  isSynthesis: boolean("is_synthesis"),
+  // G12: links a Chair answer to the open question it resolves.
+  answersQuestionId: integer("answers_question_id").references((): AnyPgColumn => openQuestions.id),
+  // G15: latest structured expert stance. Nullable for non-expert/legacy rows.
+  stance: jsonb("stance").$type<MessageStance>(),
+  timestamp: timestamp("timestamp").defaultNow(),
+});
+
+// G12: durable ledger of explicit questions raised by experts. The message
+// and answer links preserve provenance while the unique key makes repeated
+// parsing of the same message idempotent.
+export const openQuestions = pgTable("open_questions", {
+  id: serial("id").primaryKey(),
+  conversationId: integer("conversation_id").notNull().references(() => conversations.id),
+  messageId: integer("message_id").notNull().references(() => messages.id),
+  expertRole: text("expert_role").notNull(),
+  question: text("question").notNull(),
+  assumption: text("assumption"),
+  status: openQuestionStatus("status").notNull().default("open"),
+  answerMessageId: integer("answer_message_id").references(() => messages.id),
+  createdAt: timestamp("created_at").defaultNow(),
+}, (table) => ({
+  messageQuestionUnique: uniqueIndex("open_questions_message_question_unique").on(table.messageId, table.question),
+}));
+
+export const files = pgTable("files", {
+  id: serial("id").primaryKey(),
+  conversationId: integer("conversation_id").notNull().references(() => conversations.id),
+  filename: text("filename").notNull(),
+  fileUrl: text("file_url").notNull(),
+  fileType: text("file_type").notNull(),
+  uploadedBy: text("uploaded_by").notNull(),
+  // Generated deliverables use a server-owned identity across revisions.
+  // Legacy uploads and files remain unversioned when these values are null.
+  deliverableId: text("deliverable_id"),
+  generationRequestId: text("generation_request_id"),
+  version: integer("version"),
+  supersedesFileId: integer("supersedes_file_id").references((): AnyPgColumn => files.id),
+  supersededAt: timestamp("superseded_at"),
+  uploadedAt: timestamp("uploaded_at").defaultNow(),
+}, (table) => ({
+  generationRequestUnique: uniqueIndex("files_generation_request_unique")
+    .on(table.conversationId, table.generationRequestId)
+    .where(sql`${table.generationRequestId} is not null`),
+  deliverableVersionUnique: uniqueIndex("files_deliverable_version_unique")
+    .on(table.conversationId, table.deliverableId, table.version)
+    .where(sql`${table.deliverableId} is not null and ${table.version} is not null`),
+  currentDeliverableUnique: uniqueIndex("files_current_deliverable_unique")
+    .on(table.conversationId, table.deliverableId)
+    .where(sql`${table.deliverableId} is not null and ${table.supersededAt} is null`),
+}));
+
+export const insights = pgTable("insights", {
+  id: serial("id").primaryKey(),
+  conversationId: integer("conversation_id").notNull().references(() => conversations.id),
+  title: text("title").notNull(),
+  points: text("points").notNull().array(),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+export const companyProfiles = pgTable("company_profiles", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id").notNull().unique().references(() => users.id),
+  companyName: text("company_name").notNull().default("My Company"),
+  industry: text("industry").notNull().default(""),
+  stage: text("stage").notNull().default(""),
+  headcount: text("headcount").notNull().default(""),
+  revenueBand: text("revenue_band").notNull().default(""),
+  businessModel: text("business_model").notNull().default(""),
+  markets: text("markets").array().default([]),
+  constraints: text("constraints").notNull().default(""),
+  riskAppetite: text("risk_appetite").notNull().default("balanced"),
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
+});
+
+// Artifact type definition
+export const artifactSchema = z.object({
+  type: z.enum(["html", "json", "table", "chart", "code"]),
+  title: z.string(),
+  content: z.string(),
+  language: z.string().optional(),
+});
+
+export type Artifact = z.infer<typeof artifactSchema>;
+
+// Schemas
+export const insertUserSchema = createInsertSchema(users, {
+  tier: z.enum(["free", "pro", "enterprise"]).optional(),
+}).omit({
+  id: true,
+  stripeCustomerId: true,
+  stripeSubscriptionId: true,
+  subscriptionStatus: true,
+  openRouterKey: true,
+  createdAt: true,
+});
+
+export const insertConversationSchema = createInsertSchema(conversations).omit({
+  id: true,
+  createdAt: true,
+});
+
+export const insertExpertSchema = createInsertSchema(experts).omit({
+  id: true,
+});
+
+export const insertMessageSchema = createInsertSchema(messages).omit({
+  id: true,
+  timestamp: true,
+});
+
+export const insertFileSchema = createInsertSchema(files).omit({
+  id: true,
+  uploadedAt: true,
+});
+
+export const insertInsightSchema = createInsertSchema(insights).omit({
+  id: true,
+  createdAt: true,
+});
+
+export const insertOpenQuestionSchema = createInsertSchema(openQuestions, {
+  status: z.enum(["open", "answered"]).optional(),
+}).omit({
+  id: true,
+  createdAt: true,
+});
+
+export const insertCompanyProfileSchema = createInsertSchema(companyProfiles).omit({
+  id: true,
+  createdAt: true,
+  updatedAt: true,
+});
+
+// Types
+export type InsertUser = z.infer<typeof insertUserSchema>;
+export type User = typeof users.$inferSelect;
+
+export type InsertConversation = z.infer<typeof insertConversationSchema>;
+export type Conversation = typeof conversations.$inferSelect;
+
+export type InsertExpert = z.infer<typeof insertExpertSchema>;
+export type Expert = typeof experts.$inferSelect;
+
+// drizzle-zod's inferred jsonb shape does not line up with the column's
+// $type<string[]> on the insert path — pin mentions to the canonical type.
+export type InsertMessage = Omit<z.infer<typeof insertMessageSchema>, 'mentions' | 'isSynthesis' | 'stance'> & {
+  mentions?: string[] | null;
+  // G5: pinned like mentions so object literals can omit the nullable flag.
+  isSynthesis?: boolean | null;
+  // G15: pin the nullable JSON stance type for object literals.
+  stance?: MessageStance | null;
+};
+// Extend Message type to properly type artifacts as Artifact[]
+// (and keep the nullable G4/G5 columns optional for object literals)
+export type Message = Omit<typeof messages.$inferSelect, 'artifacts' | 'mentions' | 'isSynthesis' | 'answersQuestionId' | 'stance'> & {
+  artifacts?: Artifact[];
+  mentions?: string[] | null;
+  isSynthesis?: boolean | null;
+  answersQuestionId?: number | null;
+  stance?: MessageStance | null;
+};
+
+export type InsertFile = z.infer<typeof insertFileSchema>;
+export type File = Omit<typeof files.$inferSelect, "deliverableId" | "generationRequestId" | "version" | "supersedesFileId" | "supersededAt"> & {
+  deliverableId?: string | null;
+  generationRequestId?: string | null;
+  version?: number | null;
+  supersedesFileId?: number | null;
+  supersededAt?: Date | null;
+};
+
+export type DeliverableGenerationRequest = {
+  deliverableId: string;
+  generationRequestId: string;
+  mode: "create" | "revise";
+  expectedCurrentFileId?: number;
+  constraints: {
+    format?: string;
+    maxCharacters?: number;
+    requiredSections?: string[];
+    taskCount?: number;
+    datedTasks?: boolean;
+  };
+};
+
+export type SaveDeliverableVersionResult = {
+  file: File;
+  created: boolean;
+};
+
+export type InsertInsight = z.infer<typeof insertInsightSchema>;
+export type Insight = typeof insights.$inferSelect;
+
+export type InsertOpenQuestion = z.infer<typeof insertOpenQuestionSchema>;
+export type OpenQuestion = typeof openQuestions.$inferSelect;
+
+export type InsertCompanyProfile = z.infer<typeof insertCompanyProfileSchema>;
+export type CompanyProfile = typeof companyProfiles.$inferSelect;

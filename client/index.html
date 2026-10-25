@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Quorum — The AI boardroom for consequential decisions</title>
+    <meta
+      name="description"
+      content="Quorum seats a board of AI directors — finance, strategy, legal, operations — who deliberate in rounds, disagree on the record, and hand you a decision memo you can circulate."
+    />
+    <meta name="theme-color" content="#FAF7F1" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#0F1216" media="(prefers-color-scheme: dark)" />
+    <meta property="og:title" content="Quorum — The AI boardroom" />
+    <meta
+      property="og:description"
+      content="Convene a board of AI directors for the decisions that matter. Deliberation, dissent, and a decision memo."
+    />
+    <meta property="og:type" content="website" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <script>
+      // Apply the saved theme before first paint (see src/lib/theme.ts).
+      try {
+        var theme = localStorage.getItem("qTheme") || "system";
+        if (theme === "dark" || (theme === "system" && matchMedia("(prefers-color-scheme: dark)").matches)) {
+          document.documentElement.classList.add("dark");
+        }
+      } catch (e) {}
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --font-sans: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        --font-display: "Instrument Serif", "Iowan Old Style", Georgia, Cambria, serif;
+        --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

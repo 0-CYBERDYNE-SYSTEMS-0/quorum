@@ -1,0 +1,25 @@
+{
+  "enabled": true,
+  "experts": [
+    {
+      "name": "Chief Strategy Officer",
+      "role": "Chief Strategy Officer",
+      "model": "poolside/laguna-s-2.1:free"
+    },
+    {
+      "name": "Chief Financial Officer",
+      "role": "Chief Financial Officer",
+      "model": "poolside/laguna-s-2.1:free"
+    },
+    {
+      "name": "Chief Revenue Officer",
+      "role": "Chief Revenue Officer",
+      "model": "poolside/laguna-s-2.1:free"
+    },
+    {
+      "name": "General Counsel",
+      "role": "General Counsel",
+      "model": "poolside/laguna-s-2.1:free"
+    }
+  ]
+}

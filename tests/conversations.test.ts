@@ -1,0 +1,1745 @@
+/**
+ * Conversations & Expert Flow End-to-End Tests
+ *
+ * Covers:
+ *  - Create conversation (POST /api/protected/conversations)
+ *  - List conversations (GET /api/protected/conversations)
+ *  - Get single conversation (GET /api/protected/conversations/:id)
+ *  - Add experts (POST /api/protected/conversations/:id/experts)
+ *  - List experts (GET /api/protected/conversations/:id/experts)
+ *  - Update expert (PATCH /api/experts/:expertId)
+ *  - Send messages (POST /api/protected/conversations/:id/messages)
+ *  - Get messages (GET /api/protected/conversations/:id/messages)
+ *  - Auth & ownership enforcement
+ *  - Edge cases: missing fields, cross-user access, empty conversations
+ *
+ * Uses vitest + supertest. Forces MemStorage so no real database is needed.
+ * Mocks orchestrator & AI modules to avoid real API calls.
+ */
+
+import { describe, it, expect, beforeAll, beforeEach, vi } from "vitest";
+import request from "supertest";
+import express from "express";
+import type { Express } from "express";
+import fs from "node:fs";
+import path from "node:path";
+
+// ── Force MemStorage BEFORE any server imports ──
+process.env.DATABASE_URL = "";
+process.env.SESSION_SECRET = "vitest-conversation-secret";
+process.env.NODE_ENV = "test";
+// This suite performs many logins against one app; raise the per-app
+// login cap so the (correct) rate limiter doesn't cascade 429s.
+process.env.LOGIN_RATELIMIT_MAX = "1000";
+
+// ── Mock orchestrator (to avoid AI API calls when sending messages) ──
+const {
+  mockProcessMessageTurnBased,
+  mockGetExpertResponseStream,
+  mockGetModeratorNextSpeakerSuggestion,
+  mockGenerateInsights,
+  mockGenerateClosingSynthesis,
+  mockGetFarmerFileIntent,
+  mockPersistAutonomySettings,
+  mockIsConversationBusy,
+} = vi.hoisted(() => ({
+  mockProcessMessageTurnBased: vi.fn(),
+  mockGetExpertResponseStream: vi.fn(),
+  mockGetModeratorNextSpeakerSuggestion: vi.fn(),
+  mockGenerateInsights: vi.fn(),
+  mockGenerateClosingSynthesis: vi.fn(),
+  mockGetFarmerFileIntent: vi.fn().mockReturnValue(null),
+  mockPersistAutonomySettings: vi.fn().mockResolvedValue(undefined),
+  mockIsConversationBusy: vi.fn().mockReturnValue(false),
+}));
+
+vi.mock("../server/orchestrator", () => ({
+  processMessageTurnBased: mockProcessMessageTurnBased,
+  InteractionOrchestrator: class {
+    pause() {}
+    resume() {}
+    enableAutonomous(_maxTurns?: number) {}
+    disableAutonomous() {}
+  },
+  getConversationState: vi.fn().mockReturnValue(null),
+  getFarmerFileIntent: mockGetFarmerFileIntent,
+  persistAutonomySettings: mockPersistAutonomySettings,
+  isConversationBusy: mockIsConversationBusy,
+  discardConversationState: vi.fn().mockResolvedValue(undefined),
+}));
+
+// ── Mock AI module (generateSystemPrompt used when creating experts) ──
+vi.mock("../server/ai", () => ({
+  generateSystemPrompt: vi.fn().mockReturnValue("You are a helpful agricultural expert."),
+  callOpenRouterAPI: vi.fn(),
+  callPerplexityAPI: vi.fn(),
+  getExpertResponse: vi.fn(),
+  getExpertResponseStream: mockGetExpertResponseStream,
+  isRetryableExpertProviderFailure: () => false,
+  getModeratorNextSpeakerSuggestion: mockGetModeratorNextSpeakerSuggestion,
+  generateClosingSynthesis: mockGenerateClosingSynthesis,
+  generateInsights: mockGenerateInsights,
+  resolveAuxModel: (moderatorModel: string | null | undefined, firstExpertModel: string | null | undefined) =>
+    moderatorModel?.trim() || process.env.DEFAULT_AUX_MODEL?.trim() || firstExpertModel?.trim() || null,
+}));
+
+import { registerRoutes } from "../server/routes";
+import { storage } from "../server/storage";
+
+// ── Test app factory ──
+async function createTestApp(): Promise<Express> {
+  const app = express();
+  app.use(express.json());
+  app.use(express.urlencoded({ extended: false }));
+  await registerRoutes(app);
+
+  app.use(
+    (
+      err: any,
+      _req: express.Request,
+      res: express.Response,
+      _next: express.NextFunction,
+    ) => {
+      const status = err.status || err.statusCode || 500;
+      const message = err.message || "Internal Server Error";
+      res.status(status).json({ message });
+    },
+  );
+
+  return app;
+}
+
+// ── Auth helpers ──
+async function login(
+  agent: request.SuperAgentTest,
+  username = "developer",
+  password = "password",
+) {
+  const res = await agent
+    .post("/api/login")
+    .send({ username, password });
+  expect(res.status).toBe(200);
+  return agent;
+}
+
+async function registerAndLogin(
+  agent: request.SuperAgentTest,
+  username = "convouser",
+  password = "testpass123",
+  email = "convo@example.com",
+) {
+  const res = await agent
+    .post("/api/register")
+    .send({ username, password, email });
+  expect(res.status).toBe(201);
+  return agent;
+}
+
+// ── Helper: create a conversation and return it ──
+async function createConversation(
+  agent: request.SuperAgentTest,
+  title = "Test Roundtable",
+) {
+  const res = await agent
+    .post("/api/protected/conversations")
+    .send({ title });
+  expect(res.status).toBe(201);
+  return res.body;
+}
+
+// ── Helper: add an expert to a conversation ──
+async function addExpert(
+  agent: request.SuperAgentTest,
+  conversationId: number,
+  expert: { name: string; role: string; model: string; avatarUrl?: string },
+) {
+  const res = await agent
+    .post(`/api/protected/conversations/${conversationId}/experts`)
+    .send(expert);
+  expect(res.status).toBe(201);
+  return res.body;
+}
+
+async function createOpenQuestion(
+  conversationId: number,
+  question = "Which field will be planted first?",
+  assumption = "Assuming the north field is first.",
+) {
+  const sourceMessage = await storage.createMessage({
+    conversationId,
+    userId: null,
+    expertId: null,
+    content: `@[User] ${question} ${assumption}`,
+    role: "assistant",
+    expertRole: "Agronomist",
+  });
+  return storage.createOpenQuestion({
+    conversationId,
+    messageId: sourceMessage.id,
+    expertRole: "Agronomist",
+    question,
+    assumption,
+  });
+}
+
+async function waitForCondition(predicate: () => boolean, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate() && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  expect(predicate()).toBe(true);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// TEST SUITE
+// ═══════════════════════════════════════════════════════════════════
+
+describe("Conversations & Expert Flows", () => {
+  let app: Express;
+
+  beforeAll(async () => {
+    app = await createTestApp();
+  });
+
+  beforeEach(() => {
+    mockProcessMessageTurnBased.mockReset();
+    // Default: resolve silently
+    mockProcessMessageTurnBased.mockResolvedValue(undefined);
+    mockGetExpertResponseStream.mockReset();
+    mockGetModeratorNextSpeakerSuggestion.mockReset();
+    mockGenerateInsights.mockReset().mockResolvedValue(undefined);
+    mockGenerateClosingSynthesis.mockReset().mockResolvedValue(undefined);
+    mockGetFarmerFileIntent.mockReset().mockReturnValue(null);
+    mockPersistAutonomySettings.mockReset().mockResolvedValue(undefined);
+    mockIsConversationBusy.mockReset().mockReturnValue(false);
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // Create Conversation
+  // ─────────────────────────────────────────────────────────────────
+
+  describe("POST /api/protected/conversations", () => {
+    it("returns 401 when not authenticated", async () => {
+      const res = await request(app)
+        .post("/api/protected/conversations")
+        .send({ title: "Unauthorized" });
+      expect(res.status).toBe(401);
+    });
+
+    it("creates a new conversation for authenticated user", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const res = await agent
+        .post("/api/protected/conversations")
+        .send({ title: "Crop Rotation Discussion" });
+
+      expect(res.status).toBe(201);
+      expect(res.body).toHaveProperty("id");
+      expect(res.body.title).toBe("Crop Rotation Discussion");
+      expect(res.body.turnBudget).toBe(25);
+      expect(res.body).toHaveProperty("createdAt");
+      expect(res.body.userId).toBe(1); // developer user id
+    });
+
+    it("defaults title to 'New board session' when not provided", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const res = await agent
+        .post("/api/protected/conversations")
+        .send({});
+
+      expect(res.status).toBe(201);
+      expect(res.body.title).toBe("New board session");
+    });
+
+    it("creates multiple conversations for the same user", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const convo1 = await agent
+        .post("/api/protected/conversations")
+        .send({ title: "Convo 1" });
+      const convo2 = await agent
+        .post("/api/protected/conversations")
+        .send({ title: "Convo 2" });
+
+      expect(convo1.status).toBe(201);
+      expect(convo2.status).toBe(201);
+      expect(convo1.body.id).not.toBe(convo2.body.id);
+    });
+
+    it("isolates conversations between different users", async () => {
+      const agentA = request.agent(app);
+      await registerAndLogin(agentA, "convoIsolationA", "pass123");
+      const convoA = await createConversation(agentA, "User A Conversation");
+
+      const agentB = request.agent(app);
+      await registerAndLogin(agentB, "convoIsolationB", "pass456");
+      const convoB = await createConversation(agentB, "User B Conversation");
+
+      // User A cannot see User B's conversation
+      const res = await agentA.get(`/api/protected/conversations/${convoB.id}`);
+      expect(res.status).toBe(404);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // List Conversations
+  // ─────────────────────────────────────────────────────────────────
+
+  describe("GET /api/protected/conversations", () => {
+    it("returns 401 when not authenticated", async () => {
+      const res = await request(app).get("/api/protected/conversations");
+      expect(res.status).toBe(401);
+    });
+
+    it("returns empty array for user with no conversations", async () => {
+      const agent = request.agent(app);
+      await registerAndLogin(agent, "emptyconvos", "pass123");
+
+      const res = await agent.get("/api/protected/conversations");
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual([]);
+    });
+
+    it("includes updatedAt as the latest message time, falling back to createdAt", async () => {
+      const agent = request.agent(app);
+      await registerAndLogin(agent, "activityconvos", "pass123");
+      const quiet = await createConversation(agent, "Quiet");
+      const active = await createConversation(agent, "Active");
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      const message = await storage.createMessage({
+        conversationId: active.id,
+        userId: null,
+        expertId: null,
+        content: "latest",
+        role: "assistant",
+      });
+
+      const res = await agent.get("/api/protected/conversations");
+      const byId = new Map<number, any>(res.body.map((c: any) => [c.id, c]));
+      expect(byId.get(quiet.id).updatedAt).toBe(byId.get(quiet.id).createdAt);
+      expect(byId.get(active.id).updatedAt).toBe(new Date(message.timestamp!).toISOString());
+      expect(byId.get(active.id).updatedAt > byId.get(active.id).createdAt).toBe(true);
+    });
+
+    it("returns all conversations for authenticated user", async () => {
+      const agent = request.agent(app);
+      await registerAndLogin(agent, "manyconvos", "pass123");
+
+      await createConversation(agent, "Convo A");
+      await createConversation(agent, "Convo B");
+      await createConversation(agent, "Convo C");
+
+      const res = await agent.get("/api/protected/conversations");
+      expect(res.status).toBe(200);
+      expect(res.body.length).toBe(3);
+      expect(res.body.map((c: any) => c.title).sort()).toEqual(
+        ["Convo A", "Convo B", "Convo C"].sort(),
+      );
+    });
+
+    it("does not return other users' conversations", async () => {
+      const agentA = request.agent(app);
+      await registerAndLogin(agentA, "listIsolationA", "pass123");
+      await createConversation(agentA, "A's Convo");
+
+      const agentB = request.agent(app);
+      await registerAndLogin(agentB, "listIsolationB", "pass456");
+
+      const res = await agentB.get("/api/protected/conversations");
+      expect(res.status).toBe(200);
+      expect(res.body.length).toBe(0);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // Get Single Conversation
+  // ─────────────────────────────────────────────────────────────────
+
+  describe("GET /api/protected/conversations/:id", () => {
+    it("returns 401 when not authenticated", async () => {
+      const res = await request(app).get("/api/protected/conversations/1");
+      expect(res.status).toBe(401);
+    });
+
+    it("returns 404 for non-existent conversation", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const res = await agent.get("/api/protected/conversations/99999");
+      expect(res.status).toBe(404);
+    });
+
+    it("returns conversation by ID", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const convo = await createConversation(agent, "My Special Convo");
+
+      const res = await agent.get(`/api/protected/conversations/${convo.id}`);
+      expect(res.status).toBe(200);
+      expect(res.body.title).toBe("My Special Convo");
+      expect(res.body.id).toBe(convo.id);
+    });
+
+    it("returns 404 when user does not own the conversation", async () => {
+      const agentA = request.agent(app);
+      await registerAndLogin(agentA, "ownerA", "pass123");
+      const convo = await createConversation(agentA, "Owned by A");
+
+      const agentB = request.agent(app);
+      await registerAndLogin(agentB, "ownerB", "pass456");
+
+      const res = await agentB.get(`/api/protected/conversations/${convo.id}`);
+      expect(res.status).toBe(404);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // Add Experts
+  // ─────────────────────────────────────────────────────────────────
+
+  describe("POST /api/protected/conversations/:id/experts", () => {
+    it("returns 401 when not authenticated", async () => {
+      const res = await request(app)
+        .post("/api/protected/conversations/1/experts")
+        .send({ name: "Dr. Soil", role: "Soil Scientist", model: "gpt-4" });
+      expect(res.status).toBe(401);
+    });
+
+    it("returns 404 when conversation does not exist", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const res = await agent
+        .post("/api/protected/conversations/99999/experts")
+        .send({ name: "Dr. Soil", role: "Soil Scientist", model: "gpt-4" });
+      expect(res.status).toBe(404);
+    });
+
+    it("returns 404 when conversation belongs to another user", async () => {
+      const agentA = request.agent(app);
+      await registerAndLogin(agentA, "expertOwnerA", "pass123");
+      const convo = await createConversation(agentA, "A's Roundtable");
+
+      const agentB = request.agent(app);
+      await registerAndLogin(agentB, "expertOwnerB", "pass456");
+
+      const res = await agentB
+        .post(`/api/protected/conversations/${convo.id}/experts`)
+        .send({ name: "Dr. Soil", role: "Soil Scientist", model: "gpt-4" });
+      expect(res.status).toBe(404);
+    });
+
+    it("adds an expert to a conversation", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const convo = await createConversation(agent);
+
+      const res = await agent
+        .post(`/api/protected/conversations/${convo.id}/experts`)
+        .send({
+          name: "Dr. Maria Soilson",
+          role: "Soil Scientist",
+          model: "openai/gpt-4o:free",
+          avatarUrl: "https://example.com/avatar1.png",
+        });
+
+      expect(res.status).toBe(201);
+      expect(res.body).toHaveProperty("id");
+      expect(res.body.name).toBe("Dr. Maria Soilson");
+      expect(res.body.role).toBe("Soil Scientist");
+      expect(res.body.model).toBe("openai/gpt-4o:free");
+      expect(res.body.avatarUrl).toMatch(/^data:image\/svg\+xml/); // bundled catalog avatar
+      expect(res.body.conversationId).toBe(convo.id);
+      // System prompt should be generated
+      expect(res.body.systemPrompt).toBeTruthy();
+    });
+
+    it("adds multiple experts to the same conversation", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const convo = await createConversation(agent);
+
+      const expert1 = await addExpert(agent, convo.id, {
+        name: "Weather Expert",
+        role: "Meteorologist",
+        model: "gpt-4",
+      });
+      const expert2 = await addExpert(agent, convo.id, {
+        name: "Crop Expert",
+        role: "Agronomist",
+        model: "claude-3",
+      });
+
+      expect(expert1.id).not.toBe(expert2.id);
+      expect(expert1.conversationId).toBe(convo.id);
+      expect(expert2.conversationId).toBe(convo.id);
+    });
+
+    it("generates system prompt for each expert role", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const convo = await createConversation(agent);
+
+      const res = await agent
+        .post(`/api/protected/conversations/${convo.id}/experts`)
+        .send({
+          name: "Dr. Water",
+          role: "Irrigation Specialist",
+          model: "gpt-4",
+        });
+
+      expect(res.body.systemPrompt).toBe(
+        "You are a helpful agricultural expert.",
+      );
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // List Experts
+  // ─────────────────────────────────────────────────────────────────
+
+  describe("GET /api/protected/conversations/:id/experts", () => {
+    it("returns 401 when not authenticated", async () => {
+      const res = await request(app).get(
+        "/api/protected/conversations/1/experts",
+      );
+      expect(res.status).toBe(401);
+    });
+
+    it("returns empty array for conversation with no experts", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const convo = await createConversation(agent);
+
+      const res = await agent.get(
+        `/api/protected/conversations/${convo.id}/experts`,
+      );
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual([]);
+    });
+
+    it("returns all experts for a conversation", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const convo = await createConversation(agent);
+      await addExpert(agent, convo.id, {
+        name: "Expert Alpha",
+        role: "Role A",
+        model: "model-a:free",
+      });
+      await addExpert(agent, convo.id, {
+        name: "Expert Beta",
+        role: "Role B",
+        model: "model-b",
+      });
+
+      const res = await agent.get(
+        `/api/protected/conversations/${convo.id}/experts`,
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.length).toBe(2);
+      const names = res.body.map((e: any) => e.name).sort();
+      expect(names).toEqual(["Expert Alpha", "Expert Beta"]);
+    });
+
+    it("returns 404 for non-existent conversation", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const res = await agent.get("/api/protected/conversations/99999/experts");
+      expect(res.status).toBe(404);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // Update Expert
+  // ─────────────────────────────────────────────────────────────────
+
+  describe("PATCH /api/experts/:expertId", () => {
+    it("returns 401 when not authenticated", async () => {
+      const res = await request(app)
+        .patch("/api/experts/1")
+        .send({ name: "Hacked Expert" });
+      expect(res.status).toBe(401);
+    });
+
+    it("returns 404 for non-existent expert", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const res = await agent
+        .patch("/api/experts/99999")
+        .send({ name: "Ghost Expert" });
+      expect(res.status).toBe(404);
+    });
+
+    it("returns 403 when expert belongs to another user's conversation", async () => {
+      // User A creates conversation with expert
+      const agentA = request.agent(app);
+      await registerAndLogin(agentA, "updateExpertOwnerA", "pass123");
+      const convo = await createConversation(agentA, "A's Convo");
+      const expert = await addExpert(agentA, convo.id, {
+        name: "Dr. A Expert",
+        role: "Role A",
+        model: "model-a:free",
+      });
+
+      // User B tries to update it
+      const agentB = request.agent(app);
+      await registerAndLogin(agentB, "updateExpertOwnerB", "pass456");
+
+      const res = await agentB
+        .patch(`/api/experts/${expert.id}`)
+        .send({ name: "Hacked Name" });
+      expect(res.status).toBe(403);
+    });
+
+    it("updates expert name", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const convo = await createConversation(agent);
+      const expert = await addExpert(agent, convo.id, {
+        name: "Original Name",
+        role: "Scientist",
+        model: "gpt-4",
+      });
+
+      const res = await agent
+        .patch(`/api/experts/${expert.id}`)
+        .send({ name: "Updated Name" });
+
+      expect(res.status).toBe(200);
+      expect(res.body.name).toBe("Updated Name");
+      // Other fields should be unchanged
+      expect(res.body.role).toBe("Scientist");
+    });
+
+    it("updates expert model", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const convo = await createConversation(agent);
+      const expert = await addExpert(agent, convo.id, {
+        name: "Model Tester",
+        role: "Tester",
+        model: "gpt-4",
+      });
+
+      const res = await agent
+        .patch(`/api/experts/${expert.id}`)
+        .send({ model: "claude-3-opus" });
+
+      expect(res.status).toBe(200);
+      expect(res.body.model).toBe("claude-3-opus");
+    });
+
+    it("does not change fields that are not sent", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const convo = await createConversation(agent);
+      const expert = await addExpert(agent, convo.id, {
+        name: "Stable Expert",
+        role: "Stable Role",
+        model: "stable-model",
+      });
+
+      const res = await agent
+        .patch(`/api/experts/${expert.id}`)
+        .send({});
+
+      expect(res.status).toBe(200);
+      expect(res.body.name).toBe("Stable Expert");
+      expect(res.body.role).toBe("Stable Role");
+      expect(res.body.model).toBe("stable-model");
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // Delete Expert / Delete Conversation
+  // ─────────────────────────────────────────────────────────────────
+
+  describe("DELETE /api/protected/conversations/:conversationId/experts/:expertId", () => {
+    it("returns 401 when not authenticated", async () => {
+      const res = await request(app).delete("/api/protected/conversations/1/experts/1");
+      expect(res.status).toBe(401);
+    });
+
+    it("removes the expert with 204 and keeps its past messages", async () => {
+      const agent = request.agent(app);
+      await registerAndLogin(agent, "deleteExpertOwner", "pass123");
+      const convo = await createConversation(agent);
+      const expert = await addExpert(agent, convo.id, { name: "Dr. Gone", role: "Agronomist", model: "m:free" });
+      const other = await addExpert(agent, convo.id, { name: "Dr. Stay", role: "Economist", model: "m:free" });
+      const message = await storage.createMessage({
+        conversationId: convo.id,
+        userId: null,
+        expertId: expert.id,
+        content: "Plant early.",
+        role: "assistant",
+        expertName: "Dr. Gone",
+        expertRole: "Agronomist",
+      });
+
+      const res = await agent.delete(`/api/protected/conversations/${convo.id}/experts/${expert.id}`);
+      expect(res.status).toBe(204);
+
+      const list = await agent.get(`/api/protected/conversations/${convo.id}/experts`);
+      expect(list.body.map((e: any) => e.id)).toEqual([other.id]);
+
+      const messages = await storage.getConversationMessages(convo.id);
+      const kept = messages.find((m) => m.id === message.id);
+      expect(kept).toMatchObject({ content: "Plant early.", expertName: "Dr. Gone", expertId: null });
+    });
+
+    it("returns 404 for another user's conversation", async () => {
+      const owner = request.agent(app);
+      await registerAndLogin(owner, "deleteExpertOwner2", "pass123");
+      const convo = await createConversation(owner);
+      const expert = await addExpert(owner, convo.id, { name: "Dr. A", role: "Agronomist", model: "m:free" });
+
+      const intruder = request.agent(app);
+      await registerAndLogin(intruder, "deleteExpertIntruder", "pass456");
+      const res = await intruder.delete(`/api/protected/conversations/${convo.id}/experts/${expert.id}`);
+      expect(res.status).toBe(404);
+      expect((await storage.getExpertById(expert.id))?.id).toBe(expert.id);
+    });
+
+    it("returns 404 when the expert belongs to a different conversation or does not exist", async () => {
+      const agent = request.agent(app);
+      await registerAndLogin(agent, "deleteExpertMismatch", "pass123");
+      const convoA = await createConversation(agent, "A");
+      const convoB = await createConversation(agent, "B");
+      const expertB = await addExpert(agent, convoB.id, { name: "Dr. B", role: "Agronomist", model: "m:free" });
+
+      const wrongConvo = await agent.delete(`/api/protected/conversations/${convoA.id}/experts/${expertB.id}`);
+      expect(wrongConvo.status).toBe(404);
+      const missing = await agent.delete(`/api/protected/conversations/${convoA.id}/experts/99999`);
+      expect(missing.status).toBe(404);
+      expect((await storage.getExpertById(expertB.id))?.id).toBe(expertB.id);
+    });
+
+    it("returns 409 while a discussion is running", async () => {
+      const agent = request.agent(app);
+      await registerAndLogin(agent, "deleteExpertBusy", "pass123");
+      const convo = await createConversation(agent);
+      const expert = await addExpert(agent, convo.id, { name: "Dr. Busy", role: "Agronomist", model: "m:free" });
+
+      mockIsConversationBusy.mockReturnValue(true);
+      const res = await agent.delete(`/api/protected/conversations/${convo.id}/experts/${expert.id}`);
+      expect(res.status).toBe(409);
+      expect(res.body.message).toBeTruthy();
+      expect((await storage.getExpertById(expert.id))?.id).toBe(expert.id);
+    });
+  });
+
+  describe("DELETE /api/protected/conversations/:id", () => {
+    it("returns 401 when not authenticated", async () => {
+      const res = await request(app).delete("/api/protected/conversations/1");
+      expect(res.status).toBe(401);
+    });
+
+    it("deletes the conversation and everything in it with 204", async () => {
+      const agent = request.agent(app);
+      await registerAndLogin(agent, "deleteConvoOwner", "pass123");
+      const convo = await createConversation(agent, "Doomed");
+      const keep = await createConversation(agent, "Survivor");
+      const expert = await addExpert(agent, convo.id, { name: "Dr. A", role: "Agronomist", model: "m:free" });
+      const keepExpert = await addExpert(agent, keep.id, { name: "Dr. K", role: "Agronomist", model: "m:free" });
+      await storage.createMessage({ conversationId: convo.id, userId: null, expertId: expert.id, content: "hi", role: "assistant" });
+      await createOpenQuestion(convo.id);
+      await storage.createFile({ conversationId: convo.id, filename: "a.txt", fileUrl: "/uploads/delete-convo-a.txt", fileType: "text/plain", uploadedBy: "user" });
+      await storage.createInsight({ conversationId: convo.id, title: "t", points: ["p"] });
+
+      const res = await agent.delete(`/api/protected/conversations/${convo.id}`);
+      expect(res.status).toBe(204);
+
+      expect(await storage.getConversation(convo.id)).toBeUndefined();
+      expect(await storage.getConversationExperts(convo.id)).toEqual([]);
+      expect(await storage.getConversationMessages(convo.id)).toEqual([]);
+      expect(await storage.listOpenQuestions(convo.id)).toEqual([]);
+      expect(await storage.getConversationFiles(convo.id)).toEqual([]);
+      expect(await storage.getConversationInsights(convo.id)).toEqual([]);
+
+      expect((await agent.get(`/api/protected/conversations/${convo.id}`)).status).toBe(404);
+      expect((await storage.getConversation(keep.id))?.id).toBe(keep.id);
+      expect((await storage.getConversationExperts(keep.id)).map((e) => e.id)).toEqual([keepExpert.id]);
+    });
+
+    it("returns 404 for another user's or a missing conversation", async () => {
+      const owner = request.agent(app);
+      await registerAndLogin(owner, "deleteConvoOwner2", "pass123");
+      const convo = await createConversation(owner);
+
+      const intruder = request.agent(app);
+      await registerAndLogin(intruder, "deleteConvoIntruder", "pass456");
+      expect((await intruder.delete(`/api/protected/conversations/${convo.id}`)).status).toBe(404);
+      expect((await intruder.delete("/api/protected/conversations/99999")).status).toBe(404);
+      expect((await storage.getConversation(convo.id))?.id).toBe(convo.id);
+    });
+
+    it("returns 409 while a discussion is running", async () => {
+      const agent = request.agent(app);
+      await registerAndLogin(agent, "deleteConvoBusy", "pass123");
+      const convo = await createConversation(agent);
+
+      mockIsConversationBusy.mockReturnValue(true);
+      const res = await agent.delete(`/api/protected/conversations/${convo.id}`);
+      expect(res.status).toBe(409);
+      expect((await storage.getConversation(convo.id))?.id).toBe(convo.id);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // Send Messages
+  // ─────────────────────────────────────────────────────────────────
+
+  describe("POST /api/protected/conversations/:id/messages", () => {
+    it("returns 401 when not authenticated", async () => {
+      const res = await request(app)
+        .post("/api/protected/conversations/1/messages")
+        .send({ content: "Hello experts!" });
+      expect(res.status).toBe(401);
+    });
+
+    it("returns 404 for non-existent conversation", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const res = await agent
+        .post("/api/protected/conversations/99999/messages")
+        .send({ content: "Hello!" });
+      expect(res.status).toBe(404);
+    });
+
+    it("returns 404 when conversation belongs to another user", async () => {
+      const agentA = request.agent(app);
+      await registerAndLogin(agentA, "msgOwnerA", "pass123");
+      const convo = await createConversation(agentA, "A's Chat");
+
+      const agentB = request.agent(app);
+      await registerAndLogin(agentB, "msgOwnerB", "pass456");
+
+      const res = await agentB
+        .post(`/api/protected/conversations/${convo.id}/messages`)
+        .send({ content: "Hello!" });
+      expect(res.status).toBe(404);
+    });
+
+    it("sends a user message and triggers orchestrator", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const convo = await createConversation(agent);
+
+      const res = await agent
+        .post(`/api/protected/conversations/${convo.id}/messages`)
+        .send({ content: "What cover crop should I plant for nitrogen fixing?" });
+
+      expect(res.status).toBe(201);
+      expect(res.body).toHaveProperty("id");
+      expect(res.body.content).toBe(
+        "What cover crop should I plant for nitrogen fixing?",
+      );
+      expect(res.body.role).toBe("user");
+      expect(res.body.conversationId).toBe(convo.id);
+
+      // Orchestrator should have been called
+      expect(mockProcessMessageTurnBased).toHaveBeenCalledTimes(1);
+    });
+
+    it("answers a current-file link request from storage without starting a provider turn", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+      const conversation = await createConversation(agent, "Stored SOP link");
+      const file = await storage.createFile({
+        conversationId: conversation.id,
+        filename: "nitrogen-sop.md",
+        fileUrl: "/uploads/private-nitrogen-sop.md",
+        fileType: "text/markdown",
+        uploadedBy: "Expert: File Creator",
+        deliverableId: "nitrogen-sop",
+        generationRequestId: "generation-1",
+        version: 1,
+      });
+      mockGetFarmerFileIntent.mockReturnValue("retrieve");
+
+      const res = await agent
+        .post(`/api/protected/conversations/${conversation.id}/messages`)
+        .send({ content: "Please just send me the current SOP link." });
+
+      expect(res.status).toBe(201);
+      expect(res.body.role).toBe("user");
+      expect(mockProcessMessageTurnBased).not.toHaveBeenCalled();
+      const messages = await storage.getConversationMessages(conversation.id);
+      expect(messages.at(-1)?.content).toContain(
+        `/api/protected/conversations/${conversation.id}/files/${file.id}/download`,
+      );
+      expect(messages.at(-1)?.content).toContain("nitrogen-sop.md");
+      expect(await storage.getConversationFiles(conversation.id)).toHaveLength(1);
+    });
+
+    it("retrieves a legacy calendar alongside a canonical SOP", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+      const conversation = await createConversation(agent, "Legacy calendar link");
+      await storage.createFile({
+        conversationId: conversation.id,
+        filename: "nitrogen-sop.md",
+        fileUrl: "/uploads/nitrogen-sop.md",
+        fileType: "text/markdown",
+        uploadedBy: "Expert: File Creator",
+        deliverableId: "nitrogen-sop",
+        generationRequestId: "generation-sop-1",
+        version: 1,
+      });
+      const legacyCalendar = await storage.createFile({
+        conversationId: conversation.id,
+        filename: "nitrogen-calendar.ics",
+        fileUrl: "/uploads/nitrogen-calendar.ics",
+        fileType: "text/calendar",
+        uploadedBy: "Expert: File Creator",
+      });
+      mockGetFarmerFileIntent.mockReturnValue("retrieve");
+
+      const res = await agent
+        .post(`/api/protected/conversations/${conversation.id}/messages`)
+        .send({ content: "Please send me the saved calendar link." });
+
+      expect(res.status).toBe(201);
+      expect(mockProcessMessageTurnBased).not.toHaveBeenCalled();
+      const messages = await storage.getConversationMessages(conversation.id);
+      expect(messages.at(-1)?.content).toContain(
+        `/api/protected/conversations/${conversation.id}/files/${legacyCalendar.id}/download`,
+      );
+      expect(messages.at(-1)?.content).toContain("nitrogen-calendar.ics");
+      expect(messages.at(-1)?.content).not.toContain("nitrogen-sop.md");
+    });
+
+    it("prefers the current canonical version over a newer legacy file of the same kind", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+      const conversation = await createConversation(agent, "Canonical SOP link");
+      const canonical = await storage.createFile({
+        conversationId: conversation.id,
+        filename: "nitrogen-sop.md",
+        fileUrl: "/uploads/nitrogen-sop-v2.md",
+        fileType: "text/markdown",
+        uploadedBy: "Expert: File Creator",
+        deliverableId: "nitrogen-sop",
+        generationRequestId: "generation-sop-2",
+        version: 2,
+      });
+      await new Promise(resolve => setTimeout(resolve, 5));
+      await storage.createFile({
+        conversationId: conversation.id,
+        filename: "nitrogen-sop.md",
+        fileUrl: "/uploads/legacy-nitrogen-sop.md",
+        fileType: "text/markdown",
+        uploadedBy: "Expert: File Creator",
+      });
+      mockGetFarmerFileIntent.mockReturnValue("retrieve");
+
+      const res = await agent
+        .post(`/api/protected/conversations/${conversation.id}/messages`)
+        .send({ content: "Please send me the latest SOP link." });
+
+      expect(res.status).toBe(201);
+      const messages = await storage.getConversationMessages(conversation.id);
+      expect(messages.at(-1)?.content).toContain(
+        `/api/protected/conversations/${conversation.id}/files/${canonical.id}/download`,
+      );
+      expect(messages.at(-1)?.content).not.toContain("legacy-nitrogen-sop.md");
+    });
+
+    it("stores message and returns it before orchestrator completes (async fire-and-forget)", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const convo = await createConversation(agent);
+
+      // Make orchestrator slow (but fire-and-forget)
+      mockProcessMessageTurnBased.mockImplementation(
+        () => new Promise((resolve) => setTimeout(resolve, 5000)),
+      );
+
+      const res = await agent
+        .post(`/api/protected/conversations/${convo.id}/messages`)
+        .send({ content: "Async test message" });
+
+      // Should return immediately, not wait for orchestrator
+      expect(res.status).toBe(201);
+      expect(res.body.content).toBe("Async test message");
+    });
+
+    it("handles orchestrator errors without crashing the response", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const convo = await createConversation(agent);
+
+      mockProcessMessageTurnBased.mockRejectedValue(
+        new Error("AI service unavailable"),
+      );
+
+      const res = await agent
+        .post(`/api/protected/conversations/${convo.id}/messages`)
+        .send({ content: "This will trigger an error" });
+
+      // The user message should still be created and returned
+      expect(res.status).toBe(201);
+      expect(res.body.content).toBe("This will trigger an error");
+    });
+  });
+
+  describe("POST /api/protected/conversations/:id/restart", () => {
+    it("restarts the current conversation on a supplied topic", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+      const convo = await createConversation(agent, "Restartable council");
+
+      const res = await agent
+        .post(`/api/protected/conversations/${convo.id}/restart`)
+        .send({ topic: "A genuinely new topic" });
+
+      expect(res.status).toBe(201);
+      expect(res.body).toMatchObject({
+        conversationId: convo.id,
+        content: "A genuinely new topic",
+        role: "user",
+      });
+      expect(mockProcessMessageTurnBased).toHaveBeenCalledWith(
+        1,
+        convo.id,
+        expect.objectContaining({ content: "A genuinely new topic" }),
+        expect.any(Function),
+        { restart: true },
+      );
+    });
+
+    it("interrupts an active turn and starts over on the supplied topic with a fresh counter", async () => {
+      const actualOrchestrator = await vi.importActual<typeof import("../server/orchestrator")>("../server/orchestrator");
+      const agent = request.agent(app);
+      await login(agent);
+      const convo = await createConversation(agent, "Active restart council");
+      const expert = await addExpert(agent, convo.id, {
+        name: "Dr. Agronomy",
+        role: "Agronomist",
+        model: "test/model",
+      });
+
+      let releaseFirstTurn: ((message: any) => void) | undefined;
+      const turnStarts: Array<{ reference: string; counter: number }> = [];
+      const moderatorDecisions = ["Agronomist", "Agronomist", "Conclude"];
+      mockGetModeratorNextSpeakerSuggestion.mockImplementation(async () => moderatorDecisions.shift() ?? "Conclude");
+      mockGetExpertResponseStream.mockImplementation(async (speaker: any, _history: any, reference: string) => {
+        const state = actualOrchestrator.getConversationState(convo.id);
+        turnStarts.push({ reference, counter: state?.totalAutonomousTurnsTaken ?? -1 });
+        return {
+          conversationId: convo.id,
+          expertId: speaker.id,
+          userId: null,
+          content: `Response to: ${reference}`,
+          role: "assistant",
+          expertName: speaker.name,
+          expertRole: speaker.role,
+          stance: { stance: "agree", confidence: 4, position: "The revised topic supports this plan." },
+        };
+      });
+      mockGetExpertResponseStream.mockImplementationOnce((speaker: any, _history: any, reference: string) => {
+        const state = actualOrchestrator.getConversationState(convo.id);
+        turnStarts.push({ reference, counter: state?.totalAutonomousTurnsTaken ?? -1 });
+        return new Promise((resolve) => {
+          releaseFirstTurn = resolve;
+          // Keep the current expert streaming until the HTTP restart has
+          // marked the active sequence for an explicit restart.
+          void speaker;
+        });
+      });
+      mockProcessMessageTurnBased.mockImplementation((...args: any[]) =>
+        actualOrchestrator.processMessageTurnBased(...args),
+      );
+
+      const firstMessage = await agent
+        .post(`/api/protected/conversations/${convo.id}/messages`)
+        .send({ content: "Original topic" });
+      expect(firstMessage.status).toBe(201);
+      await waitForCondition(() => typeof releaseFirstTurn === "function");
+
+      const activeState = actualOrchestrator.getConversationState(convo.id);
+      expect(activeState).toMatchObject({ mode: "autonomous", totalAutonomousTurnsTaken: 1, turnInFlight: true });
+
+      const restart = await agent
+        .post(`/api/protected/conversations/${convo.id}/restart`)
+        .send({ topic: "A genuinely new topic" });
+      expect(restart.status).toBe(201);
+      expect(actualOrchestrator.getConversationState(convo.id)?.wasInterrupted).toBe(true);
+
+      releaseFirstTurn?.({
+        conversationId: convo.id,
+        expertId: expert.id,
+        userId: null,
+        content: "The old topic's in-flight answer finished.",
+        role: "assistant",
+        expertName: expert.name,
+        expertRole: expert.role,
+      });
+
+      await waitForCondition(() => turnStarts.length >= 2);
+      expect(turnStarts).toEqual([
+        { reference: "Original topic", counter: 1 },
+        { reference: "A genuinely new topic", counter: 1 },
+      ]);
+      expect(mockProcessMessageTurnBased).toHaveBeenCalledWith(
+        1,
+        convo.id,
+        expect.objectContaining({ content: "A genuinely new topic" }),
+        expect.any(Function),
+        { restart: true },
+      );
+
+      // Finish the restarted sequence cleanly instead of leaving an async
+      // chain behind for the following HTTP tests.
+      await waitForCondition(() => {
+        const state = actualOrchestrator.getConversationState(convo.id);
+        return state?.mode === "idle" && !state.turnInFlight && !state.turnChainScheduled;
+      });
+    });
+
+    it("returns 404 when the conversation belongs to another user", async () => {
+      const owner = request.agent(app);
+      await registerAndLogin(owner, "restartOwner", "pass123");
+      const convo = await createConversation(owner, "Private council");
+
+      const otherUser = request.agent(app);
+      await registerAndLogin(otherUser, "restartOther", "pass456");
+      const res = await otherUser
+        .post(`/api/protected/conversations/${convo.id}/restart`)
+        .send({ topic: "Not allowed" });
+
+      expect(res.status).toBe(404);
+      expect(mockProcessMessageTurnBased).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("persisted autonomy controls", () => {
+    it("allows autonomy settings to change while no run state is in memory", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+      const conversation = await createConversation(agent, "Cold-start settings");
+
+      const disabled = await agent
+        .post(`/api/protected/conversations/${conversation.id}/autonomous/disable`)
+        .send({});
+      expect(disabled.status).toBe(200);
+      expect(mockPersistAutonomySettings).toHaveBeenCalledWith(conversation.id, { isAutonomousEnabled: false });
+
+      const enabled = await agent
+        .post(`/api/protected/conversations/${conversation.id}/autonomous/enable`)
+        .send({ maxTurns: 4 });
+      expect(enabled.status).toBe(200);
+      expect(mockPersistAutonomySettings).toHaveBeenLastCalledWith(conversation.id, {
+        isAutonomousEnabled: true,
+        maxAutonomousTurns: 4,
+      });
+      expect((await storage.getConversation(conversation.id))?.turnBudget).toBe(4);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // Get Messages
+  // ─────────────────────────────────────────────────────────────────
+
+  describe("GET /api/protected/conversations/:id/messages", () => {
+    it("returns 401 when not authenticated", async () => {
+      const res = await request(app).get(
+        "/api/protected/conversations/1/messages",
+      );
+      expect(res.status).toBe(401);
+    });
+
+    it("returns empty array for conversation with no messages", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const convo = await createConversation(agent);
+
+      const res = await agent.get(
+        `/api/protected/conversations/${convo.id}/messages`,
+      );
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual([]);
+    });
+
+    it("returns all messages for a conversation", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const convo = await createConversation(agent);
+
+      // Send multiple messages
+      await agent
+        .post(`/api/protected/conversations/${convo.id}/messages`)
+        .send({ content: "First message" });
+      await agent
+        .post(`/api/protected/conversations/${convo.id}/messages`)
+        .send({ content: "Second message" });
+
+      const res = await agent.get(
+        `/api/protected/conversations/${convo.id}/messages`,
+      );
+      expect(res.status).toBe(200);
+      expect(res.body.length).toBe(2);
+      expect(res.body[0].content).toBe("First message");
+      expect(res.body[1].content).toBe("Second message");
+      // Messages should be sorted by timestamp
+      expect(
+        new Date(res.body[0].timestamp).getTime(),
+      ).toBeLessThanOrEqual(new Date(res.body[1].timestamp).getTime());
+    });
+
+    it("returns 404 for non-existent conversation", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const res = await agent.get("/api/protected/conversations/99999/messages");
+      expect(res.status).toBe(404);
+    });
+
+    it("returns 404 when conversation belongs to another user", async () => {
+      const agentA = request.agent(app);
+      await registerAndLogin(agentA, "msgReaderA", "pass123");
+      const convo = await createConversation(agentA, "A's Messages");
+
+      const agentB = request.agent(app);
+      await registerAndLogin(agentB, "msgReaderB", "pass456");
+
+      const res = await agentB.get(
+        `/api/protected/conversations/${convo.id}/messages`,
+      );
+      expect(res.status).toBe(404);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // File downloads and ownership
+  // ─────────────────────────────────────────────────────────────────
+
+  describe("File download routes", () => {
+    it("serves stored bytes to the owner and denies guessed links to another user", async () => {
+      const owner = request.agent(app);
+      await registerAndLogin(owner, "fileDownloadOwner", "pass123");
+      const conversation = await createConversation(owner, "Private file");
+      const filename = `download-test-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`;
+      const uploadDir = path.join(process.cwd(), "uploads");
+      const filePath = path.join(uploadDir, filename);
+      const bytes = "stored content for authorized download";
+      fs.mkdirSync(uploadDir, { recursive: true });
+      fs.writeFileSync(filePath, bytes);
+
+      try {
+        const file = await storage.createFile({
+          conversationId: conversation.id,
+          filename,
+          fileUrl: `/uploads/${filename}`,
+          fileType: "text/plain",
+          uploadedBy: "ai",
+        });
+        const canonicalUrl = `/api/protected/conversations/${conversation.id}/files/${file.id}/download`;
+
+        const list = await owner.get(`/api/protected/conversations/${conversation.id}/files`);
+        expect(list.status).toBe(200);
+        expect(list.body[0].fileUrl).toBe(canonicalUrl);
+
+        const download = await owner.get(canonicalUrl);
+        expect(download.status).toBe(200);
+        expect(download.text).toBe(bytes);
+
+        const otherUser = request.agent(app);
+        await registerAndLogin(otherUser, "fileDownloadOther", "pass456");
+        expect((await otherUser.get(canonicalUrl)).status).toBe(404);
+        expect((await otherUser.get(`/uploads/${filename}`)).status).toBe(404);
+        expect((await request(app).get(`/uploads/${filename}`)).status).toBe(401);
+      } finally {
+        fs.rmSync(filePath, { force: true });
+      }
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // Open question ledger API
+  // ─────────────────────────────────────────────────────────────────
+
+  describe("Open question routes", () => {
+    it("lists open questions only for the owning conversation user", async () => {
+      const owner = request.agent(app);
+      await registerAndLogin(owner, "questionListOwner", "pass123");
+      const conversation = await createConversation(owner, "Open questions");
+      const question = await createOpenQuestion(conversation.id);
+
+      const list = await owner.get(`/api/protected/conversations/${conversation.id}/open-questions`);
+      expect(list.status).toBe(200);
+      expect(list.body).toEqual([
+        expect.objectContaining({
+          id: question.id,
+          conversationId: conversation.id,
+          question: question.question,
+          assumption: question.assumption,
+          status: "open",
+        }),
+      ]);
+
+      const unauthenticated = await request(app).get(
+        `/api/protected/conversations/${conversation.id}/open-questions`,
+      );
+      expect(unauthenticated.status).toBe(401);
+
+      const otherUser = request.agent(app);
+      await registerAndLogin(otherUser, "questionListOther", "pass456");
+      const denied = await otherUser.get(`/api/protected/conversations/${conversation.id}/open-questions`);
+      expect(denied.status).toBe(404);
+    });
+
+    it("stores an explicit answer link, closes the question, and starts normal processing", async () => {
+      const agent = request.agent(app);
+      await registerAndLogin(agent, "questionAnswerOwner", "pass123");
+      const conversation = await createConversation(agent, "Answer question");
+      const question = await createOpenQuestion(conversation.id);
+
+      const answer = await agent
+        .post(`/api/protected/conversations/${conversation.id}/open-questions/${question.id}/answer`)
+        .send({ content: "We will plant the south field first." });
+
+      expect(answer.status).toBe(201);
+      expect(answer.body).toMatchObject({
+        role: "user",
+        content: "We will plant the south field first.",
+        answersQuestionId: question.id,
+      });
+      const stored = await storage.getConversationMessages(conversation.id);
+      expect(stored.some(message => message.id === answer.body.id)).toBe(true);
+      expect(await storage.getOpenQuestion(question.id)).toMatchObject({
+        status: "answered",
+        answerMessageId: answer.body.id,
+      });
+      expect(mockProcessMessageTurnBased).toHaveBeenCalledWith(
+        expect.any(Number),
+        conversation.id,
+        expect.objectContaining({ id: answer.body.id, answersQuestionId: question.id }),
+        expect.any(Function),
+      );
+      expect((await agent.get(`/api/protected/conversations/${conversation.id}/open-questions`)).body).toEqual([]);
+    });
+
+    it("keeps an answer retryable when its atomic write fails before commit", async () => {
+      const agent = request.agent(app);
+      await registerAndLogin(agent, "questionAnswerRetry", "pass123");
+      const conversation = await createConversation(agent, "Retry answer");
+      const question = await createOpenQuestion(conversation.id);
+      const answerText = "We will plant the south field first.";
+      const originalCreateAnswer = storage.createAnswerMessage.bind(storage);
+      const answerQuestionSpy = vi.spyOn(storage, "createAnswerMessage")
+        .mockRejectedValueOnce(new Error("temporary ledger write failure"))
+        .mockImplementation((message, questionId) => originalCreateAnswer(message, questionId));
+
+      try {
+        const firstAttempt = await agent
+          .post(`/api/protected/conversations/${conversation.id}/open-questions/${question.id}/answer`)
+          .send({ content: answerText });
+        expect(firstAttempt.status).toBe(500);
+        expect(await storage.getOpenQuestion(question.id)).toMatchObject({ status: "open", answerMessageId: null });
+        expect((await storage.getConversationMessages(conversation.id)).filter(message =>
+          message.role === "user" && message.content === answerText,
+        )).toHaveLength(0);
+        expect(mockProcessMessageTurnBased).not.toHaveBeenCalled();
+
+        const retry = await agent
+          .post(`/api/protected/conversations/${conversation.id}/open-questions/${question.id}/answer`)
+          .send({ content: answerText });
+        expect(retry.status).toBe(201);
+        expect(retry.body.answersQuestionId).toBe(question.id);
+        const persistedAnswers = (await storage.getConversationMessages(conversation.id)).filter(message =>
+          message.role === "user" && message.content === answerText,
+        );
+        expect(persistedAnswers).toHaveLength(1);
+        expect(retry.body.id).toBe(persistedAnswers[0].id);
+        expect(await storage.getOpenQuestion(question.id)).toMatchObject({
+          status: "answered",
+          answerMessageId: persistedAnswers[0].id,
+        });
+        expect(answerQuestionSpy).toHaveBeenCalledTimes(2);
+        expect(mockProcessMessageTurnBased).toHaveBeenCalledTimes(1);
+        expect(mockProcessMessageTurnBased).toHaveBeenCalledWith(
+          expect.any(Number),
+          conversation.id,
+          expect.objectContaining({ id: persistedAnswers[0].id, answersQuestionId: question.id }),
+          expect.any(Function),
+        );
+      } finally {
+        answerQuestionSpy.mockRestore();
+      }
+    });
+
+    it("prevents a concurrent answer race from storing an unprocessed message", async () => {
+      const agent = request.agent(app);
+      await registerAndLogin(agent, "questionAnswerRace", "pass123");
+      const conversation = await createConversation(agent, "Concurrent answer");
+      const question = await createOpenQuestion(conversation.id);
+      const answerPath = `/api/protected/conversations/${conversation.id}/open-questions/${question.id}/answer`;
+
+      const responses = await Promise.all([
+        agent.post(answerPath).send({ content: "The pH measured 6.4." }),
+        agent.post(answerPath).send({ content: "The pH measured 6.4." }),
+      ]);
+
+      expect(responses.map(response => response.status).sort()).toEqual(expect.arrayContaining([201]));
+      expect(responses.every(response => [200, 201, 409].includes(response.status))).toBe(true);
+      expect(responses.filter(response => response.status === 200 || response.status === 409)).toHaveLength(1);
+      const linkedAnswers = (await storage.getConversationMessages(conversation.id)).filter(message =>
+        message.role === "user" && message.answersQuestionId === question.id,
+      );
+      expect(linkedAnswers).toHaveLength(1);
+      expect(await storage.getOpenQuestion(question.id)).toMatchObject({
+        status: "answered",
+        answerMessageId: linkedAnswers[0].id,
+      });
+      expect(mockProcessMessageTurnBased).toHaveBeenCalledTimes(1);
+    });
+
+    it("starts one turn when concurrent retries recover a persisted answer", async () => {
+      const agent = request.agent(app);
+      await registerAndLogin(agent, "questionRecoveryRace", "pass123");
+      const conversation = await createConversation(agent, "Concurrent retry recovery");
+      const question = await createOpenQuestion(conversation.id);
+      const answerText = "The last soil test showed pH 6.4.";
+      const answerOwner = await storage.getUserByUsername("questionRecoveryRace");
+      const persistedAnswer = await storage.createMessage({
+        conversationId: conversation.id,
+        userId: answerOwner!.id,
+        expertId: null,
+        content: answerText,
+        role: "user",
+        answersQuestionId: question.id,
+      });
+      const answerPath = `/api/protected/conversations/${conversation.id}/open-questions/${question.id}/answer`;
+
+      const responses = await Promise.all([
+        agent.post(answerPath).send({ content: answerText }),
+        agent.post(answerPath).send({ content: answerText }),
+      ]);
+
+      expect(responses.map(response => response.status)).toEqual([200, 200]);
+      expect((await storage.getConversationMessages(conversation.id)).filter(message =>
+        message.role === "user" && message.answersQuestionId === question.id,
+      )).toEqual([expect.objectContaining({ id: persistedAnswer.id, content: answerText })]);
+      expect(await storage.getOpenQuestion(question.id)).toMatchObject({
+        status: "answered",
+        answerMessageId: persistedAnswer.id,
+      });
+      expect(mockProcessMessageTurnBased).toHaveBeenCalledTimes(1);
+    });
+
+    it("restarts dispatch for a committed answer whose original request missed the turn start", async () => {
+      const agent = request.agent(app);
+      await registerAndLogin(agent, "questionCommitRecovery", "pass123");
+      const conversation = await createConversation(agent, "Committed answer retry");
+      const question = await createOpenQuestion(conversation.id);
+      const answerOwner = await storage.getUserByUsername("questionCommitRecovery");
+      const answerText = "The soil test showed pH 6.4.";
+      const persistedAnswer = await storage.createMessage({
+        conversationId: conversation.id,
+        userId: answerOwner!.id,
+        expertId: null,
+        content: answerText,
+        role: "user",
+        answersQuestionId: question.id,
+      });
+      await storage.answerOpenQuestion(question.id, persistedAnswer.id);
+
+      const retry = await agent
+        .post(`/api/protected/conversations/${conversation.id}/open-questions/${question.id}/answer`)
+        .send({ content: answerText });
+
+      expect(retry.status).toBe(200);
+      expect(retry.body.id).toBe(persistedAnswer.id);
+      expect(mockProcessMessageTurnBased).toHaveBeenCalledTimes(1);
+      expect(mockProcessMessageTurnBased).toHaveBeenCalledWith(
+        expect.any(Number),
+        conversation.id,
+        expect.objectContaining({ id: persistedAnswer.id, answersQuestionId: question.id }),
+        expect.any(Function),
+      );
+
+      await storage.createMessage({
+        conversationId: conversation.id,
+        userId: null,
+        expertId: null,
+        content: "The answer fits this soil plan.",
+        role: "assistant",
+        expertRole: "Agronomist",
+      });
+      const completedRetry = await agent
+        .post(`/api/protected/conversations/${conversation.id}/open-questions/${question.id}/answer`)
+        .send({ content: answerText });
+      expect(completedRetry.status).toBe(200);
+      expect(completedRetry.body.id).toBe(persistedAnswer.id);
+      expect(mockProcessMessageTurnBased).toHaveBeenCalledTimes(1);
+    });
+
+    it("auto-links exactly one open question but leaves multiple questions open", async () => {
+      const agent = request.agent(app);
+      await registerAndLogin(agent, "questionAutoLink", "pass123");
+
+      const singleConversation = await createConversation(agent, "One question");
+      const onlyQuestion = await createOpenQuestion(singleConversation.id);
+      const linked = await agent
+        .post(`/api/protected/conversations/${singleConversation.id}/messages`)
+        .send({ content: "The north field goes first." });
+      expect(linked.status).toBe(201);
+      expect(linked.body.answersQuestionId).toBe(onlyQuestion.id);
+      expect(await storage.getOpenQuestion(onlyQuestion.id)).toMatchObject({ status: "answered" });
+
+      const multipleConversation = await createConversation(agent, "Two questions");
+      const first = await createOpenQuestion(multipleConversation.id, "What is the first field?", "North is first.");
+      const second = await createOpenQuestion(multipleConversation.id, "What is the first crop?", "Corn is first.");
+      const unlinked = await agent
+        .post(`/api/protected/conversations/${multipleConversation.id}/messages`)
+        .send({ content: "I will confirm both later." });
+      expect(unlinked.status).toBe(201);
+      expect(unlinked.body.answersQuestionId).toBeNull();
+      expect(await storage.getOpenQuestion(first.id)).toMatchObject({ status: "open" });
+      expect(await storage.getOpenQuestion(second.id)).toMatchObject({ status: "open" });
+    });
+
+    it("rejects cross-conversation, cross-owner, and closed question IDs", async () => {
+      const owner = request.agent(app);
+      await registerAndLogin(owner, "questionScopeOwner", "pass123");
+      const targetConversation = await createConversation(owner, "Target");
+      const otherConversation = await createConversation(owner, "Other");
+      const question = await createOpenQuestion(otherConversation.id);
+
+      const unauthenticated = await request(app)
+        .post(`/api/protected/conversations/${otherConversation.id}/open-questions/${question.id}/answer`)
+        .send({ content: "Unauthenticated answer." });
+      expect(unauthenticated.status).toBe(401);
+
+      const crossConversation = await owner
+        .post(`/api/protected/conversations/${targetConversation.id}/open-questions/${question.id}/answer`)
+        .send({ content: "This is the wrong conversation." });
+      expect(crossConversation.status).toBe(404);
+
+      const answer = await owner
+        .post(`/api/protected/conversations/${otherConversation.id}/open-questions/${question.id}/answer`)
+        .send({ content: "This is the correct conversation." });
+      expect(answer.status).toBe(201);
+      const closed = await owner
+        .post(`/api/protected/conversations/${otherConversation.id}/open-questions/${question.id}/answer`)
+        .send({ content: "Trying to answer twice." });
+      expect(closed.status).toBe(409);
+
+      const otherUser = request.agent(app);
+      await registerAndLogin(otherUser, "questionScopeOther", "pass456");
+      const crossOwner = await otherUser
+        .post(`/api/protected/conversations/${otherConversation.id}/open-questions/${question.id}/answer`)
+        .send({ content: "Not the owner." });
+      expect(crossOwner.status).toBe(404);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // End-to-End Flow
+  // ─────────────────────────────────────────────────────────────────
+
+  describe("End-to-End Roundtable Flow", () => {
+    it("user creates conversation, adds experts, sends message", async () => {
+      const agent = request.agent(app);
+      await registerAndLogin(agent, "fullflow", "pass123");
+
+      // 1. Create conversation
+      const convo = await createConversation(agent, "Farm Planning Session");
+
+      // 2. Add experts
+      const soilExpert = await addExpert(agent, convo.id, {
+        name: "Dr. Terra",
+        role: "Soil Scientist",
+        model: "openai/gpt-4o:free",
+      });
+      const weatherExpert = await addExpert(agent, convo.id, {
+        name: "Sky Walker",
+        role: "Meteorologist",
+        model: "anthropic/claude-3:free",
+      });
+
+      expect(soilExpert.name).toBe("Dr. Terra");
+      expect(weatherExpert.name).toBe("Sky Walker");
+
+      // 3. Verify experts are listed
+      const expertsRes = await agent.get(
+        `/api/protected/conversations/${convo.id}/experts`,
+      );
+      expect(expertsRes.body.length).toBe(2);
+
+      // 4. Send a message
+      const msgRes = await agent
+        .post(`/api/protected/conversations/${convo.id}/messages`)
+        .send({ content: "What's the best crop rotation for my soil type?" });
+
+      expect(msgRes.status).toBe(201);
+      expect(msgRes.body.role).toBe("user");
+
+      // 5. Verify message is stored
+      const messagesRes = await agent.get(
+        `/api/protected/conversations/${convo.id}/messages`,
+      );
+      expect(messagesRes.body.length).toBe(1);
+      expect(messagesRes.body[0].content).toBe(
+        "What's the best crop rotation for my soil type?",
+      );
+    });
+
+    it("developer user can use dev-login and create a roundtable quickly", async () => {
+      const agent = request.agent(app);
+      await agent.post("/api/dev-login");
+
+      // Create conversation
+      const convo = await createConversation(agent, "Dev Quick Test");
+
+      // Add 3 experts
+      await addExpert(agent, convo.id, {
+        name: "Expert 1",
+        role: "Agronomist",
+        model: "gpt-4",
+      });
+      await addExpert(agent, convo.id, {
+        name: "Expert 2",
+        role: "Economist",
+        model: "claude-3",
+      });
+      await addExpert(agent, convo.id, {
+        name: "Expert 3",
+        role: "Meteorologist",
+        model: "gpt-4o",
+      });
+
+      // Send a message
+      await agent
+        .post(`/api/protected/conversations/${convo.id}/messages`)
+        .send({ content: "How can I improve my farm's sustainability?" });
+
+      // Verify everything
+      const messages = await agent.get(
+        `/api/protected/conversations/${convo.id}/messages`,
+      );
+      expect(messages.body.length).toBe(1);
+
+      const experts = await agent.get(
+        `/api/protected/conversations/${convo.id}/experts`,
+      );
+      expect(experts.body.length).toBe(3);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────
+  // Edge Cases
+  // ─────────────────────────────────────────────────────────────────
+
+  describe("Edge Cases", () => {
+    it("conversation with very long title", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const longTitle = "A".repeat(500);
+      const res = await agent
+        .post("/api/protected/conversations")
+        .send({ title: longTitle });
+
+      expect(res.status).toBe(201);
+      expect(res.body.title.length).toBe(500);
+    });
+
+    it("message with empty content", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const convo = await createConversation(agent);
+
+      const res = await agent
+        .post(`/api/protected/conversations/${convo.id}/messages`)
+        .send({ content: "" });
+
+      // Should still store the message (content is empty string)
+      expect(res.status).toBe(201);
+      expect(res.body.content).toBe("");
+    });
+
+    it("message with special characters and Unicode", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const convo = await createConversation(agent);
+
+      const res = await agent
+        .post(`/api/protected/conversations/${convo.id}/messages`)
+        .send({ content: "🌱 ¿Cómo mejorar el suelo? 土壤改良について" });
+
+      expect(res.status).toBe(201);
+      expect(res.body.content).toBe(
+        "🌱 ¿Cómo mejorar el suelo? 土壤改良について",
+      );
+    });
+
+    it("expert with empty name (server may reject or accept)", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const convo = await createConversation(agent);
+
+      const res = await agent
+        .post(`/api/protected/conversations/${convo.id}/experts`)
+        .send({ name: "", role: "Helper", model: "gpt-4" });
+
+      // May be accepted or rejected — just check it doesn't crash
+      expect([201, 400, 500]).toContain(res.status);
+    });
+
+    it("concurrent message sends are handled", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const convo = await createConversation(agent);
+
+      const [res1, res2] = await Promise.all([
+        agent
+          .post(`/api/protected/conversations/${convo.id}/messages`)
+          .send({ content: "Message A" }),
+        agent
+          .post(`/api/protected/conversations/${convo.id}/messages`)
+          .send({ content: "Message B" }),
+      ]);
+
+      expect(res1.status).toBe(201);
+      expect(res2.status).toBe(201);
+    });
+
+    it("conversation IDs increment properly", async () => {
+      const agent = request.agent(app);
+      await login(agent);
+
+      const convo1 = await createConversation(agent, "First");
+      const convo2 = await createConversation(agent, "Second");
+
+      expect(convo2.id).toBeGreaterThan(convo1.id);
+    });
+  });
+});
