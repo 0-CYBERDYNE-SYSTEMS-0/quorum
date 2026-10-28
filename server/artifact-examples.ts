@@ -42,6 +42,19 @@ export const artifactExamples = [
       ], encoding: { y: { field: "option", type: "nominal", sort: { field: "usd" }, title: null }, x: { field: "usd", type: "quantitative", title: "Quoted upfront cost (USD)", scale: { zero: true } }, tooltip: [{ field: "option" }, { field: "usd", format: "$,.0f", title: "Quoted cost" }] } },
     },
   },
+  {
+    request: "Chair supplies renewal rates by contract type: monthly 71%, annual 88%, multi-year 94%. Show which type holds customers best.",
+    output: {
+      type: "vega-lite", title: "Renewal rate by contract type", theme: "earth", sources: ["Chair"],
+      description: "Multi-year contracts renew most often among the supplied types. Renewal rate alone does not show why customers stay.",
+      data: [{ type: "Multi-year", rate: 0.94 }, { type: "Annual", rate: 0.88 }, { type: "Monthly", rate: 0.71 }],
+      spec: { encoding: { y: { field: "type", type: "nominal", sort: "-x", title: null }, x: { field: "rate", type: "quantitative", title: "Renewal rate", axis: { format: ".0%" }, scale: { domain: [0, 1] } } },
+        layer: [
+          { mark: { type: "bar", size: 26 }, encoding: { color: { condition: { test: "datum.type === 'Multi-year'", value: "accent" }, value: "muted" } } },
+          { mark: { type: "text", align: "left", dx: 8 }, encoding: { text: { field: "rate", type: "quantitative", format: ".0%" } } },
+        ] },
+    },
+  },
 ];
 
 export function artifactExamplesForRequest(request: string): string {

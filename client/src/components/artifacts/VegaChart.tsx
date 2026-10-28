@@ -1,19 +1,34 @@
 import { useEffect, useRef, useState } from "react";
-import { parseVegaChart, themedVegaSpec } from "@shared/chart-artifact";
+import { chartColors, parseVegaChart, themedVegaSpec, type ChartMode } from "@shared/chart-artifact";
+import { toChartModel } from "@shared/chart-model";
+import BarChart from "./BarChart";
+import ColumnChart from "./ColumnChart";
+import LineChart from "./LineChart";
+import StackedBars from "./StackedBars";
+
+const currentMode = (): ChartMode => (document.documentElement.classList.contains("dark") ? "dark" : "light");
 
 export default function VegaChart({ content }: { content: string }) {
   const host = useRef<HTMLDivElement>(null);
   const [error, setError] = useState("");
   const [width, setWidth] = useState(600);
+  const [mode, setMode] = useState<ChartMode>(currentMode);
+  useEffect(() => {
+    const observer = new MutationObserver(() => setMode(currentMode()));
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
+    return () => observer.disconnect();
+  }, []);
+  let chart: ReturnType<typeof parseVegaChart> = null;
+  try { chart = parseVegaChart(JSON.parse(content)); } catch { /* Invalid JSON has a readable fallback. */ }
+  const model = chart ? toChartModel(chart) : null;
+  // The Vega host only exists when no purpose-built renderer applies, and that can change when the content does.
+  const vegaHost = !(chart && model);
   useEffect(() => {
     if (!host.current) return;
     const observer = new ResizeObserver(([entry]) => setWidth(Math.round(entry.contentRect.width)));
     observer.observe(host.current);
     return () => observer.disconnect();
-  }, []);
-
-  let chart: ReturnType<typeof parseVegaChart> = null;
-  try { chart = parseVegaChart(JSON.parse(content)); } catch { /* Invalid JSON has a readable fallback. */ }
+  }, [vegaHost]);
   const columns = chart ? Array.from(new Set(chart.data.flatMap(Object.keys))) : [];
   useEffect(() => {
     const target = host.current;
@@ -29,7 +44,7 @@ export default function VegaChart({ content }: { content: string }) {
         if (!parsed) throw new Error("Invalid chart specification");
         const { default: embed } = await import("vega-embed");
         if (cancelled) return;
-        const result = await embed(mount, themedVegaSpec(parsed, width), {
+        const result = await embed(mount, themedVegaSpec(parsed, width, mode), {
           mode: "vega-lite", renderer: "svg", ast: true, actions: { export: true, source: false, compiled: false, editor: false },
           // All data is inline; even malformed saved specs cannot trigger network loads.
           loader: {
@@ -46,16 +61,23 @@ export default function VegaChart({ content }: { content: string }) {
       }
     })();
     return () => { cancelled = true; finalize?.(); mount.remove(); };
-  }, [content, width]);
+  }, [content, width, mode]);
 
   return (
     <div className="space-y-4">
-      {chart?.description && <p className="text-sm leading-relaxed text-neutral-600">{chart.description}</p>}
+      {chart?.description && <p className="text-sm leading-relaxed text-muted-ink">{chart.description}</p>}
       {error && <p role="alert" className="text-sm text-amber-800 dark:text-amber-300">{error}</p>}
-      <div ref={host} className="w-full overflow-x-auto rounded-lg bg-white p-1" aria-label={chart?.title || "Visualization"} />
+      {chart && model
+        ? <div className="w-full rounded-lg bg-surface-raised px-4 py-3">
+            {model.kind === "lines" ? <LineChart model={model} palette={chartColors(chart, mode)} title={chart.title} />
+              : model.kind === "stacked" ? <StackedBars model={model} palette={chartColors(chart, mode)} title={chart.title} />
+              : model.vertical ? <ColumnChart model={model} palette={chartColors(chart, mode)} title={chart.title} />
+              : <BarChart model={model} palette={chartColors(chart, mode)} title={chart.title} />}
+          </div>
+        : <div ref={host} className="w-full overflow-x-auto rounded-lg bg-surface-raised p-2" aria-label={chart?.title || "Visualization"} />}
       {chart && <>
-        <p className="text-xs text-neutral-500">Sources: {chart.sources.map((source, index) => <span key={source}>{index > 0 && " · "}{/^https?:\/\//i.test(source) ? <a className="underline" href={source} target="_blank" rel="noopener noreferrer">{source}</a> : source}</span>)}</p>
-        <details className="text-xs text-neutral-600">
+        <p className="text-xs text-muted-ink">Sources: {chart.sources.map((source, index) => <span key={source}>{index > 0 && " · "}{/^https?:\/\//i.test(source) ? <a className="underline" href={source} target="_blank" rel="noopener noreferrer">{source}</a> : source}</span>)}</p>
+        <details className="text-xs text-muted-ink">
           <summary className="cursor-pointer">View source data · {chart.data.length} rows</summary>
           {chart.data.length > 100 && <p className="mt-2">Showing the first 100 rows. Download the chart JSON for the complete dataset.</p>}
           <div className="mt-2 max-h-64 overflow-auto"><table className="w-full text-left"><thead><tr>{columns.map(key => <th key={key} className="p-2 border-b">{key}</th>)}</tr></thead><tbody>{chart.data.slice(0, 100).map((row, index) => <tr key={index}>{columns.map(key => <td key={key} className="p-2 border-b">{row[key] == null ? "—" : String(row[key])}</td>)}</tr>)}</tbody></table></div>

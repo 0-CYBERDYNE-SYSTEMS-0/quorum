@@ -69,12 +69,12 @@ export default function ArtifactDisplay({ artifact }: ArtifactDisplayProps) {
       if (Array.isArray(data) && data.length > 0) {
         const keys = Object.keys(data[0]);
         return (
-          <div className="overflow-x-auto rounded-lg border border-primary/20 shadow-sm">
-            <table className="w-full text-sm border-collapse">
+          <div className="overflow-x-auto rounded-lg border border-line bg-surface-raised">
+            <table className="w-full text-sm border-collapse tabular-nums">
               <thead>
-                <tr className="bg-primary/10 dark:bg-primary/20">
+                <tr className="bg-slatewash">
                   {keys.map((key, i) => (
-                    <th key={i} className="p-3 border-b border-primary/20 font-bold text-left text-farm-dark-green uppercase tracking-wider text-xs">
+                    <th key={i} className="p-3 border-b border-line-strong font-semibold text-left text-muted-ink uppercase tracking-wider text-[11px]">
                       {String(key)}
                     </th>
                   ))}
@@ -83,8 +83,7 @@ export default function ArtifactDisplay({ artifact }: ArtifactDisplayProps) {
               <tbody>
                 {data.map((row, i) => (
                   <tr key={i} className={cn(
-                    "transition-colors hover:bg-primary/5",
-                    i % 2 === 0 ? "bg-card" : "bg-neutral-50/50"
+                    "transition-colors hover:bg-bronze-wash/50"
                   )}>
                     {keys.map((key, j) => {
                       const val = String(row[key] || "");
@@ -94,7 +93,7 @@ export default function ArtifactDisplay({ artifact }: ArtifactDisplayProps) {
                       
                       return (
                         <td key={j} className={cn(
-                          "p-3 border-b border-neutral-100 font-medium",
+                          "p-3 border-b border-line text-ink last:border-b-0",
                           isStatus && "text-emerald-600 dark:text-emerald-400",
                           isWarning && "text-amber-600 dark:text-amber-400 font-bold",
                           isCritical && "text-red-600 dark:text-red-400 font-bold"
@@ -150,20 +149,20 @@ export default function ArtifactDisplay({ artifact }: ArtifactDisplayProps) {
         if (isMarkdownTable) {
           return (
             <div className="overflow-x-auto">
-              <table className="w-full text-sm border-collapse border border-neutral-200">
+              <table className="w-full text-sm border-collapse tabular-nums">
                 <tbody>
                   {artifact.content
                     .split("\n")
                     .filter((line) => line.trim() && !/^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)+\|?\s*$/.test(line))
                     .map((row, i) => (
-                      <tr key={i} className={i === 0 ? "border-b-2 border-neutral-300" : ""}>
+                      <tr key={i} className={i === 0 ? "bg-slatewash" : ""}>
                         {row
                           .split("|")
                           .filter((cell) => cell.trim())
                           .map((cell, j) => (
                             <td
                               key={j}
-                              className={`p-2 border border-neutral-200 ${i === 0 ? "font-semibold bg-neutral-100" : ""}`}
+                              className={`p-3 border-b border-line ${i === 0 ? "font-semibold text-muted-ink uppercase tracking-wider text-[11px]" : "text-ink"}`}
                             >
                               {cell.trim()}
                             </td>
@@ -285,12 +284,12 @@ export default function ArtifactDisplay({ artifact }: ArtifactDisplayProps) {
 
       case "html":
         // HTML content is sanitized with DOMPurify to prevent XSS attacks
-        // sandbox allows both scripts and same-origin for full functionality
+        // Scripts may run, but without same-origin the frame cannot reach the app's cookies or storage
         return (
           <iframe
             srcDoc={sanitizedHTML}
             className="w-full h-80 border border-neutral-200 rounded"
-            sandbox="allow-scripts allow-same-origin"
+            sandbox="allow-scripts"
             title="HTML Artifact"
           />
         );
@@ -312,7 +311,7 @@ export default function ArtifactDisplay({ artifact }: ArtifactDisplayProps) {
             <div className="flex items-center gap-2 min-w-0">
               {getIcon()}
               <CardTitle className="text-sm truncate">{artifact.title}</CardTitle>
-              <span className="text-xs text-neutral-500 bg-neutral-100 px-2 py-1 rounded flex-shrink-0">{artifact.type}</span>
+              <span className="rounded-full bg-slatewash px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-ink flex-shrink-0">{artifact.type}</span>
             </div>
             <div className="flex gap-1 flex-shrink-0">
               <Button size="sm" variant="ghost" onClick={handleCopy} title="Copy content" aria-label="Copy artifact content" className="h-8 w-8 p-0">
@@ -341,7 +340,7 @@ export default function ArtifactDisplay({ artifact }: ArtifactDisplayProps) {
             <div className="flex min-w-0 items-center gap-3">
               {getIcon()}
               <DialogTitle className="truncate text-lg">{artifact.title}</DialogTitle>
-              <span className="rounded bg-neutral-100 px-2 py-1 text-xs text-neutral-600">{artifact.type}</span>
+              <span className="rounded-full bg-slatewash px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider text-muted-ink">{artifact.type}</span>
             </div>
             <div className="flex gap-2">
               <Button size="sm" variant="ghost" onClick={handleCopy} aria-label="Copy artifact content" title="Copy">

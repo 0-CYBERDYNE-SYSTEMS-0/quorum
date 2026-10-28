@@ -23,6 +23,46 @@ describe("themed Vega-Lite artifacts", () => {
     try { await view.runAsync(); expect(await view.toSVG()).toContain("<svg"); }
     finally { view.finalize(); }
   });
+  it("fits single-view charts to their container and themes light and dark", async () => {
+    const parsed = parseVegaChart(chart)!;
+    const light = themedVegaSpec(parsed, 500) as Record<string, any>;
+    const dark = themedVegaSpec(parsed, 500, "dark") as Record<string, any>;
+    expect(light.autosize).toEqual({ type: "fit", contains: "padding" });
+    expect(light.width).toBeLessThanOrEqual(500);
+    expect(light.config.range.category).not.toEqual(dark.config.range.category);
+    expect(light.config.axis.labelColor).not.toBe(dark.config.axis.labelColor);
+    const spec = compile(dark as unknown as TopLevelSpec).spec;
+    const view = new View(parse(spec, undefined, { ast: true }), { renderer: "none", expr: expressionInterpreter });
+    try { await view.runAsync(); expect(await view.toSVG()).toContain("<svg"); }
+    finally { view.finalize(); }
+  });
+  it("brands the expert's spec: tokens resolve, literal mark colors drop, tooltips and flat ranges are fixed", async () => {
+    const spec = {
+      layer: [
+        { mark: { type: "bar", color: "#4c78a8" }, encoding: { color: { condition: { test: "datum.segment === 'SMB'", value: "accent" }, value: "muted" } } },
+        { mark: { type: "text" }, encoding: { text: { field: "revenue", type: "quantitative" } } },
+      ],
+      encoding: { y: { field: "revenue", type: "quantitative" }, y2: { field: "revenue" }, x: { field: "segment", type: "nominal" } },
+    };
+    const parsed = parseVegaChart({ ...chart, spec })!;
+    const light = themedVegaSpec(parsed, 500) as Record<string, any>;
+    const dark = themedVegaSpec(parsed, 500, "dark") as Record<string, any>;
+    expect(light.layer[0].mark).toEqual({ type: "bar", tooltip: true });
+    expect(light.layer[1].mark.tooltip).toBeUndefined();
+    expect(light.layer[0].encoding.color.condition.value).toBe(light.config.range.category[0]);
+    expect(light.layer[0].encoding.color.value).not.toBe(dark.layer[0].encoding.color.value);
+    expect(light.encoding.y2).toBeUndefined();
+    expect(light.config.mark.color).toBe(light.config.range.category[0]);
+    expect(parsed.spec.layer).toHaveLength(2);
+    expect((parsed.spec as any).layer[0].mark.color).toBe("#4c78a8");
+  });
+  it("only swaps color tokens, never inherited object properties", () => {
+    const parsed = parseVegaChart({ ...chart, spec: { layer: [{ mark: { type: "text" }, encoding: { text: { value: "toString" }, color: { value: "constructor" } } }, { mark: { type: "bar" }, encoding: { color: { value: "accent" } } }] } })!;
+    const [text, bar] = (themedVegaSpec(parsed) as { layer: { encoding: Record<string, { value: unknown }> }[] }).layer;
+    expect(text.encoding.color.value).toBe("constructor");
+    expect(text.encoding.text.value).toBe("toString");
+    expect(bar.encoding.color.value).toMatch(/^#/);
+  });
   it("loads examples for visualization requests without adding them to ordinary discussion", () => {
     expect(artifactExamplesForRequest("Make an immersive visualization")).toContain("fictional training context, never evidence");
     expect(artifactExamplesForRequest("What should I scout next?")).toBe("");
