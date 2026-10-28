@@ -27,10 +27,14 @@ export default function ColumnChart({ model, palette, title }: { model: BarModel
   const waterfall = ranged;
 
   const ends = rows.flatMap(row => [row.value, row.high ?? row.value]);
-  const lo = Math.min(0, ...ends);
+  // scale.zero:false (non-waterfall): the axis starts just under the smallest value instead of at zero.
+  const cut = model.truncated && !waterfall;
+  const lo = cut ? Math.min(...ends) : Math.min(0, ...ends);
   const hi = Math.max(...ends);
-  const { step, top } = niceScale(Math.max(hi, -lo) * 1.1);
-  const bottomValue = lo < 0 ? -Math.ceil(-lo / step) * step : 0;
+  const { step } = niceScale(cut ? Math.max(hi - lo, 1e-9) * 1.1 : Math.max(hi, -lo) * 1.1);
+  const bottomValue = cut ? Math.floor((lo - step * 0.15) / step) * step : lo < 0 ? -Math.ceil(-lo / step) * step : 0;
+  const topEdge = hi > bottomValue ? Math.ceil((cut ? hi + step * 0.15 : hi * 1.1) / step) * step : bottomValue + step;
+  const top = Math.max(topEdge, bottomValue + step);
   const ticks = Array.from({ length: Math.round((top - bottomValue) / step) + 1 }, (_, index) => bottomValue + index * step);
   const w = Math.max(320, width);
   const plotW = w - M.left - M.right;
@@ -71,12 +75,13 @@ export default function ColumnChart({ model, palette, title }: { model: BarModel
         ))}
         {rows.map((row, index) => {
           const x = M.left + band * index + (band - barW) / 2;
-          const a = waterfall ? yOf(row.value) : yOf(0);
+          const a = waterfall ? yOf(row.value) : yOf(cut ? bottomValue : 0);
           const b = yOf(level(row));
           const y = Math.min(a, b);
           const h = Math.max(3, Math.abs(a - b));
-          const labelY = y - 8;
-          const down = waterfall && level(row) < row.value;
+          const below = !waterfall && row.value < 0;
+          const labelY = below ? y + h + 16 : y - 8;
+          const down = below || (waterfall && level(row) < row.value);
           return (
             <g key={row.name} style={{ opacity: active === null || active === index ? 1 : 0.4, transition: "opacity 160ms" }}
               onMouseEnter={() => setActive(index)} onMouseMove={event => { const rect = box.current?.getBoundingClientRect(); if (rect) setPointer({ x: event.clientX - rect.left, y: event.clientY - rect.top }); }}>

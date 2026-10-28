@@ -44,7 +44,8 @@ export interface LineModel {
   xs: { label: string; num: number }[];
   /** Position by value (dates, numbers) rather than by order (categories). */
   continuous: boolean;
-  series: { name: string; points: (number | null)[] }[];
+  /** colorIndex is the series' place in the palette, stable when an empty series is not drawn. */
+  series: { name: string; points: (number | null)[]; colorIndex: number }[];
   area: boolean;
   zero: boolean;
   /** An explicit y axis range from the expert; honored over the zero baseline. */
@@ -92,6 +93,12 @@ function formatter(title: string, format?: string): Formatter {
   }
   return { full: n => trim(n), tick: n => trim(n) };
 }
+
+/** Whole words of a field name (snake_case, kebab-case, camelCase), so "total" is never read as "to". */
+const words = (field: string) => field.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+const hasWord = (field: string, set: Set<string>) => words(field).some(word => set.has(word));
+const startWords = new Set(["from", "start", "prev", "previous", "prior", "before", "base", "open", "begin"]);
+const endWords = new Set(["to", "end", "after", "close", "next"]);
 
 const markType = (node: Loose) => (typeof node.mark === "string" ? node.mark : node.mark?.type);
 const categorical = (channel?: Loose) => ["nominal", "ordinal"].includes(channel?.type);
@@ -163,7 +170,7 @@ function toBarModel(chart: VegaChart, spec: Loose, layers: Loose[]): BarModel | 
   if (conditions.some(item => testMatches(item.test, {}) === null)) return null;
   const baseTone = toneOf(enc.color?.value, "accent");
   // y/y2 are just two ends; field names say which one is the start of the step (so "to"/"from" can come in either order).
-  const swapped = high?.field && (/^(from|start|prev|before|base|open|begin)/i.test(high.field) || /^(to|end|after|close|next)/i.test(val.field));
+  const swapped = high?.field && (hasWord(high.field, startWords) || hasWord(val.field, endWords));
   const tooltips = tooltipsOf(enc);
 
   const rows: BarRow[] = [];
@@ -187,10 +194,23 @@ function toBarModel(chart: VegaChart, spec: Loose, layers: Loose[]): BarModel | 
   }
   if (!rows.length || new Set(rows.map(row => row.name)).size !== rows.length) return null;
 
+  // Sorts follow Vega-Lite: "x"/"y" sort by that channel (the value axis orders by value, the category axis by name),
+  // "ascending"/"descending" order by name, null keeps data order. Only an absent sort is ours: horizontal bars rank by value.
   const order: unknown = cat.sort;
-  const descending = order === "-x" || order === "-y" || order === "descending" || (order as Loose | null)?.order === "descending";
+  const valueChannel = vertical ? "y" : "x";
+  const catChannel = vertical ? "x" : "y";
+  const byValue = (dir: number) => rows.sort((a, b) => dir * ((a.high ?? a.value) - (b.high ?? b.value)));
+  const byName = (dir: number) => rows.sort((a, b) => dir * (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   if (Array.isArray(order)) rows.sort((a, b) => order.indexOf(a.name) - order.indexOf(b.name));
-  else if (descending || (!vertical && cat.type === "nominal" && order !== "x" && order !== "y" && order !== "ascending")) rows.sort((a, b) => (b.high ?? b.value) - (a.high ?? a.value));
+  else if (order === undefined) { if (!vertical && cat.type === "nominal") byValue(-1); }
+  else if (order !== null) {
+    const spec: Loose = typeof order === "string" ? { encoding: order.replace(/^-/, ""), order: order.startsWith("-") ? "descending" : "ascending" } : (order as Loose);
+    const dir = spec.order === "descending" ? -1 : 1;
+    if (order === "ascending" || order === "descending") byName(dir);
+    else if (spec.encoding === valueChannel || (spec.field && spec.field === val.field)) byValue(dir);
+    else if (spec.encoding === catChannel || (spec.field && spec.field === cat.field)) byName(dir);
+    else return null;
+  }
   return { kind: "bars", vertical, rows, axisTitle: String(val.title ?? val.axis?.title ?? ""), ranged: rows.some(row => row.high !== null), dots, truncated: val.scale?.zero === false, format: full, tick };
 }
 
@@ -206,9 +226,14 @@ function toStackedModel(chart: VegaChart, spec: Loose, layers: Loose[]): Stacked
   const normalized = x.stack === "normalize";
   const { full } = formatter(title, x.axis?.format);
   const seen = (field: string) => Array.from(new Set(chart.data.map(row => String(row[field]))));
-  const orderOf = (preset: unknown, found: string[]) => (Array.isArray(preset) && preset.every(item => typeof item === "string") ? (preset as string[]).filter(item => found.includes(item)) : found);
+  // An order list must name every value in the data; otherwise rows would silently disappear and shares would misstate the whole.
+  const orderOf = (preset: unknown, found: string[]): string[] | null => {
+    if (!Array.isArray(preset) || !preset.every(item => typeof item === "string")) return found;
+    return found.every(item => preset.includes(item)) ? (preset as string[]).filter(item => found.includes(item)) : null;
+  };
   const seriesNames = orderOf(color.sort ?? color.scale?.domain, seen(color.field));
   const names = orderOf(y.sort, seen(y.field));
+  if (!seriesNames || !names) return null;
   const range: unknown[] = Array.isArray(color.scale?.range) ? color.scale.range : [];
   const series = seriesNames.map((name, index) => ({ name, tone: toneOf(range[index], index) }));
   if (series.length < 2 || series.length > 6) return null;
@@ -220,11 +245,17 @@ function toStackedModel(chart: VegaChart, spec: Loose, layers: Loose[]): Stacked
     if (!Number.isFinite(value) || value < 0 || cell.has(key)) return null;
     cell.set(key, value);
   }
-  const categories = names.map(name => {
-    const values = series.map(item => cell.get(`${name}\u0000${item.name}`) ?? 0);
+  const categories: StackedModel["categories"] = [];
+  for (const name of names) {
+    const values: number[] = [];
+    for (const item of series) {
+      const value = cell.get(`${name}\u0000${item.name}`);
+      if (value === undefined) return null; // a missing cell is missing, not zero
+      values.push(value);
+    }
     const total = values.reduce((sum, value) => sum + value, 0);
-    return { name, total, cells: values.map(value => ({ value, share: total ? value / total : 0, label: full(value) })) };
-  });
+    categories.push({ name, total, cells: values.map(value => ({ value, share: total ? value / total : 0, label: full(value) })) });
+  }
   if (!categories.length || categories.every(item => item.total === 0)) return null;
   return { kind: "stacked", categories, series, normalized, axisTitle: String(x.title ?? x.axis?.title ?? ""), format: full };
 }
@@ -256,12 +287,17 @@ function toLineModel(chart: VegaChart, spec: Loose, layers: Loose[]): LineModel 
   else if (Array.isArray(x.sort)) keys.sort((a, b) => x.sort.indexOf(a) - x.sort.indexOf(b));
   const xs = keys.map((key, index) => ({ label: key, num: num(key, index) }));
   if (xs.length < 2 || xs.some(point => !Number.isFinite(point.num))) return null;
+  // Distinct labels can parse to the same position ("2026-01-01" and "2026-01-01T00:00"); that cannot be drawn.
+  if (continuous && xs.some((point, index) => index > 0 && point.num === xs[index - 1].num)) return null;
   if (x.type === "temporal") {
     const span = (xs[xs.length - 1].num - xs[0].num) / 864e5;
     xs.forEach(point => { point.label = dateLabel(point.num, span); });
   }
 
-  const names = color?.field ? Array.from(new Set(chart.data.map(raw => String(raw[color.field])))) : [title];
+  // Vega colors a nominal series by its sorted position (or the expert's order), so use the same order and keep it when a series is empty.
+  const found = color?.field ? Array.from(new Set(chart.data.map(raw => String(raw[color.field])))) : [title];
+  const preset: unknown = color?.sort ?? color?.scale?.domain;
+  const names = Array.isArray(preset) && found.every(name => preset.includes(name)) ? preset.filter(name => found.includes(name)) : [...found].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
   if (names.length > 6) return null;
   const series = names.map(name => {
     const points: (number | null)[] = keys.map(() => null);
@@ -272,7 +308,7 @@ function toLineModel(chart: VegaChart, spec: Loose, layers: Loose[]): LineModel 
       if (at >= 0 && Number.isFinite(value)) points[at] = value;
     }
     return { name, points };
-  });
+  }).map((item, colorIndex) => ({ ...item, colorIndex }));
   const area = layers.some(node => markType(node) === "area");
   // Vega stacks multi-series areas by default; overlaying them would misstate the total.
   if (area && series.length > 1 && y.stack !== false && y.stack !== null) return null;

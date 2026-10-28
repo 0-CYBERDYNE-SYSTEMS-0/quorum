@@ -102,6 +102,49 @@ describe("toBarModel", () => {
     const spec = { mark: "bar", encoding: { y: { field: "band", type: "ordinal" }, x: { field: "n", type: "quantitative" } } };
     expect(toBarModel(parseVegaChart({ ...base, data, spec })!)!.rows.map(row => row.name)).toEqual(["0-1 yr", "1-3 yr", "3+ yr"]);
   });
+  it("falls back to Vega rather than dropping or zero-filling stacked data", () => {
+    const stack = (data: Record<string, unknown>[], color: Record<string, unknown>, y: Record<string, unknown> = {}) =>
+      parseVegaChart({ ...base, data, spec: { mark: "bar", encoding: { y: { field: "row", type: "nominal", ...y }, x: { field: "n", type: "quantitative", stack: "normalize" }, color: { field: "g", type: "nominal", ...color } } } })!;
+    const data = [{ row: "R1", g: "A", n: 1 }, { row: "R1", g: "B", n: 1 }, { row: "R1", g: "C", n: 2 }];
+    expect(toChartModel(stack(data, { scale: { domain: ["A", "B"] } }))).toBeNull();                  // series C would vanish
+    expect(toChartModel(stack(data, {}, { sort: ["R2"] }))).toBeNull();                                 // row R1 would vanish
+    expect(toChartModel(stack(data.slice(0, 2).concat([{ row: "R2", g: "A", n: 4 }]), {}))).toBeNull(); // R2/B is missing, not 0
+    expect((toChartModel(stack(data, { scale: { domain: ["C", "A", "B", "D"] } })) as StackedModel).series.map(item => item.name)).toEqual(["C", "A", "B"]);
+  });
+  it("reads waterfall direction from whole words, not prefixes", () => {
+    const run = (y: string, y2: string, row: Record<string, number>) =>
+      (toBarModel(parseVegaChart({ ...base, data: [{ step: "S", ...row }], spec: { mark: "bar", encoding: { x: { field: "step", type: "ordinal" }, y: { field: y, type: "quantitative", title: "EBITDA ($K)" }, y2: { field: y2 } } } })!)!).rows[0].label;
+    expect(run("total", "delta", { total: 100, delta: 160 })).toBe("+$60K");                   // "total" is not "to"
+    expect(run("baseline", "level", { baseline: 100, level: 160 })).toBe("+$60K");            // "baseline" is not "base"
+    expect(run("total_after", "prior_total", { total_after: 160, prior_total: 100 })).toBe("+$60K");
+    expect(run("endBalance", "startBalance", { endBalance: 160, startBalance: 100 })).toBe("+$60K");
+  });
+  it("sorts the way Vega-Lite does when the expert asks", () => {
+    const data = [{ k: "b", n: 2 }, { k: "c", n: 3 }, { k: "a", n: 1 }];
+    const names = (sort: unknown, extra: Record<string, unknown> = {}) =>
+      toBarModel(parseVegaChart({ ...base, data, spec: { mark: "bar", encoding: { y: { field: "k", type: "nominal", sort }, x: { field: "n", type: "quantitative" }, ...extra } } })!)?.rows.map(row => row.name) ?? null;
+    expect(names("x")).toEqual(["a", "b", "c"]);                                                         // ascending by value
+    expect(names("-x")).toEqual(["c", "b", "a"]);
+    expect(names("y")).toEqual(["a", "b", "c"]);                                                         // by name
+    expect(names("-y")).toEqual(["c", "b", "a"]);
+    expect(names("ascending")).toEqual(["a", "b", "c"]);
+    expect(names({ field: "n", order: "descending" })).toEqual(["c", "b", "a"]);
+    expect(names(null)).toEqual(["b", "c", "a"]);                                                        // data order
+    expect(names({ field: "other" })).toBeNull();                                                        // cannot honor it: use Vega
+  });
+  it("breaks lines at gaps and refuses x values that collapse to one position", () => {
+    const gap = [{ m: "2026-01-01", n: 1 }, { m: "2026-02-01", n: 2 }, { m: "2026-03-01", n: null }, { m: "2026-04-01", n: 4 }];
+    const spec = { mark: "line", encoding: { x: { field: "m", type: "temporal" }, y: { field: "n", type: "quantitative" } } };
+    expect((toChartModel(parseVegaChart({ ...base, data: gap, spec })!) as LineModel).series[0].points).toEqual([1, 2, null, 4]);
+    const same = [{ m: "2026-01-01", n: 1 }, { m: "2026-01-01T00:00:00Z", n: 2 }, { m: "2026-02-01", n: 3 }];
+    expect(toChartModel(parseVegaChart({ ...base, data: same, spec })!)).toBeNull();
+  });
+  it("colors series like Vega: by sorted position, stable when a series is empty", () => {
+    const data = [{ m: "Jan", g: "B", n: 1 }, { m: "Feb", g: "B", n: 2 }, { m: "Jan", g: "A", n: null }, { m: "Feb", g: "A", n: null }, { m: "Jan", g: "C", n: 3 }, { m: "Feb", g: "C", n: 4 }];
+    const spec = { mark: "line", encoding: { x: { field: "m", type: "ordinal" }, y: { field: "n", type: "quantitative" }, color: { field: "g", type: "nominal" } } };
+    const model = toChartModel(parseVegaChart({ ...base, data, spec })!) as LineModel;
+    expect(model.series.map(item => [item.name, item.colorIndex])).toEqual([["B", 1], ["C", 2]]);
+  });
   it("picks round gridlines", () => {
     expect(niceScale(3338000)).toEqual({ step: 1000000, top: 4000000 });
     expect(niceScale(0)).toEqual({ step: 1, top: 1 });

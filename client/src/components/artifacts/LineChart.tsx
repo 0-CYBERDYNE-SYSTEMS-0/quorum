@@ -54,7 +54,14 @@ export default function LineChart({ model, palette, title }: { model: LineModel;
 
   const paths = series.map(item => {
     const pts = item.points.flatMap((value, index) => (value === null ? [] : [[xOf(index), yOf(value)] as [number, number]]));
-    return { item, pts, d: smooth(pts) };
+    // A missing value breaks the line; it is never bridged as if data existed.
+    const runs: [number, number][][] = [];
+    item.points.forEach((value, index) => {
+      if (value === null) return;
+      if (index === 0 || item.points[index - 1] === null) runs.push([]);
+      runs[runs.length - 1].push([xOf(index), yOf(value)]);
+    });
+    return { item, pts, runs, d: runs.map(smooth).join("") };
   });
   // End labels keep a minimum gap so neighbouring series names never collide.
   const ends = paths.map(({ pts }, index) => ({ index, y: pts[pts.length - 1][1] })).sort((a, b) => a.y - b.y);
@@ -77,8 +84,8 @@ export default function LineChart({ model, palette, title }: { model: LineModel;
         <defs>
           {paths.map(({ item }, index) => (
             <linearGradient key={item.name} id={`${uid}-a${index}`} x1="0" x2="0" y1="0" y2="1">
-              <stop offset="0" stopColor={palette.series[index]} stopOpacity={model.area ? 0.34 : 0.16} />
-              <stop offset="1" stopColor={palette.series[index]} stopOpacity={0} />
+              <stop offset="0" stopColor={palette.series[item.colorIndex]} stopOpacity={model.area ? 0.34 : 0.16} />
+              <stop offset="1" stopColor={palette.series[item.colorIndex]} stopOpacity={0} />
             </linearGradient>
           ))}
           <clipPath id={`${uid}-reveal`}><rect x={0} y={0} height={HEIGHT} width={ready ? w : 0} style={{ transition: "width 1100ms cubic-bezier(.2,.7,.2,1)" }} /></clipPath>
@@ -93,11 +100,11 @@ export default function LineChart({ model, palette, title }: { model: LineModel;
           <text key={index} x={xOf(index)} y={HEIGHT - M.bottom + 24} textAnchor={index === 0 ? "start" : index === xs.length - 1 ? "end" : "middle"} className="fill-faint-ink text-[11px]">{xs[index].label}</text>
         ))}
         <g clipPath={`url(#${uid}-reveal)`}>
-          {paths.map(({ item, pts, d }, index) => {
-            const color = palette.series[index];
+          {paths.map(({ item, pts, runs, d }, index) => {
+            const color = palette.series[item.colorIndex];
             return (
               <g key={item.name} style={{ opacity: at === null ? 1 : 0.95 }}>
-                {(model.area || !multi) && <path d={`${d}L${pts[pts.length - 1][0]},${yOf(lo)}L${pts[0][0]},${yOf(lo)}Z`} fill={`url(#${uid}-a${index})`} />}
+                {(model.area || !multi) && runs.filter(run => run.length > 1).map((run, at) => <path key={at} d={`${smooth(run)}L${run[run.length - 1][0]},${yOf(lo)}L${run[0][0]},${yOf(lo)}Z`} fill={`url(#${uid}-a${index})`} />)}
                 <path d={d} fill="none" stroke={color} strokeWidth={2.8} strokeLinecap="round" strokeLinejoin="round" />
                 {xs.length <= 14 && pts.map(([px, py], i) => <circle key={i} cx={px} cy={py} r={3} fill="hsl(var(--surface-raised))" stroke={color} strokeWidth={2} />)}
               </g>
@@ -106,11 +113,11 @@ export default function LineChart({ model, palette, title }: { model: LineModel;
         </g>
         {paths.map(({ item, pts }, index) => {
           const last = pts[pts.length - 1];
-          const lastValue = item.points[item.points.length - 1];
+          const lastValue = item.points.filter((value): value is number => value !== null).pop() ?? null;
           return (
             <g key={`e${item.name}`} style={{ opacity: ready ? 1 : 0, transition: "opacity 500ms 900ms" }}>
-              <circle cx={last[0]} cy={last[1]} r={5} fill={palette.series[index]} stroke="hsl(var(--surface-raised))" strokeWidth={2.5} />
-              <text x={last[0] + 12} y={endY.get(index) ?? last[1]} dy="0.32em" className="text-[12px] font-semibold" fill={palette.series[index]}>
+              <circle cx={last[0]} cy={last[1]} r={5} fill={palette.series[item.colorIndex]} stroke="hsl(var(--surface-raised))" strokeWidth={2.5} />
+              <text x={last[0] + 12} y={endY.get(index) ?? last[1]} dy="0.32em" className="text-[12px] font-semibold" fill={palette.series[item.colorIndex]}>
                 {multi ? item.name : lastValue !== null ? model.format(lastValue) : ""}
               </text>
               {multi && lastValue !== null && <text x={last[0] + 12} y={(endY.get(index) ?? last[1]) + 12} dy="0.32em" className="fill-muted-ink text-[11px] tabular-nums">{model.format(lastValue)}</text>}
@@ -124,7 +131,7 @@ export default function LineChart({ model, palette, title }: { model: LineModel;
           <g pointerEvents="none">
             <line x1={xOf(at)} x2={xOf(at)} y1={M.top} y2={M.top + plotH} stroke="hsl(var(--ink))" strokeOpacity={0.35} strokeWidth={1} />
             {series.map((item, index) => item.points[at] === null ? null : (
-              <circle key={item.name} cx={xOf(at)} cy={yOf(item.points[at]!)} r={5.5} fill={palette.series[index]} stroke="hsl(var(--surface-raised))" strokeWidth={2.5} />
+              <circle key={item.name} cx={xOf(at)} cy={yOf(item.points[at]!)} r={5.5} fill={palette.series[item.colorIndex]} stroke="hsl(var(--surface-raised))" strokeWidth={2.5} />
             ))}
           </g>
         )}
@@ -133,7 +140,7 @@ export default function LineChart({ model, palette, title }: { model: LineModel;
       {model.yTitle && <p className="text-center text-[11px] text-faint-ink">{model.yTitle}</p>}
       {at !== null && (
         <HoverCard x={xOf(at)} y={M.top + 30} width={w} title={xs[at].label}
-          lines={series.flatMap((item, index) => (item.points[at] === null ? [] : [{ name: item.name, value: model.format(item.points[at]!), color: palette.series[index] }]))} />
+          lines={series.flatMap((item, index) => (item.points[at] === null ? [] : [{ name: item.name, value: model.format(item.points[at]!), color: palette.series[item.colorIndex] }]))} />
       )}
     </div>
   );

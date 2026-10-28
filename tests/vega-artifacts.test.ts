@@ -56,6 +56,13 @@ describe("themed Vega-Lite artifacts", () => {
     expect(parsed.spec.layer).toHaveLength(2);
     expect((parsed.spec as any).layer[0].mark.color).toBe("#4c78a8");
   });
+  it("only swaps color tokens, never inherited object properties", () => {
+    const parsed = parseVegaChart({ ...chart, spec: { layer: [{ mark: { type: "text" }, encoding: { text: { value: "toString" }, color: { value: "constructor" } } }, { mark: { type: "bar" }, encoding: { color: { value: "accent" } } }] } })!;
+    const [text, bar] = (themedVegaSpec(parsed) as { layer: { encoding: Record<string, { value: unknown }> }[] }).layer;
+    expect(text.encoding.color.value).toBe("constructor");
+    expect(text.encoding.text.value).toBe("toString");
+    expect(bar.encoding.color.value).toMatch(/^#/);
+  });
   it("loads examples for visualization requests without adding them to ordinary discussion", () => {
     expect(artifactExamplesForRequest("Make an immersive visualization")).toContain("fictional training context, never evidence");
     expect(artifactExamplesForRequest("What should I scout next?")).toBe("");

@@ -66,7 +66,7 @@ function refineSpec(spec: Record<string, unknown>, data: VegaChart["data"], pale
     if (Array.isArray(node)) return node.map(resolve);
     if (!node || typeof node !== "object") return node;
     return Object.fromEntries(Object.entries(node).map(([key, child]) =>
-      [key, typeof child === "string" && ["value", "color", "fill", "stroke"].includes(key) && child in tokens ? tokens[child] : resolve(child)]));
+      [key, typeof child === "string" && ["value", "color", "fill", "stroke"].includes(key) && Object.hasOwn(tokens, child) ? tokens[child] : resolve(child)]));
   };
   const refine = (node: Record<string, unknown>, tooltipped: boolean) => {
     const encoding = node.encoding as Record<string, Record<string, unknown>> | undefined;

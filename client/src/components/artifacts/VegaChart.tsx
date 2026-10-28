@@ -18,16 +18,17 @@ export default function VegaChart({ content }: { content: string }) {
     observer.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
     return () => observer.disconnect();
   }, []);
+  let chart: ReturnType<typeof parseVegaChart> = null;
+  try { chart = parseVegaChart(JSON.parse(content)); } catch { /* Invalid JSON has a readable fallback. */ }
+  const model = chart ? toChartModel(chart) : null;
+  // The Vega host only exists when no purpose-built renderer applies, and that can change when the content does.
+  const vegaHost = !(chart && model);
   useEffect(() => {
     if (!host.current) return;
     const observer = new ResizeObserver(([entry]) => setWidth(Math.round(entry.contentRect.width)));
     observer.observe(host.current);
     return () => observer.disconnect();
-  }, []);
-
-  let chart: ReturnType<typeof parseVegaChart> = null;
-  try { chart = parseVegaChart(JSON.parse(content)); } catch { /* Invalid JSON has a readable fallback. */ }
-  const model = chart ? toChartModel(chart) : null;
+  }, [vegaHost]);
   const columns = chart ? Array.from(new Set(chart.data.flatMap(Object.keys))) : [];
   useEffect(() => {
     const target = host.current;
