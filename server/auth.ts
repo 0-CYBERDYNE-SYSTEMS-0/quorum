@@ -174,16 +174,10 @@ export function setupAuth(app: Express) {
       return res.status(401).json({ message: "Unauthorized" });
     }
     
-    // In development mode, allow access regardless of subscription status
-    if (DEVELOPMENT_MODE) {
-      return next();
-    }
-    
-    const user = req.user as SelectUser;
-    if (user.subscriptionStatus !== "active") {
-      return res.status(403).json({ message: "Subscription required" });
-    }
-    
+    // Signed-in users of every tier may use the app. Free (Associate) accounts
+    // have no subscription; their limits (seat count, paid models, house-key
+    // budget) are enforced per route via getTierLimits / isPaidModel, so a
+    // blanket "active subscription" gate here locked Free users out entirely.
     next();
   });
 }
