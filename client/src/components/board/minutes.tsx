@@ -10,6 +10,9 @@ import { clockLabel, initialsFor, roleColor, stanceLabel, stanceOf, stanceTone }
 import type { StreamView } from "@/hooks/use-board-room";
 import { cn } from "@/lib/utils";
 
+// `~$66K ... ~$49K` must not render as strikethrough; one stable array keeps the markdown processor cached while streaming.
+const remarkPlugins: [typeof remarkGfm, { singleTilde: boolean }][] = [[remarkGfm, { singleTilde: false }]];
+
 function extractText(node: ReactNode): string {
   if (typeof node === "string" || typeof node === "number") return String(node);
   if (Array.isArray(node)) return node.map(extractText).join("");
@@ -109,7 +112,7 @@ function DirectorEntry({
           </p>
         )}
         <div className="minutes-prose mt-3">
-          <ReactMarkdown remarkPlugins={[remarkGfm]} components={components as never}>
+          <ReactMarkdown remarkPlugins={remarkPlugins} components={components as never}>
             {message.content}
           </ReactMarkdown>
         </div>
@@ -148,7 +151,7 @@ function SynthesisEntry({ message }: { message: Message }) {
       </header>
       <div className="px-5 py-5 sm:px-7">
         <div className="minutes-prose minutes-prose--memo">
-          <ReactMarkdown remarkPlugins={[remarkGfm]} components={components as never}>
+          <ReactMarkdown remarkPlugins={remarkPlugins} components={components as never}>
             {message.content}
           </ReactMarkdown>
         </div>
@@ -176,7 +179,7 @@ function TypingEntry({ view }: { view: StreamView }) {
         </header>
         {view.content ? (
           <div className="minutes-prose mt-3">
-            <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents([]) as never}>
+            <ReactMarkdown remarkPlugins={remarkPlugins} components={markdownComponents([]) as never}>
               {view.content}
             </ReactMarkdown>
             <span className="ml-0.5 inline-block h-4 w-[2px] translate-y-0.5 bg-bronze animate-blink" />
