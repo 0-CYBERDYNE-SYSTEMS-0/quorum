@@ -22,6 +22,8 @@ export const HOUSE_KEY_PAID_MODEL_ALLOWLIST = [
 
 /** Output cap for ordinary expert replies (documents keep maxOutputTokens()). */
 export const EXPERT_REPLY_MAX_TOKENS = 1200;
+/** Output cap for the Moderator's closing decision memo (seven short sections). */
+export const CLOSING_MEMO_MAX_TOKENS = 2000;
 
 /** Free model experts use once a Pro user's monthly AI budget is spent. */
 export const BUDGET_FALLBACK_MODEL = "dots-studio/dots-3-note-preview:free";

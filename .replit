@@ -14,7 +14,7 @@ PORT = "5001"
 
 [deployment]
 build = ["sh", "-c", "npm ci && npm run build"]
-run = ["sh", "-c", "node scripts/migrate.mjs && npm start"]
+run = ["sh", "-c", "node scripts/migrate.mjs && NODE_ENV=production node dist/index.js"]
 deploymentTarget = "cloudrun"
 
 [[deployment.ports]]

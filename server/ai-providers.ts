@@ -3,11 +3,16 @@ import type { AIMessage, AIModelResponse } from './ai';
 import { randomUUID } from 'crypto';
 
 const AI_REQUEST_TIMEOUT_MS = 120_000;
-const OUTPUT_LIMIT_ERROR = "Response reached the output limit. Please ask for a shorter response or split the request into smaller parts.";
+export const OUTPUT_LIMIT_ERROR = "Response reached the output limit. Please ask for a shorter response or split the request into smaller parts.";
 // Output ceiling per call. 1024 truncated File Creator SOPs mid-document;
 // 8192 let one runaway answer cost 8x a normal turn. 4096 (~3,000 words)
 // fits the longest documents we generate. Override with OPENROUTER_MAX_OUTPUT_TOKENS.
 export const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
+function reasoningParam(override?: string) {
+  const effort = override || process.env.OPENROUTER_REASONING_EFFORT;
+  return effort ? { reasoning: { effort } } : {};
+}
+
 export function maxOutputTokens(): number {
   const parsed = Number(process.env.OPENROUTER_MAX_OUTPUT_TOKENS);
   return Number.isInteger(parsed) && parsed >= 256 && parsed <= 32768 ? parsed : DEFAULT_MAX_OUTPUT_TOKENS;
@@ -98,7 +103,11 @@ function safeOpenRouterError(status: number | undefined, providerDetail?: unknow
 // ─── Provider Interface ───────────────────────────────────────────────────────
 
 /** Per-call options. maxTokens overrides the default output cap (e.g. expert replies). */
-export type ChatOptions = { maxTokens?: number };
+export type ChatOptions = {
+  maxTokens?: number;
+  /** Per-call OpenRouter reasoning effort; overrides OPENROUTER_REASONING_EFFORT. */
+  reasoningEffort?: string;
+};
 
 export interface AIProvider {
   chat(messages: AIMessage[], model: string, userId?: number, webSearch?: boolean, options?: ChatOptions): Promise<AIModelResponse>;
@@ -298,9 +307,7 @@ export class OpenRouterProvider implements AIProvider {
           temperature: 0.7,
           ...this.requestBudget(attempt),
           usage: { include: true },
-          ...(process.env.OPENROUTER_REASONING_EFFORT
-            ? { reasoning: { effort: process.env.OPENROUTER_REASONING_EFFORT } }
-            : {}),
+          ...reasoningParam(options.reasoningEffort),
           ...(webSearch ? { plugins: [{ id: "web", max_results: 3 }] } : {}),
         }),
         signal: AbortSignal.timeout(AI_REQUEST_TIMEOUT_MS),
@@ -388,9 +395,7 @@ export class OpenRouterProvider implements AIProvider {
           temperature: 0.7,
           ...this.requestBudget(attempt),
           usage: { include: true },
-          ...(process.env.OPENROUTER_REASONING_EFFORT
-            ? { reasoning: { effort: process.env.OPENROUTER_REASONING_EFFORT } }
-            : {}),
+          ...reasoningParam(options.reasoningEffort),
           ...(webSearch ? { plugins: [{ id: "web", max_results: 3 }] } : {}),
           stream: true,
         }),
