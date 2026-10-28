@@ -6,6 +6,7 @@ export default defineConfig({
     globals: true,
     environment: "node",
     testTimeout: 15000,
+    setupFiles: ["./tests/setup-loopback.ts"],
     env: {
       // Force in-memory storage (no real DB needed for billing tests)
       DATABASE_URL: "",

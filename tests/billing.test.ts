@@ -200,21 +200,24 @@ describe("Billing System E2E", () => {
       const originalPriceId = process.env.STRIPE_PRICE_ID;
       delete process.env.STRIPE_PRICE_ID;
 
-      // Create app while PRICE_ID is missing — routes read env at request time
-      const appNoPrice = await createTestApp();
+      let res: request.Response;
+      try {
+        // Create app while PRICE_ID is missing — routes read env at request time
+        const appNoPrice = await createTestApp();
 
-      const agent = request.agent(appNoPrice);
-      await login(agent);
+        const agent = request.agent(appNoPrice);
+        await login(agent);
 
-      // Provide customer mock so code reaches price ID check
-      mockStripeCustomerCreate.mockResolvedValue({
-        id: "cus_no_price",
-      });
+        // Provide customer mock so code reaches price ID check
+        mockStripeCustomerCreate.mockResolvedValue({
+          id: "cus_no_price",
+        });
 
-      const res = await agent.post("/api/create-subscription");
-      
-      // Restore after request
-      process.env.STRIPE_PRICE_ID = originalPriceId;
+        res = await agent.post("/api/create-subscription");
+      } finally {
+        if (originalPriceId === undefined) delete process.env.STRIPE_PRICE_ID;
+        else process.env.STRIPE_PRICE_ID = originalPriceId;
+      }
 
       expect(res.status).toBe(503);
       expect(res.body.code).toBe("BILLING_UNAVAILABLE");
