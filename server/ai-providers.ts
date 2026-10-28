@@ -9,6 +9,9 @@ export const OUTPUT_LIMIT_ERROR = "Response reached the output limit. Please ask
 // fits the longest documents we generate. Override with OPENROUTER_MAX_OUTPUT_TOKENS.
 export const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
 function reasoningParam(override?: string) {
+  // "none" turns reasoning off entirely. Some free models (dots-3-note) ignore
+  // effort:"low" and spend the whole max_tokens budget on hidden reasoning.
+  if (override === "none") return { reasoning: { enabled: false } };
   const effort = override || process.env.OPENROUTER_REASONING_EFFORT;
   return effort ? { reasoning: { effort } } : {};
 }

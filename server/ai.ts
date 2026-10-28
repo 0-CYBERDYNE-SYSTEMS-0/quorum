@@ -1818,7 +1818,7 @@ export async function generateClosingSynthesis(
     // Free reasoning models can spend the whole output budget thinking and hit
     // finish_reason=length before the memo is written. Keep reasoning low, cap
     // the memo, and retry once on the budget model if the cap is still hit.
-    const closingOptions = { maxTokens: CLOSING_MEMO_MAX_TOKENS, reasoningEffort: "low" };
+    const closingOptions = { maxTokens: CLOSING_MEMO_MAX_TOKENS, reasoningEffort: "none" };
     let response: AIModelResponse;
     try {
       response = await callOpenRouterAPIStream(messages, closingModel, onClosingToken, conversation?.userId, false, closingOptions);

@@ -371,6 +371,22 @@ describe("AI Providers", () => {
       expect(body.max_tokens).toBe(2000);
     });
 
+    it("reasoningEffort none disables reasoning entirely on chatStream", async () => {
+      process.env.OPENROUTER_API_KEY = "or-key-123";
+      process.env.OPENROUTER_REASONING_EFFORT = "high";
+      mockFetch.mockResolvedValueOnce(mockSseResponse([
+        { choices: [{ delta: { content: "memo" }, finish_reason: null }] },
+        { choices: [{ delta: {}, finish_reason: "stop" }] },
+      ]));
+
+      const provider = new OpenRouterProvider();
+      await provider.chatStream([{ role: "user", content: "close" }], "dots-studio/dots-3-note-preview:free", () => {}, undefined, false, { maxTokens: 2000, reasoningEffort: "none" });
+
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      expect(body.reasoning).toEqual({ enabled: false });
+      expect(body.max_tokens).toBe(2000);
+    });
+
     it("throws when an SSE frame contains a provider error", async () => {
       process.env.OPENROUTER_API_KEY = "or-key-123";
       mockFetch.mockResolvedValueOnce(mockSseResponse([
