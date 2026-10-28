@@ -355,6 +355,22 @@ describe("AI Providers", () => {
       expect(body.reasoning).toEqual({ effort: "low" });
     });
 
+    it("per-call reasoningEffort and maxTokens override the env defaults on chatStream", async () => {
+      process.env.OPENROUTER_API_KEY = "or-key-123";
+      process.env.OPENROUTER_REASONING_EFFORT = "high";
+      mockFetch.mockResolvedValueOnce(mockSseResponse([
+        { choices: [{ delta: { content: "memo" }, finish_reason: null }] },
+        { choices: [{ delta: {}, finish_reason: "stop" }] },
+      ]));
+
+      const provider = new OpenRouterProvider();
+      await provider.chatStream([{ role: "user", content: "close" }], "openai/gpt-6-luna", () => {}, undefined, false, { maxTokens: 2000, reasoningEffort: "low" });
+
+      const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+      expect(body.reasoning).toEqual({ effort: "low" });
+      expect(body.max_tokens).toBe(2000);
+    });
+
     it("throws when an SSE frame contains a provider error", async () => {
       process.env.OPENROUTER_API_KEY = "or-key-123";
       mockFetch.mockResolvedValueOnce(mockSseResponse([

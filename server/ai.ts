@@ -10,8 +10,8 @@ import path from "path";
 import fs from "fs";
 import axios from "axios";
 import { randomBytes } from "crypto";
-import { getProvider, type ChatOptions } from "./ai-providers";
-import { BUDGET_FALLBACK_MODEL, EXPERT_REPLY_MAX_TOKENS } from "./usage-caps";
+import { getProvider, OUTPUT_LIMIT_ERROR, type ChatOptions } from "./ai-providers";
+import { BUDGET_FALLBACK_MODEL, CLOSING_MEMO_MAX_TOKENS, EXPERT_REPLY_MAX_TOKENS } from "./usage-caps";
 import { findCatalogExpert } from "@shared/expert-catalog";
 import { DELIVERABLE_PLACEHOLDER, pendingDeliverableFor, pendingDeliverableByMessage } from "./pending-deliverables";
 export { commitPendingDeliverable, discardPendingDeliverable } from "./pending-deliverables";
@@ -1808,13 +1808,31 @@ export async function generateClosingSynthesis(
     if (!closingModel) {
       throw new Error("No auxiliary model could be resolved for the Moderator closing synthesis.");
     }
-    const response = await callOpenRouterAPIStream(messages, closingModel, (token) => {
+    const onClosingToken = (token: string) => {
       broadcastFn(conversationId, {
         type: "expert_stream_token",
         expertId: moderatorExpert.id,
         token,
       });
-    }, conversation?.userId);
+    };
+    // Free reasoning models can spend the whole output budget thinking and hit
+    // finish_reason=length before the memo is written. Keep reasoning low, cap
+    // the memo, and retry once on the budget model if the cap is still hit.
+    const closingOptions = { maxTokens: CLOSING_MEMO_MAX_TOKENS, reasoningEffort: "low" };
+    let response: AIModelResponse;
+    try {
+      response = await callOpenRouterAPIStream(messages, closingModel, onClosingToken, conversation?.userId, false, closingOptions);
+    } catch (error) {
+      if (!(error instanceof Error) || error.message !== OUTPUT_LIMIT_ERROR || closingModel === BUDGET_FALLBACK_MODEL) throw error;
+      console.warn(`[SYNTHESIS] ${closingModel} hit the output limit; retrying closing memo on ${BUDGET_FALLBACK_MODEL}`);
+      broadcastFn(conversationId, {
+        type: "expert_stream_start",
+        expertId: moderatorExpert.id,
+        expertName: moderatorExpert.name,
+        expertRole: "Moderator",
+      });
+      response = await callOpenRouterAPIStream(messages, BUDGET_FALLBACK_MODEL, onClosingToken, conversation?.userId, false, closingOptions);
+    }
     const content = response.message.content;
 
     const storedMessage = await storage.createMessage({
