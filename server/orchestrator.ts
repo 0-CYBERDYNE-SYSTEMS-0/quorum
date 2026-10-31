@@ -6,6 +6,7 @@ import { enforceTurnFairness } from "./turn-fairness";
 import { commitPendingDeliverable, discardPendingDeliverable } from "./pending-deliverables";
 import type { InsertMessage, Expert, Message, File, MessageStance, OrchestratorSnapshot } from "@shared/schema";
 import { extractFarmerQuestions } from "@shared/mentions";
+import { isDeferentialStancePosition } from "@shared/stance";
 import { createHash } from "crypto";
 
 // Verbose per-turn tracing is opt-in (ORCH_DEBUG=1). The default flood slows
@@ -130,7 +131,9 @@ const MAX_TURN_BUDGET = 20;
 type StanceLedger = Record<string, MessageStance | null>;
 
 function emptyStanceLedger(activeExperts: Expert[]): StanceLedger {
-    return Object.fromEntries(activeExperts.map(expert => [expert.role, null]));
+    return Object.fromEntries(activeExperts
+        .filter(expert => expert.role.trim().toLowerCase() !== "file creator")
+        .map(expert => [expert.role, null]));
 }
 
 function isMessageStance(value: unknown): value is MessageStance {
@@ -138,16 +141,14 @@ function isMessageStance(value: unknown): value is MessageStance {
     const stance = value as Partial<MessageStance>;
     return ["agree", "disagree", "conditional", "abstain"].includes(String(stance.stance).toLowerCase()) &&
         Number.isInteger(stance.confidence) && Number(stance.confidence) >= 1 && Number(stance.confidence) <= 5 &&
-        typeof stance.position === "string";
+        typeof stance.position === "string" && stance.position.trim().length > 0 && !isDeferentialStancePosition(stance.position);
 }
 
-/** Convergence excludes abstentions and requires at least one substantive stance. */
+/** Convergence requires a recorded, supportive position from every discussant. */
 export function isStanceLedgerConverged(ledger: StanceLedger): boolean {
-    const substantive = Object.values(ledger).filter((stance): stance is MessageStance =>
-        Boolean(stance && stance.stance !== "abstain")
-    );
-    return substantive.length > 0 && substantive.every(stance =>
-        stance.stance === "agree" || stance.stance === "conditional"
+    const stances = Object.values(ledger);
+    return stances.length > 0 && stances.every(stance =>
+        stance !== null && (stance.stance === "agree" || stance.stance === "conditional")
     );
 }
 
@@ -175,6 +176,8 @@ export function canConcludeWithStanceEvidence(
 ): boolean {
     if (turnsTaken >= effectiveBudget) return true;
     if (isStanceLedgerConverged(ledger)) return true;
+    const stances = Object.values(ledger);
+    if (!stances.length || stances.some(stance => stance === null || stance.stance === "abstain")) return false;
     const threshold = Math.ceil(0.8 * effectiveBudget);
     const currentSignature = getStableStanceSplitSignature(ledger);
     return turnsTaken >= threshold && stableSplitCycleCount >= 2 && currentSignature !== null &&
@@ -289,7 +292,7 @@ function completedTurnStanceUpdates(
     }
 
     const cycleRoles = new Set([...state.stanceCycleRoles, expertRole]);
-    const completeCycle = state.activeExperts.every(expert => cycleRoles.has(expert.role));
+    const completeCycle = Object.keys(state.stanceLedger).every(role => cycleRoles.has(role));
     if (!completeCycle) {
         return {
             stanceLedger,
@@ -789,6 +792,15 @@ function isUsableExpertResponse(role: Message["role"], content: string): boolean
         trimmedContent.length > 0 &&
         !trimmedContent.startsWith("(Error") &&
         !trimmedContent.startsWith("⚠️");
+}
+
+export function isDeferentialOneLiner(content: string): boolean {
+    const text = content.replace(/\s+/g, " ").trim();
+    const wordCount = text ? text.split(/\s+/).length : 0;
+    const deferral = /\b(?:i|we)\s+(?:(?:would|should|could|might|may|will|can|must|shall)\s+)?defer\b/i.test(text);
+    const bareAgreementOrSupport = /\b(?:i|we)\s+(?:agree(?:\s+with\b)?|support)\b/i.test(text);
+    const hasReasonOrCondition = /\b(?:because|since|as|if|only if|provided(?: that)?|unless|subject to|contingent on|so long as|given|based on|due to|however|although)\b|[:,;—–]/i.test(text);
+    return wordCount <= 18 && (deferral || (bareAgreementOrSupport && !hasReasonOrCondition));
 }
 
 // Per-sequence fairness memory, keyed by the sequence's
@@ -1984,6 +1996,8 @@ export class InteractionOrchestrator {
                 });
                 if (!state) return;
                 let expertResponse: InsertMessage;
+                let providerRetried = false;
+                let repairExpertResponse: ((retryInstruction?: string) => Promise<InsertMessage>) | null = null;
                 if (existingCreate) {
                     const downloadUrl = `/api/protected/conversations/${this.conversationId}/files/${existingCreate.id}/download`;
                     const content = `Using existing file: ${existingCreate.filename} (version ${existingCreate.version ?? 1})\nDownload: ${downloadUrl}`;
@@ -2019,34 +2033,77 @@ export class InteractionOrchestrator {
                         deliverableRequest,
                         retryInstruction,
                     );
+                    repairExpertResponse = streamExpertResponse;
                     expertResponse = await streamExpertResponse();
-                    if ((state.mode === "autonomous" || state.mode === "processing_sequential") &&
-                        !state.singleTurnOnly &&
-                        typeof isRetryableExpertProviderFailure === "function" &&
+                    if (typeof isRetryableExpertProviderFailure === "function" &&
                         isRetryableExpertProviderFailure(expertResponse)) {
-                        const retryState = getConversationState(this.conversationId);
+                        let retryState = getConversationState(this.conversationId);
                         if (retryState &&
                             (retryState.mode === "autonomous" || retryState.mode === "processing_sequential") &&
-                            !retryState.singleTurnOnly && !retryState.wasInterrupted) {
+                            !retryState.wasInterrupted) {
                             console.warn(`Orchestrator: retrying one provider error for ${currentExpert.role} in conversation ${this.conversationId}.`);
                             // Free-tier providers commonly answer a burst with a
                             // momentary 429. A short pause turns most of those into
                             // a successful second attempt instead of a failed turn.
                             await new Promise(resolve => setTimeout(resolve, 1500));
-                            // A fresh start clears any partial/error tokens from the first attempt in the client.
-                            retryState.broadcastFn(this.conversationId, {
-                                type: "expert_stream_start",
-                                conversationId: this.conversationId,
-                                expertId: currentExpert.id,
-                                expertName: currentExpert.name,
-                                expertRole: currentExpert.role,
-                            });
-                            expertResponse = await streamExpertResponse(
-                                "The previous provider attempt did not complete. Answer concisely (no more than 180 words), preserve the key action, caveats, and any supported inline citations, and do not repeat the full discussion.",
-                            );
+                            retryState = getConversationState(this.conversationId);
+                            if (retryState &&
+                                (retryState.mode === "autonomous" || retryState.mode === "processing_sequential") &&
+                                !retryState.wasInterrupted) {
+                                // A fresh start clears any partial/error tokens from the first attempt in the client.
+                                retryState.broadcastFn(this.conversationId, {
+                                    type: "expert_stream_start",
+                                    conversationId: this.conversationId,
+                                    expertId: currentExpert.id,
+                                    expertName: currentExpert.name,
+                                    expertRole: currentExpert.role,
+                                });
+                                providerRetried = true;
+                                expertResponse = await streamExpertResponse(
+                                    "The previous provider attempt did not complete. Answer concisely (no more than 180 words), preserve the key action, caveats, and any supported inline citations, and do not repeat the full discussion.",
+                                );
+                            }
                         }
                     }
                     providerCallResolved = true;
+                }
+
+                const responseState = getConversationState(this.conversationId);
+                const priorResponseContent = [
+                    ...messagesSinceLatestFarmer(history).expertMessages.map(message => message.content),
+                    ...(responseState?.sequenceExpertContents ?? []),
+                ];
+                const needsPositionRepair = responseState &&
+                    !isFileCreatorRole(currentExpert.role) &&
+                    (responseState.mode === "autonomous" || responseState.mode === "processing_sequential") &&
+                    !responseState.wasInterrupted &&
+                    !responseState.pendingUserMessage &&
+                    isUsableExpertResponse(expertResponse.role, expertResponse.content) &&
+                    (!isMessageStance(expertResponse.stance) ||
+                        isDeferentialOneLiner(expertResponse.content) ||
+                        isNearDuplicate(expertResponse.content, priorResponseContent));
+                let retainedOriginalStanceAfterFailedRepair = false;
+                if (responseState && needsPositionRepair && repairExpertResponse && !(state.singleTurnOnly && providerRetried)) {
+                    console.warn(`Orchestrator: requesting one role-specific stance repair from ${currentExpert.role} in conversation ${this.conversationId}.`);
+                    const originalResponse = expertResponse;
+                    responseState.broadcastFn(this.conversationId, {
+                        type: "expert_stream_start",
+                        conversationId: this.conversationId,
+                        expertId: currentExpert.id,
+                        expertName: currentExpert.name,
+                        expertRole: currentExpert.role,
+                    });
+                    const repairedResponse = await repairExpertResponse(
+                        "Your previous draft lacked a valid independent stance, was deferential, or repeated a colleague. Give a distinct position grounded in your own role: state your recommendation or explicit uncertainty, one role-specific reason or missing fact, and the decision consequence or condition. Do not defer, stop at agreement, or repeat another director. End with a substantive STANCE line. If your function has no basis, use abstain and name the specific evidence that is missing.",
+                    );
+                    if (isMessageStance(originalResponse.stance) &&
+                        (!isUsableExpertResponse(repairedResponse.role, repairedResponse.content) || !isMessageStance(repairedResponse.stance))) {
+                        retainedOriginalStanceAfterFailedRepair = true;
+                        discardPendingDeliverable(repairedResponse);
+                    } else {
+                        discardPendingDeliverable(originalResponse);
+                        expertResponse = repairedResponse;
+                    }
                 }
                 
                 // Store and broadcast completed message
@@ -2058,7 +2115,8 @@ export class InteractionOrchestrator {
                         ...messagesSinceLatestFarmer(history).expertMessages.map(m => m.content),
                         ...(getConversationState(this.conversationId)?.sequenceExpertContents ?? []),
                     ];
-                    if (state.mode === "autonomous" && !isFileCreatorRole(currentExpert.role) && isNearDuplicate(expertResponse.content, priorContents)) {
+                    if (state.mode === "autonomous" && !isFileCreatorRole(currentExpert.role) &&
+                        !retainedOriginalStanceAfterFailedRepair && isNearDuplicate(expertResponse.content, priorContents)) {
                         const turnsByExpert = countPostQuestionTurnsByExpert(
                             history,
                             state.activeExperts,
@@ -2067,14 +2125,9 @@ export class InteractionOrchestrator {
                         const stillOwedMinimumTurn = (turnsByExpert.get(currentExpert.id) ?? 0) <
                             MINIMUM_AUTONOMOUS_TURNS_PER_EXPERT_BEFORE_CONCLUSION;
                         if (stillOwedMinimumTurn) {
-                            // Preserve the minimum opportunity without repeating
-                            // the duplicated claims or their deliverables.
-                            expertResponse.content = "I don't have a distinct, evidence-supported point to add beyond the recommendations already shared, so I won't repeat them.";
-                            expertResponse.artifacts = [];
-                            expertResponse.mentions = [];
-                            expertResponse.stance = null;
-                            console.warn(`Orchestrator: replaced near-duplicate answer from ${currentExpert.role} in conversation ${this.conversationId} with a non-repeating minimum-turn response.`);
-                            discardPendingDeliverable(expertResponse);
+                            // Preserve the director's actual structured judgment
+                            // instead of persisting a generic deferential turn.
+                            console.warn(`Orchestrator: retained the minimum-turn response from ${currentExpert.role} after its role-specific repair remained similar in conversation ${this.conversationId}.`);
                         } else {
                             discardedDuplicate = true;
                             turnFairness.retired.add(currentExpert.id);

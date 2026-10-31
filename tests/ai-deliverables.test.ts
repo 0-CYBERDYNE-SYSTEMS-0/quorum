@@ -191,8 +191,9 @@ describe("AI deliverable generation", () => {
   });
 
   it.each(["streaming", "non-streaming"] as const)("redacts provider errors on the retry message (%s)", async (pathType) => {
-    mockProviderChat.mockRejectedValue(new Error("private provider payload"));
-    mockProviderChatStream.mockRejectedValue(new Error("private provider payload"));
+    const providerError = Object.assign(new Error("private provider payload"), { status: 503 });
+    mockProviderChat.mockRejectedValue(providerError);
+    mockProviderChatStream.mockRejectedValue(providerError);
 
     const result = pathType === "streaming"
       ? await getExpertResponseStream(
@@ -206,9 +207,15 @@ describe("AI deliverable generation", () => {
   });
 
   it.each([
-    ["rate limit", Object.assign(new Error("Too Many Requests"), { status: 429 })],
-    ["timeout", Object.assign(new Error("request timed out"), { name: "APIConnectionTimeoutError" })],
-  ])("does not mark %s provider failures retryable", async (_label, providerError) => {
+    ["rate limit", Object.assign(new Error("Too Many Requests"), { status: 429 }), true],
+    ["status-less structured provider error", Object.assign(new Error("provider error"), { isProviderError: true }), true],
+    ["timeout", Object.assign(new Error("request timed out"), { name: "APIConnectionTimeoutError" }), true],
+    ["upstream 503", Object.assign(new Error("unavailable"), { statusCode: 503 }), true],
+    ["configuration 401", Object.assign(new Error("authentication failed"), { statusCode: 401 }), false],
+    ["malformed response", new Error("Invalid response format from OpenRouter API"), false],
+    ["output limit", new Error("provider output limit exceeded"), false],
+    ["unclassified", new Error("provider response failed"), false],
+  ])("marks %s provider failures retryable only when transient", async (_label, providerError, retryable) => {
     mockProviderChat.mockRejectedValue(providerError);
     mockProviderChatStream.mockRejectedValue(providerError);
 
@@ -217,7 +224,7 @@ describe("AI deliverable generation", () => {
     );
 
     expect(result.content).toMatch(/^⚠️ No complete response was received\./);
-    expect(isRetryableExpertProviderFailure(result)).toBe(false);
+    expect(isRetryableExpertProviderFailure(result)).toBe(retryable);
   });
 
   it("rejects a filename or MIME type that does not match the requested format", async () => {

@@ -322,7 +322,9 @@ function toLineModel(chart: VegaChart, spec: Loose, layers: Loose[]): LineModel 
 /** Maps an expert's Vega-Lite spec onto a purpose-built renderer; null means "use the Vega renderer". */
 export function toChartModel(chart: VegaChart): ChartModel | null {
   const spec = chart.spec as Loose;
-  const layers: Loose[] = Array.isArray(spec.layer) ? spec.layer : [spec];
+  const layers: Loose[] = Array.isArray(spec.layer)
+    ? [...(spec.mark === undefined ? [] : [{ mark: spec.mark }]), ...spec.layer]
+    : [spec];
   if (!transformsSafe(spec, chart.data) || layers.some(node => node !== spec && !transformsSafe(node, chart.data))) return null;
   if (layers.some(node => node.mark === undefined)) return null;
   const enc: Loose = { ...spec.encoding, ...layers.find(node => ["bar", "line", "area", "point", "circle"].includes(markType(node)))?.encoding };

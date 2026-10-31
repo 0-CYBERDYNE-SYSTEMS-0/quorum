@@ -103,6 +103,10 @@ export function themedVegaSpec(chart: VegaChart, width = 600, mode: ChartMode = 
   const ink = chartInk[mode];
   const palette = [...(mode === "dark" ? visualThemesDark : visualThemes)[chart.theme]];
   const spec = refineSpec(raw, chart.data, palette, mode);
+  if (Array.isArray(spec.layer) && spec.mark !== undefined) {
+    spec.layer = [{ mark: spec.mark }, ...(spec.layer as unknown[])];
+    delete spec.mark;
+  }
   const composed = ["facet", "repeat", "concat", "hconcat", "vconcat"].some(key => key in spec);
   const sans = '"Inter", system-ui, sans-serif';
   const serif = '"Instrument Serif", Georgia, serif';

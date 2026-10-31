@@ -16,9 +16,10 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 const mockFetch = vi.fn();
 global.fetch = mockFetch;
 
-const { mockGetConversation, mockGetConversationExperts, mockGetUserApiKey } = vi.hoisted(() => ({
+const { mockGetConversation, mockGetConversationExperts, mockGetConversationInsights, mockGetUserApiKey } = vi.hoisted(() => ({
   mockGetConversation: vi.fn(),
   mockGetConversationExperts: vi.fn(),
+  mockGetConversationInsights: vi.fn(),
   mockGetUserApiKey: vi.fn(),
 }));
 
@@ -26,6 +27,7 @@ vi.mock("../server/storage", () => ({
   storage: {
     getConversation: mockGetConversation,
     getConversationExperts: mockGetConversationExperts,
+    getConversationInsights: mockGetConversationInsights,
     getUserApiKey: mockGetUserApiKey,
   },
 }));
@@ -36,13 +38,25 @@ import {
   LocalOpenAIProvider,
 } from "../server/ai-providers";
 import type { AIMessage } from "../server/ai";
-import { getModeratorNextSpeakerSuggestion } from "../server/ai";
+import { getExpertResponseStream, getModeratorNextSpeakerSuggestion, isRetryableExpertProviderFailure } from "../server/ai";
 import type { ModeratorContext } from "../server/ai";
 import { isFreeModel } from "../server/tiers";
 
 function mockSseResponse(events: object[]) {
   const body = events.map((event) => `data: ${JSON.stringify(event)}`).join("\n") + "\ndata: [DONE]\n";
-  return { ok: true, body: new Response(body).body };
+  return { ok: true, status: 200, body: new Response(body).body };
+}
+
+function mockErroredSseResponse() {
+  return {
+    ok: true,
+    status: 200,
+    body: new ReadableStream({
+      start(controller) {
+        controller.error(Object.assign(new Error("terminated"), { code: "UND_ERR_SOCKET" }));
+      },
+    }),
+  };
 }
 
 describe("AI Providers", () => {
@@ -50,6 +64,7 @@ describe("AI Providers", () => {
     mockFetch.mockClear();
     mockGetConversation.mockReset();
     mockGetConversationExperts.mockReset();
+    mockGetConversationInsights.mockReset().mockResolvedValue([]);
     mockGetUserApiKey.mockReset().mockResolvedValue(null);
     delete process.env.LOCAL_AI_BASE_URL;
     delete process.env.LOCAL_AI_API_KEY;
@@ -231,6 +246,302 @@ describe("AI Providers", () => {
         reservedUsd: 0,
         attempts: [{ generationId: "gen_123", model: "deepseek/deepseek-v4.1-flash", provider: "Mock Provider", result: "success", costUsd: 0.12 }],
       });
+    });
+
+    it.each(["chat", "chatStream"] as const)("records the Poolside-to-dots-studio route and actual fallback for %s", async (method) => {
+      process.env.OPENROUTER_API_KEY = "test-only-openrouter-key";
+      const requestedModel = "poolside/laguna-s-2.1:free";
+      const fallbackModel = "dots-studio/dots-3-note-preview:free";
+      mockFetch.mockResolvedValueOnce(method === "chat"
+        ? {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              model: fallbackModel,
+              provider: "Dots Studio",
+              choices: [{ message: { role: "assistant", content: "Answer." } }],
+            }),
+          }
+        : mockSseResponse([
+            { model: fallbackModel, provider: "Dots Studio", choices: [{ delta: { content: "Answer." }, finish_reason: null }] },
+            { choices: [{ delta: {}, finish_reason: "stop" }] },
+          ]));
+
+      const provider = new OpenRouterProvider();
+      if (method === "chat") {
+        await provider.chat([{ role: "user", content: "Question" }], requestedModel);
+      } else {
+        await provider.chatStream([{ role: "user", content: "Question" }], requestedModel, () => {});
+      }
+
+      expect(provider.getUsageSnapshot().attempts[0]).toMatchObject({
+        model: requestedModel,
+        attemptedModel: requestedModel,
+        requestModel: requestedModel,
+        routedModels: [requestedModel, fallbackModel],
+        fallbackModels: [fallbackModel],
+        responseModel: fallbackModel,
+        provider: "Dots Studio",
+        fallbackUsed: true,
+        httpStatus: 200,
+        result: "success",
+      });
+    });
+
+    it("records the allowlisted provider from a 429 without response-body, prompt, or key text", async () => {
+      process.env.OPENROUTER_API_KEY = "test-only-openrouter-key";
+      const prompt = "PRIVATE PROMPT TEXT";
+      const apiKey = process.env.OPENROUTER_API_KEY;
+      const privateBody = `PRIVATE PROVIDER BODY ${prompt} ${apiKey}`;
+      mockFetch.mockResolvedValueOnce(new Response(JSON.stringify({
+        error: { code: 429, message: privateBody, metadata: { provider_name: "Mock Provider", raw: privateBody } },
+      }), { status: 429 }));
+      const info = vi.spyOn(console, "info").mockImplementation(() => {});
+      const provider = new OpenRouterProvider();
+
+      try {
+        let caughtError: unknown;
+        try {
+          await provider.chat([{ role: "user", content: prompt }], "poolside/laguna-s-2.1:free");
+        } catch (error) {
+          caughtError = error;
+        }
+        expect(caughtError).toMatchObject({ statusCode: 429 });
+
+        const attempt = provider.getUsageSnapshot().attempts[0];
+        expect(attempt).toMatchObject({
+          attemptedModel: "poolside/laguna-s-2.1:free",
+          routedModels: ["poolside/laguna-s-2.1:free", "dots-studio/dots-3-note-preview:free"],
+          httpStatus: 429,
+          providerStatus: 429,
+          provider: "Mock Provider",
+          failureCategory: "rate_limit",
+          result: "failed",
+        });
+        const diagnostics = `${JSON.stringify(attempt)} ${info.mock.calls.map(([message]) => message).join(" ")} ${(caughtError as Error).message}`;
+        expect(diagnostics).not.toContain(apiKey);
+        expect(diagnostics).not.toContain(prompt);
+        expect(diagnostics).not.toContain(privateBody);
+        expect(attempt).not.toHaveProperty("errorMessage");
+      } finally {
+        info.mockRestore();
+      }
+    });
+
+    it("records provider status from a 200 SSE error without response-body, prompt, or key text", async () => {
+      process.env.OPENROUTER_API_KEY = "test-only-openrouter-key";
+      const apiKey = process.env.OPENROUTER_API_KEY;
+      const prompt = "PRIVATE STREAM PROMPT";
+      const privateBody = `PRIVATE STREAM BODY ${prompt} ${apiKey}`;
+      mockFetch.mockResolvedValueOnce(mockSseResponse([
+        { error: { code: 429, message: privateBody, metadata: { provider_name: "Mock Provider", raw: privateBody } } },
+      ]));
+      const info = vi.spyOn(console, "info").mockImplementation(() => {});
+      const provider = new OpenRouterProvider();
+
+      try {
+        let caughtError: unknown;
+        try {
+          await provider.chatStream([{ role: "user", content: prompt }], "poolside/laguna-s-2.1:free", () => {});
+        } catch (error) {
+          caughtError = error;
+        }
+        expect(caughtError).toMatchObject({ statusCode: 429 });
+
+        const attempt = provider.getUsageSnapshot().attempts[0];
+        expect(attempt).toMatchObject({
+          httpStatus: 200,
+          providerStatus: 429,
+          provider: "Mock Provider",
+          failureCategory: "rate_limit",
+          result: "failed",
+        });
+        const diagnostics = `${JSON.stringify(attempt)} ${info.mock.calls.map(([message]) => message).join(" ")} ${(caughtError as Error).message}`;
+        expect(diagnostics).not.toContain(apiKey);
+        expect(diagnostics).not.toContain(prompt);
+        expect(diagnostics).not.toContain(privateBody);
+      } finally {
+        info.mockRestore();
+      }
+    });
+
+    it("marks a status-less 200 SSE provider error retryable for the expert", async () => {
+      process.env.OPENROUTER_API_KEY = "test-only-openrouter-key";
+      mockGetConversation.mockResolvedValue(null);
+      mockFetch.mockResolvedValueOnce(mockSseResponse([
+        { error: "upstream provider failed" },
+      ]));
+      const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+      const expert = {
+        id: 42,
+        conversationId: 77,
+        name: "Chief Marketing Officer",
+        role: "Chief Marketing Officer",
+        model: "poolside/laguna-s-2.1:free",
+        systemPrompt: "Advise on marketing decisions.",
+        customInstructions: null,
+        avatarUrl: null,
+      };
+      const provider = getProvider(expert.model) as OpenRouterProvider;
+
+      try {
+        const failedResponse = await getExpertResponseStream(
+          expert, [], "Assess the launch plan.", [], [expert.role], () => {},
+        );
+
+        expect(failedResponse.content).toContain("No complete response was received");
+        expect(isRetryableExpertProviderFailure(failedResponse)).toBe(true);
+        const attempt = provider.getUsageSnapshot().attempts.at(-1);
+        expect(attempt).toMatchObject({ httpStatus: 200, failureCategory: "upstream_transport", result: "failed" });
+        expect(attempt).not.toHaveProperty("providerStatus");
+      } finally {
+        errorLog.mockRestore();
+      }
+    });
+
+    it("marks an unclassified mid-stream transport failure retryable for the expert", async () => {
+      process.env.OPENROUTER_API_KEY = "test-only-openrouter-key";
+      mockGetConversation.mockResolvedValue(null);
+      mockFetch.mockResolvedValueOnce(mockErroredSseResponse());
+      const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+      const expert = {
+        id: 42,
+        conversationId: 77,
+        name: "Chief Marketing Officer",
+        role: "Chief Marketing Officer",
+        model: "poolside/laguna-s-2.1:free",
+        systemPrompt: "Advise on marketing decisions.",
+        customInstructions: null,
+        avatarUrl: null,
+      };
+      const provider = getProvider(expert.model) as OpenRouterProvider;
+
+      try {
+        const failedResponse = await getExpertResponseStream(
+          expert, [], "Assess the launch plan.", [], [expert.role], () => {},
+        );
+
+        expect(failedResponse.content).toContain("No complete response was received");
+        expect(isRetryableExpertProviderFailure(failedResponse)).toBe(true);
+        expect(provider.getUsageSnapshot().attempts.at(-1)).toMatchObject({
+          httpStatus: 200,
+          failureCategory: "upstream_transport",
+          result: "failed",
+        });
+      } finally {
+        errorLog.mockRestore();
+      }
+    });
+
+    it("marks an output-limit failure retryable so the expert can answer concisely", async () => {
+      process.env.OPENROUTER_API_KEY = "test-only-openrouter-key";
+      mockGetConversation.mockResolvedValue(null);
+      mockFetch.mockResolvedValueOnce(mockSseResponse([
+        { choices: [{ delta: { content: "A long partial answer" }, finish_reason: null }] },
+        { choices: [{ delta: {}, finish_reason: "length" }] },
+      ]));
+      const expert = {
+        id: 42,
+        conversationId: 77,
+        name: "Chief Financial Officer",
+        role: "Chief Financial Officer",
+        model: "xiaomi/mimo-v2.6-flash",
+        systemPrompt: "Advise on finance decisions.",
+        customInstructions: null,
+        avatarUrl: null,
+      };
+      const provider = getProvider(expert.model) as OpenRouterProvider;
+
+      const failedResponse = await getExpertResponseStream(
+        expert, [], "Assess the pilot.", [], [expert.role], () => {},
+      );
+
+      expect(failedResponse.content).toContain("No complete response was received");
+      expect(isRetryableExpertProviderFailure(failedResponse)).toBe(true);
+      expect(provider.getUsageSnapshot().attempts.at(-1)).toMatchObject({
+        httpStatus: 200,
+        failureCategory: "upstream_transport",
+        result: "failed",
+      });
+    });
+
+    it("keeps a known HTTP 401 provider configuration failure non-retryable", async () => {
+      process.env.OPENROUTER_API_KEY = "test-only-openrouter-key";
+      mockGetConversation.mockResolvedValue(null);
+      mockFetch.mockResolvedValueOnce(new Response("authentication failed", { status: 401 }));
+      const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+      const expert = {
+        id: 42,
+        conversationId: 77,
+        name: "Chief Marketing Officer",
+        role: "Chief Marketing Officer",
+        model: "poolside/laguna-s-2.1:free",
+        systemPrompt: "Advise on marketing decisions.",
+        customInstructions: null,
+        avatarUrl: null,
+      };
+      const provider = getProvider(expert.model) as OpenRouterProvider;
+
+      try {
+        const failedResponse = await getExpertResponseStream(
+          expert, [], "Assess the launch plan.", [], [expert.role], () => {},
+        );
+
+        expect(isRetryableExpertProviderFailure(failedResponse)).toBe(false);
+        expect(provider.getUsageSnapshot().attempts.at(-1)).toMatchObject({
+          httpStatus: 401,
+          failureCategory: "configuration",
+          result: "failed",
+        });
+      } finally {
+        errorLog.mockRestore();
+      }
+    });
+
+    it("classifies a request timeout without inventing an HTTP status", async () => {
+      process.env.OPENROUTER_API_KEY = "test-only-openrouter-key";
+      mockFetch.mockRejectedValueOnce(Object.assign(new Error("request timed out"), { name: "TimeoutError" }));
+      const provider = new OpenRouterProvider();
+
+      await expect(provider.chat([{ role: "user", content: "Question" }], "poolside/laguna-s-2.1:free"))
+        .rejects.toThrow("request timed out");
+
+      expect(provider.getUsageSnapshot().attempts[0]).toMatchObject({
+        failureCategory: "timeout",
+        result: "failed",
+      });
+      expect(provider.getUsageSnapshot().attempts[0]).not.toHaveProperty("httpStatus");
+    });
+
+    it("classifies a transport failure without inventing an HTTP status", async () => {
+      process.env.OPENROUTER_API_KEY = "test-only-openrouter-key";
+      mockFetch.mockRejectedValueOnce(Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("socket reset"), { code: "ECONNRESET" }),
+      }));
+      const provider = new OpenRouterProvider();
+
+      await expect(provider.chat([{ role: "user", content: "Question" }], "poolside/laguna-s-2.1:free"))
+        .rejects.toThrow("fetch failed");
+
+      expect(provider.getUsageSnapshot().attempts[0]).toMatchObject({
+        failureCategory: "upstream_transport",
+        result: "failed",
+      });
+      expect(provider.getUsageSnapshot().attempts[0]).not.toHaveProperty("httpStatus");
+    });
+
+    it.each([
+      [401, "configuration"],
+      [503, "upstream_transport"],
+    ] as const)("classifies HTTP %i as %s", async (status, failureCategory) => {
+      process.env.OPENROUTER_API_KEY = "test-only-openrouter-key";
+      mockFetch.mockResolvedValueOnce(new Response("provider detail is not logged", { status }));
+      const provider = new OpenRouterProvider();
+
+      await expect(provider.chat([{ role: "user", content: "Question" }], "poolside/laguna-s-2.1:free"))
+        .rejects.toMatchObject({ statusCode: status });
+
+      expect(provider.getUsageSnapshot().attempts[0]).toMatchObject({ httpStatus: status, failureCategory });
     });
 
     it("accounts for usage on the final streaming chunk", async () => {
@@ -434,6 +745,11 @@ describe("AI Providers", () => {
       await expect(
         provider.chat([{ role: "user", content: "hello" }], "deepseek/deepseek-v3")
       ).rejects.toThrow("OpenRouter API key not provided");
+      expect(provider.getUsageSnapshot().attempts[0]).toMatchObject({
+        failureCategory: "configuration",
+        result: "failed",
+      });
+      expect(provider.getUsageSnapshot().attempts[0]).not.toHaveProperty("httpStatus");
     });
   });
 
