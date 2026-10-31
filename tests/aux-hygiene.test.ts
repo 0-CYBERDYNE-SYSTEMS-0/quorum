@@ -214,6 +214,15 @@ describe("G8 moderator degradation notice", () => {
       expertName: expert.name,
       expertRole: expert.role,
       artifacts: [],
+      stance: {
+        stance: "conditional",
+        confidence: 4,
+        position: expert.role === "Agronomist"
+          ? "Match crop work to growth stage and current field conditions."
+          : expert.role === "Soil Scientist"
+            ? "Check soil moisture and nutrient levels before scheduling field work."
+            : "Schedule outdoor work around the forecasted rain window.",
+      },
     }));
 
     const turnNames = () =>

@@ -58,7 +58,10 @@ export const artifactExamples = [
 ];
 
 export function artifactExamplesForRequest(request: string): string {
-  if (!/\b(chart|charts|visuali[sz]\w*|graph|graphs|plot|plots|dashboard|heatmap)\b/i.test(request)) return "";
+  const explicitlyVisual = /\b(chart|charts|visuali[sz]\w*|graph|graphs|plot|plots|dashboard|heatmap)\b/i.test(request);
+  const comparesData = /\b(compare|comparison|versus|vs\.?|trend|trends|over time|rank|ranking|breakdown|year.over.year|month.over.month)\b/i.test(request) &&
+    /\b(?:\d{2,}|revenue|sales|margin|rate|growth|conversion|cost|price|volume|share|count|metric|statistics|data|numbers?)\b/i.test(request);
+  if (!explicitlyVisual && !comparesData) return "";
   return "VISUAL DESIGN TRAINING EXAMPLES: The following Chair inputs are fictional training context, never evidence for this decision. Use the designs as inspiration, not a fixed menu. Return chart JSON inside a chart fence.\n" +
     artifactExamples.map(example => `Example Chair input: ${example.request}\nExample chart output: ${JSON.stringify(example.output)}`).join("\n\n");
 }

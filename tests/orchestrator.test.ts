@@ -26,6 +26,7 @@ const mockGetCurrentDeliverableFiles = vi.hoisted(() => vi.fn());
 const mockGetCurrentDeliverableFile = vi.hoisted(() => vi.fn());
 const mockCreateMessage = vi.hoisted(() => vi.fn());
 const mockCreateOpenQuestion = vi.hoisted(() => vi.fn());
+const mockListOpenQuestions = vi.hoisted(() => vi.fn());
 // G7: the orchestrator persists snapshots through these; default no-ops here,
 // with dedicated coverage in tests/orchestrator-recovery.test.ts.
 const mockGetConversation = vi.hoisted(() => vi.fn());
@@ -33,11 +34,15 @@ const mockUpdateConversation = vi.hoisted(() => vi.fn());
 
 const mockGetExpertResponseStream = vi.hoisted(() => vi.fn());
 const mockIsRetryableExpertProviderFailure = vi.hoisted(() => vi.fn((response: { content: string }) =>
-  response.content.startsWith("(Error") && !/\b429\b/.test(response.content),
+  response.content.startsWith("(Error") && /\b(?:408|425|429|5\d\d)\b|timeout|ETIMEDOUT|ECONNRESET|status-less structured provider error/i.test(response.content),
 ));
 const mockGenerateInsights = vi.hoisted(() => vi.fn());
 const mockGetModeratorNextSpeakerSuggestion = vi.hoisted(() => vi.fn());
 const mockGenerateClosingSynthesis = vi.hoisted(() => vi.fn());
+// Deliverables are exercised at the ai.ts level in deliverable-commit.test.ts;
+// here the spies prove which response the orchestrator keeps or rejects.
+const mockCommitPendingDeliverable = vi.hoisted(() => vi.fn());
+const mockDiscardPendingDeliverable = vi.hoisted(() => vi.fn());
 
 vi.mock("../server/storage", () => ({
   storage: {
@@ -50,11 +55,29 @@ vi.mock("../server/storage", () => ({
     getCurrentDeliverableFile: mockGetCurrentDeliverableFile,
     createMessage: mockCreateMessage,
     createOpenQuestion: mockCreateOpenQuestion,
+    listOpenQuestions: mockListOpenQuestions,
   },
 }));
 
+vi.mock("../server/pending-deliverables", () => ({
+  commitPendingDeliverable: mockCommitPendingDeliverable,
+  discardPendingDeliverable: mockDiscardPendingDeliverable,
+}));
+
 vi.mock("../server/ai", () => ({
-  getExpertResponseStream: mockGetExpertResponseStream,
+  // The real response builder always includes a stance field. Legacy happy
+  // path fixtures that omit it get a valid mock stance; explicit undefined
+  // and null remain available for stance-repair regressions.
+  getExpertResponseStream: async (...args: any[]) => {
+    const response = await mockGetExpertResponseStream(...args);
+    if (response && !Object.prototype.hasOwnProperty.call(response, "stance")) {
+      return {
+        ...response,
+        stance: { stance: "conditional", confidence: 3, position: "The role recommends proceeding on the current evidence." },
+      };
+    }
+    return response;
+  },
   isRetryableExpertProviderFailure: mockIsRetryableExpertProviderFailure,
   generateInsights: mockGenerateInsights,
   getModeratorNextSpeakerSuggestion: mockGetModeratorNextSpeakerSuggestion,
@@ -147,9 +170,11 @@ describe("Orchestrator", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockListOpenQuestions.mockResolvedValue([]);
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     vi.unstubAllEnvs();
   });
 
@@ -611,20 +636,26 @@ describe("Orchestrator", () => {
       expect(mockGenerateClosingSynthesis.mock.calls.filter(([cid]) => cid === conversationId)).toHaveLength(1);
     });
 
-    it("retries one recoverable provider error without consuming another autonomous turn", async () => {
+    it.each([
+      ["transient 429", "(Error generating response: HTTP 429 Too Many Requests)"],
+      ["status-less structured provider error", "(Error generating response: status-less structured provider error)"],
+    ])("retries a %s once after the bounded backoff without consuming another turn", async (_label, firstFailure) => {
       const conversationId = nextConvId();
       const { waitForTurns, releaseNextTurn, addUserMessageToHistory, turnNames, storedMessages } =
         setupGatedConversation(conversationId);
       mockGetConversation.mockResolvedValue({ turnBudget: 2 });
       mockGetModeratorNextSpeakerSuggestion.mockResolvedValue("RoundRobin");
+      const backoffTimer = vi.spyOn(globalThis, "setTimeout");
 
       const firstMessage = createMockMessage(1, "Check the irrigation plan");
       addUserMessageToHistory(firstMessage);
       await processMessageTurnBased(userId, conversationId, firstMessage, broadcastFn);
       await waitForTurns(1);
-      await releaseNextTurn("(Error generating response: provider output limit exceeded)");
+      await releaseNextTurn(firstFailure);
 
       await waitForTurns(2);
+      expect(backoffTimer.mock.calls.filter(([, delay]) => delay === 1500)).toHaveLength(1);
+      backoffTimer.mockRestore();
       expect(turnNames()).toEqual(["Alice", "Alice"]);
       const aliceCalls = mockGetExpertResponseStream.mock.calls.filter(([expert]) => expert.id === experts[0].id);
       expect(aliceCalls).toHaveLength(2);
@@ -640,6 +671,36 @@ describe("Orchestrator", () => {
       await waitForMode(conversationId, "idle");
     });
 
+    it("retries a status-less provider error once in single-turn mode without spending another turn", async () => {
+      const conversationId = nextConvId();
+      const { waitForTurns, releaseNextTurn, addUserMessageToHistory, turnNames } =
+        setupGatedConversation(conversationId);
+      mockGetConversation.mockResolvedValue({
+        turnBudget: 2,
+        orchestratorState: { isAutonomousEnabled: false },
+      });
+      mockGetModeratorNextSpeakerSuggestion.mockResolvedValue("RoundRobin");
+      const backoffTimer = vi.spyOn(globalThis, "setTimeout");
+
+      const firstMessage = createMockMessage(1, "Check the irrigation plan");
+      addUserMessageToHistory(firstMessage);
+      await processMessageTurnBased(userId, conversationId, firstMessage, broadcastFn);
+      await waitForTurns(1);
+      expect(getConversationState(conversationId)!.singleTurnOnly).toBe(true);
+      await releaseNextTurn("(Error generating response: status-less structured provider error)");
+
+      await waitForTurns(2);
+      expect(backoffTimer.mock.calls.filter(([, delay]) => delay === 1500)).toHaveLength(1);
+      expect(turnNames()).toEqual(["Alice", "Alice"]);
+      expect(getConversationState(conversationId)!.totalAutonomousTurnsTaken).toBe(1);
+      backoffTimer.mockRestore();
+
+      await releaseNextTurn("Distinct recovered answer from Alice");
+      await waitForMode(conversationId, "idle");
+      expect(turnNames()).toEqual(["Alice", "Alice"]);
+      expect(getConversationState(conversationId)!.totalAutonomousTurnsTaken).toBe(0);
+    });
+
     it("keeps a recoverably failed expert eligible for a later budgeted turn after the single retry", async () => {
       const conversationId = nextConvId();
       const { waitForTurns, releaseNextTurn, addUserMessageToHistory, turnNames } =
@@ -651,11 +712,11 @@ describe("Orchestrator", () => {
       addUserMessageToHistory(firstMessage);
       await processMessageTurnBased(userId, conversationId, firstMessage, broadcastFn);
       await waitForTurns(1);
-      await releaseNextTurn("(Error generating response: provider output limit exceeded)");
+      await releaseNextTurn("(Error generating response: HTTP 503 Service Unavailable)");
 
       await waitForTurns(2);
       expect(turnNames()).toEqual(["Alice", "Alice"]);
-      await releaseNextTurn("(Error generating response: provider output limit exceeded)");
+      await releaseNextTurn("(Error generating response: HTTP 503 Service Unavailable)");
 
       await waitForTurns(3);
       expect(turnNames()).toEqual(["Alice", "Alice", "Bob"]);
@@ -673,7 +734,7 @@ describe("Orchestrator", () => {
       await waitForMode(conversationId, "idle");
     });
 
-    it("does not retry a rate-limited provider error and skips a later Moderator pick of that expert", async () => {
+    it("does not retry a configuration failure and skips a later Moderator pick of that expert", async () => {
       const conversationId = nextConvId();
       const { waitForTurns, releaseNextTurn, addUserMessageToHistory, turnNames } = setupGatedConversation(conversationId);
       mockGetConversation.mockResolvedValue({ turnBudget: 2 });
@@ -685,7 +746,7 @@ describe("Orchestrator", () => {
       addUserMessageToHistory(firstMessage);
       await processMessageTurnBased(userId, conversationId, firstMessage, broadcastFn);
       await waitForTurns(1);
-      await releaseNextTurn("(Error generating response: HTTP 429 Too Many Requests)");
+      await releaseNextTurn("(Error generating response: HTTP 401 authentication failed)");
 
       await waitForTurns(2);
       expect(turnNames()).toEqual(["Alice", "Bob"]);
@@ -1206,40 +1267,271 @@ describe("Orchestrator", () => {
       );
     }
 
-    it("preserves minimum turns with a non-repeating response when an owed expert repeats", async () => {
+    it("repairs an undefined stance with one role-specific retry before storing the message", async () => {
       const conversationId = nextConvId();
+      const { storedMessages, addUserMessageToHistory } = setupGatedConversation(conversationId);
+      mockGetConversation.mockResolvedValue({ turnBudget: 1 });
+      mockGetModeratorNextSpeakerSuggestion.mockResolvedValue("RoundRobin");
+      let responseCount = 0;
+      mockGetExpertResponseStream.mockImplementation(async (expert: Expert) => {
+        if (expert.conversationId !== conversationId) return new Promise<never>(() => {});
+        responseCount += 1;
+        return {
+          conversationId,
+          expertId: expert.id,
+          userId: null,
+          content: responseCount === 1
+            ? "Limit the launch to a cohort that tests retention before broad acquisition spend."
+            : "Marketing recommends a controlled launch cohort to measure retention before broad acquisition spend.",
+          role: "assistant",
+          expertName: expert.name,
+          expertRole: expert.role,
+          artifacts: [],
+          stance: responseCount === 1
+            ? undefined
+            : { stance: "conditional", confidence: 4, position: "Use a controlled cohort to validate retention before scaling." },
+        };
+      });
+
+      const userMessage = createMockMessage(1, "Assess the launch plan");
+      addUserMessageToHistory(userMessage);
+      await processMessageTurnBased(userId, conversationId, userMessage, broadcastFn);
+      await waitForMode(conversationId, "idle");
+
+      expect(responseCount).toBe(2);
+      const targetResponseCalls = mockGetExpertResponseStream.mock.calls.filter(
+        ([expert]) => expert.conversationId === conversationId,
+      );
+      expect(targetResponseCalls).toHaveLength(2);
+      expect(targetResponseCalls[1][7]).toContain("lacked a valid independent stance");
+      expect(storedMessages().filter(message => message.role === "assistant")).toHaveLength(1);
+      expect(storedMessages().find(message => message.role === "assistant")?.stance).toEqual({
+        stance: "conditional",
+        confidence: 4,
+        position: "Use a controlled cohort to validate retention before scaling.",
+      });
+    });
+
+    it("repairs a Free single-turn response once before storing it", async () => {
+      const conversationId = nextConvId();
+      const { storedMessages, addUserMessageToHistory } = setupGatedConversation(conversationId);
+      mockGetConversation.mockResolvedValue({ turnBudget: 2, orchestratorState: { isAutonomousEnabled: false } });
+      mockGetModeratorNextSpeakerSuggestion.mockResolvedValue("RoundRobin");
+      let responseCount = 0;
+      mockGetExpertResponseStream.mockImplementation(async (expert: Expert) => {
+        if (expert.conversationId !== conversationId) return new Promise<never>(() => {});
+        responseCount++;
+        return {
+          conversationId, expertId: expert.id, userId: null, role: "assistant",
+          expertName: expert.name, expertRole: expert.role, artifacts: [],
+          content: responseCount === 1 ? "I agree with the other director." : "Test retention in a limited cohort before scaling.",
+          stance: responseCount === 1 ? null : { stance: "conditional", confidence: 4, position: "Validate retention in a limited cohort before scaling." },
+        };
+      });
+      const userMessage = createMockMessage(1, "Assess the launch plan");
+      addUserMessageToHistory(userMessage);
+      await processMessageTurnBased(userId, conversationId, userMessage, broadcastFn);
+      await waitForMode(conversationId, "idle");
+      expect(responseCount).toBe(2);
+      expect(storedMessages().filter(message => message.role === "assistant")).toHaveLength(1);
+      expect(storedMessages().find(message => message.role === "assistant")?.stance?.position).toBe("Validate retention in a limited cohort before scaling.");
+    });
+
+    it("limits a Free provider retry and stance repair to one supplemental call", async () => {
+      const conversationId = nextConvId();
+      const { storedMessages, addUserMessageToHistory } = setupGatedConversation(conversationId);
+      mockGetConversation.mockResolvedValue({ turnBudget: 2, orchestratorState: { isAutonomousEnabled: false } });
+      mockGetModeratorNextSpeakerSuggestion.mockResolvedValue("RoundRobin");
+      let responseCount = 0;
+      mockGetExpertResponseStream.mockImplementation(async (expert: Expert) => {
+        if (expert.conversationId !== conversationId) return new Promise<never>(() => {});
+        responseCount++;
+        return {
+          conversationId, expertId: expert.id, userId: null, role: "assistant",
+          expertName: expert.name, expertRole: expert.role, artifacts: [],
+          content: responseCount === 1 ? "(Error generating response: HTTP 429)" : "I agree with the other director.",
+          stance: null,
+        };
+      });
+      const userMessage = createMockMessage(1, "Assess the launch plan");
+      addUserMessageToHistory(userMessage);
+      await processMessageTurnBased(userId, conversationId, userMessage, broadcastFn);
+      await waitForMode(conversationId, "idle");
+      expect(responseCount).toBe(2);
+      expect(storedMessages().find(message => message.role === "assistant")?.content).toBe("I agree with the other director.");
+    });
+
+    it("retains a valid original stance when the stance repair has no valid stance", async () => {
+      const conversationId = nextConvId();
+      const { storedMessages, addUserMessageToHistory } = setupGatedConversation(conversationId);
+      mockGetConversation.mockResolvedValue({ turnBudget: 1 });
+      mockGetModeratorNextSpeakerSuggestion.mockResolvedValue("RoundRobin");
+      const originalStance = { stance: "conditional" as const, confidence: 4, position: "Validate retention before scaling." };
+      let responseCount = 0;
+      mockGetExpertResponseStream.mockImplementation(async (expert: Expert) => {
+        if (expert.conversationId !== conversationId) return new Promise<never>(() => {});
+        responseCount++;
+        return {
+          conversationId, expertId: expert.id, userId: null, role: "assistant",
+          expertName: expert.name, expertRole: expert.role, artifacts: [],
+          content: responseCount === 1 ? "I agree with the other director." : "Test retention before scaling.",
+          stance: responseCount === 1 ? originalStance : null,
+        };
+      });
+      const userMessage = createMockMessage(1, "Assess the launch plan");
+      addUserMessageToHistory(userMessage);
+      await processMessageTurnBased(userId, conversationId, userMessage, broadcastFn);
+      await waitForMode(conversationId, "idle");
+      expect(responseCount).toBe(2);
+      expect(storedMessages().find(message => message.role === "assistant")?.stance).toEqual(originalStance);
+    });
+
+    it("commits the retained reply's deliverable and discards the rejected repair's", async () => {
+      const conversationId = nextConvId();
+      const { storedMessages, addUserMessageToHistory } = setupGatedConversation(conversationId);
+      mockGetConversation.mockResolvedValue({ turnBudget: 1 });
+      mockGetModeratorNextSpeakerSuggestion.mockResolvedValue("RoundRobin");
+      const originalStance = { stance: "conditional" as const, confidence: 4, position: "Validate retention before scaling." };
+      let originalResponse: any;
+      let repairResponse: any;
+      let responseCount = 0;
+      mockGetExpertResponseStream.mockImplementation(async (expert: Expert) => {
+        if (expert.conversationId !== conversationId) return new Promise<never>(() => {});
+        responseCount++;
+        if (responseCount === 1) {
+          originalResponse = {
+            conversationId, expertId: expert.id, userId: null, role: "assistant",
+            expertName: expert.name, expertRole: expert.role, artifacts: [],
+            content: "I agree with the other director.\n\n📄 {{deliverable}}",
+            stance: originalStance,
+          };
+          return originalResponse;
+        }
+        repairResponse = {
+          conversationId, expertId: expert.id, userId: null, role: "assistant",
+          expertName: expert.name, expertRole: expert.role, artifacts: [],
+          content: "Test retention before scaling.\n\n📄 {{deliverable}}",
+          stance: null,
+        };
+        return repairResponse;
+      });
+      const userMessage = createMockMessage(1, "Assess the launch plan");
+      addUserMessageToHistory(userMessage);
+      await processMessageTurnBased(userId, conversationId, userMessage, broadcastFn);
+      await waitForMode(conversationId, "idle");
+      expect(responseCount).toBe(2);
+      // The repair failed to produce a valid stance, so the original reply is
+      // retained: its deliverable is committed, the repair's is discarded and
+      // never committed. The assertions are object-specific because other
+      // conversation chains may still be draining.
+      expect(mockDiscardPendingDeliverable.mock.calls.filter(([message]) => message === repairResponse)).toHaveLength(1);
+      expect(mockDiscardPendingDeliverable.mock.calls.filter(([message]) => message === originalResponse)).toHaveLength(0);
+      expect(mockCommitPendingDeliverable.mock.calls.filter(([message]) => message === originalResponse)).toHaveLength(1);
+      expect(mockCommitPendingDeliverable.mock.calls.filter(([message]) => message === repairResponse)).toHaveLength(0);
+      expect(storedMessages().find(message => message.role === "assistant")?.content).toBe(originalResponse.content);
+    });
+
+    it.each(["missing stance", "unusable response"])("retains a valid duplicate stance after two prior turns when repair returns %s", async (repairFailure) => {
+      const conversationId = nextConvId();
+      const { storedMessages, addUserMessageToHistory } = setupGatedConversation(conversationId);
+      const expert = { ...experts[0], conversationId };
+      mockGetConversationExperts.mockResolvedValue([expert]);
+      mockGetConversation.mockResolvedValue({ turnBudget: 1 });
+      mockGetModeratorNextSpeakerSuggestion.mockResolvedValue("RoundRobin");
+      const originalContent = "Limit the launch to a controlled cohort and measure retention before increasing acquisition spend.";
+      const originalStance = { stance: "conditional" as const, confidence: 4, position: "Validate retention before scaling acquisition spend." };
+      const userMessage = createMockMessage(1, "Assess the launch plan");
+      addUserMessageToHistory(userMessage);
+      addUserMessageToHistory(createMockMessage(2, originalContent, "assistant", expert.id));
+      addUserMessageToHistory(createMockMessage(3, "Require a weekly retention review before approving the next cohort.", "assistant", expert.id));
+      expect(haveAllExpertsSpokenMinimumTurns(storedMessages(), [expert], userMessage.id)).toBe(true);
+      let responseCount = 0;
+      mockGetExpertResponseStream.mockImplementation(async (currentExpert: Expert) => {
+        if (currentExpert.conversationId !== conversationId) return new Promise<never>(() => {});
+        responseCount++;
+        return {
+          conversationId, expertId: expert.id, userId: null, role: "assistant",
+          expertName: expert.name, expertRole: expert.role, artifacts: [],
+          content: responseCount === 1 ? originalContent : repairFailure === "unusable response" ? "" : "Test retention before scaling.",
+          stance: responseCount === 1 ? originalStance : null,
+        };
+      });
+      await processMessageTurnBased(userId, conversationId, userMessage, broadcastFn);
+      await waitForMode(conversationId, "idle");
+      expect(responseCount).toBe(2);
+      const persisted = storedMessages().filter(message => message.role === "assistant");
+      expect(persisted).toHaveLength(3);
+      expect(persisted[2].content).toBe(originalContent);
+      expect(persisted[2].stance).toEqual(originalStance);
+      expect(getConversationState(conversationId)?.stanceLedger[expert.role]).toEqual(originalStance);
+    });
+
+    it("retries deferential answers without a valid stance and persists distinct positions", async () => {
+      const conversationId = nextConvId();
+      mockGetConversation.mockResolvedValue(undefined);
       // Experts bound to THIS conversation: the mock returns
       // expert.conversationId, so leftover chains from earlier tests (whose
       // loops keep running on their own conversation IDs) can never pollute
       // this conversation's stored-message counts.
-      const myExperts = experts.map((e) => ({ ...e, conversationId }));
+      const roles = ["Chief Strategy Officer", "Chief Financial Officer", "Chief Marketing Officer"];
+      const myExperts = roles.map((role, index) => ({
+        ...createMockExpert(index + 1, role, role),
+        conversationId,
+      }));
       mockGetConversationExperts.mockResolvedValue(myExperts);
       mockGetConversationFiles.mockResolvedValue([]);
       mockGetModeratorNextSpeakerSuggestion.mockResolvedValue("RoundRobin");
       const assistantTurns = mockHistoryBackedStorage();
 
-      const firstRoundContents: Record<string, string> = {
-        Alice: "Lime this field at two tons per acre and retest the soil in spring",
-        Bob: "Tile drainage would fix the wet spot in the north corner",
-        Carol: "Frost risk stays low for the next ten days in your county",
+      const rolePositions: Record<string, string> = {
+        "Chief Strategy Officer": "Limit the pilot to the segment that validates the strategic thesis.",
+        "Chief Financial Officer": "Fund the pilot only after the payback model includes support costs.",
+        "Chief Marketing Officer": "Validate segment-specific conversion before scaling acquisition spend.",
       };
-
-      mockGetExpertResponseStream.mockImplementation(async (expert: Expert) => {
-        // Turns after the first roster repeat Alice's first reply with only its
-        // final word changed (0.875 similarity), exercising duplicate pruning.
-        const content =
-          assistantTurns(conversationId) >= 3
-            ? "Lime this field at two tons per acre and retest the soil in autumn"
-            : firstRoundContents[expert.name];
+      const secondRoundResponses: Record<string, string> = {
+        "Chief Strategy Officer": "Strategy recommends a limited cohort that tests the strategic thesis before expansion changes resource allocation.",
+        "Chief Financial Officer": "Finance recommends releasing funds in stages after the payback model includes support costs and downside cases.",
+        "Chief Marketing Officer": "Marketing recommends a controlled channel test to measure segment conversion before scaling acquisition spend.",
+      };
+      mockGetExpertResponseStream.mockImplementation(async (expert: Expert, ...args: any[]) => {
+        const stance = { stance: "conditional", confidence: 4, position: rolePositions[expert.role] };
+        if (args[6]) {
+          return {
+            conversationId: expert.conversationId,
+            expertId: expert.id,
+            userId: null,
+            content: `${expert.role}: ${rolePositions[expert.role]} Measure the stated condition before committing resources, and revisit the recommendation if the evidence changes.`,
+            role: "assistant",
+            expertName: expert.name,
+            expertRole: expert.role,
+            artifacts: [],
+            stance,
+          };
+        }
+        const roleTurns = assistantTurns.messagesFor(conversationId).filter(message => message.expertRole === expert.role).length;
+        if (roleTurns === 0) {
+          return {
+            conversationId: expert.conversationId,
+            expertId: expert.id,
+            userId: null,
+            content: "I defer to another director on this decision.",
+            role: "assistant",
+            expertName: expert.name,
+            expertRole: expert.role,
+            artifacts: [],
+            stance: null,
+          };
+        }
         return {
           conversationId: expert.conversationId,
           expertId: expert.id,
           userId: null,
-          content,
+          content: secondRoundResponses[expert.role],
           role: "assistant",
           expertName: expert.name,
           expertRole: expert.role,
           artifacts: [],
+          stance,
         };
       });
 
@@ -1247,20 +1539,25 @@ describe("Orchestrator", () => {
       await processMessageTurnBased(userId, conversationId, userMessage, broadcastFn);
       new InteractionOrchestrator(conversationId).enableAutonomous(6);
 
-      await waitFor(800);
+      await vi.waitFor(() => {
+        expect(assistantTurns(conversationId)).toBeGreaterThanOrEqual(6);
+        expect(getConversationState(conversationId)!.mode).toBe("idle");
+        expect(mockGenerateClosingSynthesis.mock.calls.filter(([cid]) => cid === conversationId)).toHaveLength(1);
+      }, { timeout: 10000 });
 
-      // An owed expert's duplicate is replaced by a truthful, non-repeating
-      // fallback so the minimum roster count remains reachable.
       const persisted = assistantTurns.messagesFor(conversationId);
       const turnsByExpert = persisted.reduce<Record<string, number>>((counts, message) => {
-        const name = message.expertName ?? "unknown";
-        counts[name] = (counts[name] ?? 0) + 1;
+        const role = message.expertRole ?? "unknown";
+        counts[role] = (counts[role] ?? 0) + 1;
         return counts;
       }, {});
       expect(persisted.length).toBeGreaterThanOrEqual(6);
-      expect(["Alice", "Bob", "Carol"].every(name => (turnsByExpert[name] ?? 0) >= 2)).toBe(true);
-      expect(persisted.some(message => message.content.includes("I don't have a distinct, evidence-supported point"))).toBe(true);
-      expect(mockGetExpertResponseStream.mock.calls.filter(([expert]) => expert.conversationId === conversationId).length).toBeGreaterThanOrEqual(6);
+      expect(roles.every(role => (turnsByExpert[role] ?? 0) >= 2)).toBe(true);
+      expect(persisted.every(message => message.stance !== null && message.stance !== undefined)).toBe(true);
+      expect(new Set(persisted.slice(0, 3).map(message => message.stance!.position)).size).toBe(3);
+      expect(persisted.some(message => message.content.includes("I defer to another director"))).toBe(false);
+      const retries = mockGetExpertResponseStream.mock.calls.filter(([expert, ...args]) => expert.conversationId === conversationId && args[6]);
+      expect(retries).toHaveLength(3);
 
       const state = getConversationState(conversationId);
       expect(state!.mode).toBe("idle");
@@ -1268,10 +1565,11 @@ describe("Orchestrator", () => {
       expect(state!.totalAutonomousTurnsTaken).toBe(0);
       expect(mockGenerateInsights).toHaveBeenCalledWith(conversationId, expect.any(Function));
       expect(mockGenerateClosingSynthesis.mock.calls.filter(([cid]) => cid === conversationId)).toHaveLength(1);
-    });
+    }, 15000);
 
     it("lets direct autonomous routing run to its cap when contributions stay distinct", async () => {
       const conversationId = nextConvId();
+      mockGetConversation.mockResolvedValue(undefined);
       const myExperts = experts.map((e) => ({ ...e, conversationId }));
       mockGetConversationExperts.mockResolvedValue(myExperts);
       mockGetConversationFiles.mockResolvedValue([]);
@@ -1293,7 +1591,10 @@ describe("Orchestrator", () => {
       await processMessageTurnBased(userId, conversationId, userMessage, broadcastFn);
       new InteractionOrchestrator(conversationId).enableAutonomous(6);
 
-      await waitFor(1000);
+      await vi.waitFor(() => {
+        expect(assistantTurns(conversationId)).toBe(6);
+        expect(getConversationState(conversationId)!.mode).toBe("idle");
+      }, { timeout: 10000 });
 
       // The six-turn autonomous budget is fully used without an initial
       // forced roster round.
@@ -1303,7 +1604,7 @@ describe("Orchestrator", () => {
         cid === conversationId && event.type === "state_update" &&
         event.expertTurnsConsumed === 6 && event.expertTurnsRemaining === 0,
       )).toBe(true);
-    });
+    }, 15000);
   });
 
   // ─────────────────────────────────────────────────────────────────
@@ -2789,15 +3090,20 @@ describe("G4 mention mechanics", () => {
         position,
       });
 
-      it("treats agreement and conditional positions as convergence, but abstention or disagreement as unresolved", () => {
+      it("requires a supportive structured stance from every eligible seat before convergence", () => {
         expect(isStanceLedgerConverged({ Agronomist: stance("agree"), "Soil Scientist": stance("conditional") })).toBe(true);
-        // The approved gate requires >=1 non-abstaining stance and all
-        // non-abstaining stances to be supportive; missing/abstaining entries
-        // are excluded rather than treated as dissent.
-        expect(isStanceLedgerConverged({ Agronomist: stance("agree"), "Soil Scientist": null })).toBe(true);
+        expect(isStanceLedgerConverged({ Agronomist: stance("agree"), "Soil Scientist": null })).toBe(false);
         expect(isStanceLedgerConverged({ Agronomist: stance("abstain"), "Soil Scientist": null })).toBe(false);
+        expect(isStanceLedgerConverged({ Agronomist: stance("agree"), "Soil Scientist": stance("abstain") })).toBe(false);
         expect(isStanceLedgerConverged({ Agronomist: stance("agree"), "Soil Scientist": stance("disagree") })).toBe(false);
         expect(isStanceLedgerConverged({ Agronomist: null })).toBe(false);
+      });
+
+      it("does not close on a stable split while any eligible seat has no substantive position", () => {
+        const incomplete = { Agronomist: stance("agree"), "Soil Scientist": stance("disagree"), "Weather Expert": null };
+        const signature = getStableStanceSplitSignature(incomplete);
+        expect(signature).not.toBeNull();
+        expect(canConcludeWithStanceEvidence(incomplete, 5, 6, 2, signature)).toBe(false);
       });
 
       it("requires two post-question contributions from every speakable expert", () => {

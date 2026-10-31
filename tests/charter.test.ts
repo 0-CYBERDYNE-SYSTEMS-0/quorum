@@ -604,6 +604,9 @@ describe("getModeratorNextSpeakerSuggestion charter awareness", () => {
   it.each([
     ["Continue", "RoundRobin"],
     ["Go deeper: Soil Scientist", "Soil Scientist"],
+    ["Go deeper: Soil Scientist\n\nThe soil data needs a closer look.", "Soil Scientist"],
+    ["- Continue", "RoundRobin"],
+    ["**Conclude**", "Conclude"],
     ["Conclude", "Conclude"],
     ["Soil Scientist", "Soil Scientist"],
     ["RoundRobin", "RoundRobin"],

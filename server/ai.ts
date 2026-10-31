@@ -13,6 +13,7 @@ import { randomBytes } from "crypto";
 import { getProvider, OUTPUT_LIMIT_ERROR, type ChatOptions } from "./ai-providers";
 import { BUDGET_FALLBACK_MODEL, CLOSING_MEMO_MAX_TOKENS, EXPERT_REPLY_MAX_TOKENS } from "./usage-caps";
 import { findCatalogExpert } from "@shared/expert-catalog";
+import { isDeferentialStancePosition } from "@shared/stance";
 import { DELIVERABLE_PLACEHOLDER, pendingDeliverableFor, pendingDeliverableByMessage } from "./pending-deliverables";
 export { commitPendingDeliverable, discardPendingDeliverable } from "./pending-deliverables";
 import { enforceCitationIntegrity, removeUnsupportedCitedSentences, stripMetaLines, undecorate, mergeDuplicateFarmerQuestions, removeRepeatedExpertSentences } from "./response-hygiene";
@@ -71,6 +72,13 @@ async function runExpertToolPhase(expert: Expert, question: string, userId?: num
   const run = await runToolCalls(calls);
   console.log(`[TOOLS] ${expert.role}: ${calls.length} call(s), ${run.sources.length} source(s)${run.notes.length ? `, notes: ${run.notes.join("; ")}` : ""}`);
   return run;
+}
+
+export function allowedChartSourceUrls(toolRun: ToolRun | null | undefined, citations?: string[]): string[] {
+  return Array.from(new Set([
+    ...(toolRun?.sources.map(source => source.url) ?? []),
+    ...(citations ?? []),
+  ]));
 }
 
 function stripModelSourcesSection(content: string): string {
@@ -472,14 +480,17 @@ function expertResponseErrorMessage(error: unknown, expertName: string, imagePar
 
 function isRetryableProviderError(error: unknown): boolean {
   const details = typeof error === "object" && error !== null
-    ? error as { status?: unknown; statusCode?: unknown; code?: unknown; name?: unknown; message?: unknown }
+    ? error as { status?: unknown; statusCode?: unknown; code?: unknown; name?: unknown; cause?: unknown; isProviderError?: unknown }
     : {};
   const status = Number(details.status ?? details.statusCode);
-  if (Number.isInteger(status) && status >= 400 && status < 500) return false;
-  const description = [details.name, details.code, details.message, error instanceof Error ? error.message : String(error)]
+  if (Number.isInteger(status)) return status === 408 || status === 425 || status === 429 || (status >= 500 && status < 600);
+  const cause = typeof details.cause === "object" && details.cause !== null
+    ? details.cause as { code?: unknown; name?: unknown }
+    : {};
+  const description = [details.name, details.code, cause.name, cause.code]
     .filter(value => value !== undefined && value !== null)
     .join(" ");
-  return !/(?:\b429\b|too many requests|rate[ -]?limit|timeout|timed?\s*out|abort(?:ed|error)?|cancel(?:led|ed)?|canceled)/i.test(description);
+  return details.isProviderError === true || /(?:APIConnectionTimeoutError|TimeoutError|ETIMEDOUT|UND_ERR_CONNECT_TIMEOUT|ECONNRESET|ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN)/i.test(description);
 }
 
 function deliverableSuccessMessage(
@@ -562,7 +573,7 @@ export function parseTrailingStanceLine(content: string): {
   const match = finalLine.match(/^STANCE\s*:\s*(agree|disagree|conditional|abstain)\s*\|\s*([1-5])\s*\|\s*(.+?)\s*$/i);
   const stanceValue = match?.[1]?.toLowerCase();
   const position = match?.[3]?.trim();
-  const stance = match && position && STANCE_VALUES.includes(stanceValue as typeof STANCE_VALUES[number])
+  const stance = match && position && !isDeferentialStancePosition(position) && STANCE_VALUES.includes(stanceValue as typeof STANCE_VALUES[number])
     ? {
         stance: stanceValue as MessageStance["stance"],
         confidence: Number(match[2]) as MessageStance["confidence"],
@@ -665,6 +676,7 @@ export function generateSystemPrompt(
 ): string {
   let basePrompt = `You are the ${expert.role}, a director on the Chair's board. The Chair is the company operator; the board advises on consequential business decisions.
 Speak only from the ${expert.role} function. Be direct and specific; advice is not a substitute for qualified professional review.
+${expert.role === "Moderator" || expert.role === "File Creator" ? "" : "Take an independent, role-specific position on the decision. State a substantive reason, evidence, condition, or risk from your function. Agreement is useful only with your own reasoning; never defer to the Chair or another director, and do not answer with a one-line agreement or handoff. If your function genuinely has no basis to decide, abstain and state the specific missing evidence."}
 ${expert.role === "Moderator" || expert.role === "File Creator" ? "" : "Finish every reply with: STANCE: <agree|disagree|conditional|abstain> | <1-5> | <one-line position>."}
 The other seats are: [${availableRoles?.join(', ') || 'various roles'}].
 `;
@@ -684,7 +696,7 @@ The other seats are: [${availableRoles?.join(', ') || 'various roles'}].
     );
     const colleagues = colleagueRoles.length > 0 ? ` Colleagues (not you): [${colleagueRoles.join(", ")}].` : "";
     basePrompt += `\n🎭 STAY IN ROLE: you are the ${expert.role}. Never answer as another director, and never describe another director's function in the first person. When a point belongs to another seat, name that seat and hand it over with @[Role].\n`;
-    basePrompt += `\n🔁 HOW TO CONTRIBUTE:\n- Start with substance. Do not narrate your process ("Let me check…", "Looking at this from the CFO's lens…"). Your first sentence is a claim from your own function.\n- If a colleague has already made a substantive point, engage one specific claim in your first two sentences and name that director. If no colleague has spoken yet, do not invent cross-talk.\n- Add one thing that is new: a fact, number, condition, trade-off, risk, or handoff. Do not restate what is settled. If you have nothing new, say so in one line and stop.\n- Keep the Chair's decision in view: say what you would do and what would change your mind.\n`;
+    basePrompt += `\n🔁 HOW TO CONTRIBUTE:\n- Start with substance. Do not narrate your process ("Let me check…", "Looking at this from the CFO's lens…"). Your first sentence is a claim from your own function.\n- If a colleague has already made a substantive point, engage one specific claim in your first two sentences and name that director. If no colleague has spoken yet, do not invent cross-talk.\n- Add one thing that is new: a fact, number, condition, trade-off, or risk. Do not restate what is settled. If you lack new evidence, state your own judgment and name the specific evidence you cannot establish; do not defer or stop at agreement.\n- Keep the Chair's decision in view: say what you would do and what would change your mind.\n`;
     basePrompt += `\n💬 CROSS-TALK: Build on or challenge colleagues by name ("I agree with X because…" / "I disagree with X on…").${colleagues} Tag @[Role] only when you need that specialty or want that expert to defend a point; never tag yourself or force a tag every turn. Add new information or an objection instead of repeating settled points.\n`;
     if (expert.role !== "File Creator") {
       basePrompt += `\n📏 RESPONSE SIZE: Keep each expert turn to no more than 180 words. Lead with one concrete contribution; retain relevant evidence, units, caveats, and supported citations. Do not pad or repeat previous answers. This limit does not apply to user-requested deliverables.\n`;
@@ -755,7 +767,7 @@ You may end the discussion when the Chair's question is resolved and further tur
 
   const stanceInstruction = expert.role === "Moderator" || expert.role === "File Creator"
     ? ""
-    : `\n\nAt the very end of every response, add exactly one machine-readable stance line in this format:\nSTANCE: <agree|disagree|conditional|abstain> | <confidence 1-5> | <one-line position>\nUse one of the four stance values exactly (case-insensitive), an integer confidence from 1 to 5, and a concise one-line position. Put no text after this line. This line will be removed from the Chair-facing response.`;
+    : `\n\nAt the very end of every response, add exactly one machine-readable stance line in this format:\nSTANCE: <agree|disagree|conditional|abstain> | <confidence 1-5> | <one-line position>\nUse one of the four stance values exactly (case-insensitive), an integer confidence from 1 to 5, and a concise position grounded in your own role. The position must state your conclusion or condition, not merely agree, defer, or hand off. Put no text after this line. This line will be removed from the Chair-facing response.`;
 
   return basePrompt + interactionPrompt + roleInstructions + (expert.role === "Moderator" ? "" : ARTIFACT_DESIGN_PROMPT) + stanceInstruction;
 }
@@ -1249,7 +1261,7 @@ export async function getExpertResponseStream(
       ? { deliverable: null, cleanContent: response.message.content }
       : extractDeliverable(response.message.content);
     const extracted = extractArtifacts(deliverableSplit.cleanContent);
-    const allowedChartUrls = toolRun?.sources.map(src => src.url) ?? [];
+    const allowedChartUrls = allowedChartSourceUrls(toolRun, response.citations);
     const chartEvidence: ChartEvidence = {
       farmerText: history.filter(message => message.role === "user").map(message => message.content).join("\n"),
     };
@@ -1414,7 +1426,11 @@ export async function getExpertResponse(
     const chartEvidence: ChartEvidence = {
       farmerText: history.filter(message => message.role === "user").map(message => message.content).join("\n"),
     };
-    const { kept: artifacts, dropped: droppedCharts, droppedReasons } = filterChartArtifacts(extractedNonStream.artifacts, [], chartEvidence);
+    const { kept: artifacts, dropped: droppedCharts, droppedReasons } = filterChartArtifacts(
+      extractedNonStream.artifacts,
+      allowedChartSourceUrls(null, response.citations),
+      chartEvidence,
+    );
     logRejectedCharts(expert.role, droppedReasons);
     const cleanContent = extractedNonStream.cleanContent + (droppedCharts ? CHART_REJECTION_NOTICE : "");
     const researchAnswer = isResearchAnalystRole(expert.role)
@@ -1549,7 +1565,101 @@ ${charter?.trim()
     ? `Measure the outcome against the board charter, including its goal and stop criteria:\n${charter.trim()}`
     : ""}
 
-Under “Open questions for the Chair,” list every open question for the Chair. Under “Assumptions awaiting confirmation,” list their paired assumptions. If a list is empty, say that none remain.`;
+Under “Open questions for the Chair,” list every open question for the Chair. Under “Assumptions awaiting confirmation,” reproduce every non-empty paired assumption verbatim and identify its unresolved question. Also include each standalone “Assuming …” or “Assumption: …” line from an assistant director message, even when it has no paired question. Exclude assumptions from the Chair and Moderator. Do not generalize, omit, or present an unconfirmed assumption as fact. If a list is empty, say that none remain.`;
+}
+
+function latestPersistedStanceLedger(
+  experts: Expert[],
+  history: Message[],
+  priorLedger: Record<string, MessageStance | null>,
+): Record<string, MessageStance | null> {
+  const roles = Array.from(new Set([
+    ...experts.map(expert => expert.role),
+    ...Object.keys(priorLedger),
+  ])).filter(role => !/^(?:moderator|file creator)$/i.test(role.trim()));
+  const ledger = Object.fromEntries(roles.map(role => [role, null])) as Record<string, MessageStance | null>;
+  const orderedHistory = [...history].sort((left, right) =>
+    (left.timestamp?.getTime() ?? 0) - (right.timestamp?.getTime() ?? 0) || left.id - right.id,
+  );
+
+  for (const message of orderedHistory) {
+    const role = message.expertRole?.trim();
+    if (message.role !== "assistant" || !role || !(role in ledger) ||
+        /^(?:moderator|file creator)$/i.test(message.expertName?.trim() ?? "") ||
+        message.stance === null || message.stance === undefined) continue;
+
+    const value = message.stance as Partial<MessageStance>;
+    const stance = String(value.stance).toLowerCase();
+    const position = typeof value.position === "string" ? value.position.trim() : "";
+    if (["agree", "disagree", "conditional", "abstain"].includes(stance) &&
+      Number.isInteger(value.confidence) && Number(value.confidence) >= 1 && Number(value.confidence) <= 5 &&
+      position.length > 0 && !isDeferentialStancePosition(position)) {
+      ledger[role] = {
+          stance: stance as MessageStance["stance"],
+          confidence: Number(value.confidence) as MessageStance["confidence"],
+          position,
+        };
+    }
+  }
+  return ledger;
+}
+
+/** Ensure each still-open assumption survives the model's closing synthesis. */
+export function preserveOpenQuestionAssumptions(
+  content: string,
+  openQuestions: OpenQuestion[],
+  history: Message[] = [],
+): string {
+  const assumptions: Array<{ role: string; question?: string; assumption: string }> = [];
+  const seenAssumptions = new Set<string>();
+  const addAssumption = (item: { role: string; question?: string; assumption: string }) => {
+    const key = item.assumption.replace(/\s+/g, " ").trim().toLowerCase();
+    if (seenAssumptions.has(key)) return;
+    seenAssumptions.add(key);
+    assumptions.push(item);
+  };
+
+  for (const question of openQuestions) {
+    const assumption = question.assumption?.replace(/\s+/g, " ").trim();
+    if (!assumption) continue;
+    const sourceMessage = history.find(message => message.id === question.messageId && message.role === "assistant");
+    const role = sourceMessage?.expertRole?.trim() || question.expertRole.trim();
+    if (!role || /^(?:chair|moderator)$/i.test(role) ||
+        /^(?:chair|moderator)$/i.test(sourceMessage?.expertName?.trim() ?? "")) continue;
+    addAssumption({ role, question: question.question.replace(/\s+/g, " ").trim(), assumption });
+  }
+
+  for (const message of history) {
+    const role = message.expertRole?.trim();
+    if (message.role !== "assistant" || !role || /^(?:chair|moderator)$/i.test(role) ||
+        /^(?:chair|moderator)$/i.test(message.expertName?.trim() ?? "")) continue;
+
+    const lines = message.content.split(/\r?\n/);
+    for (let index = 0; index < lines.length; index += 1) {
+      const previousLine = (lines[index - 1] ?? "").trim().replace(/^[-*+]\s+/, "");
+      if (/^(?:Board question\s*:\s*|@\[\s*(?:user|chair)\s*\]\s+)/i.test(previousLine)) continue;
+      const assumptionLine = lines[index].trim().replace(/^[-*+]\s+/, "");
+      const match = assumptionLine.match(/^(?:Assuming\b\s*:?\s*|Assumption:\s*)(.+?)\s*$/i);
+      const assumption = match?.[1]?.replace(/\s+/g, " ").trim();
+      if (!assumption) continue;
+      addAssumption({ role, assumption });
+    }
+  }
+  if (!assumptions.length) return content;
+
+  const canonicalBullets = assumptions.map(item => `- ${item.role}: ${item.assumption}${item.question ? ` (pending: ${item.question})` : ""}`).join("\n");
+  const heading = /^## Assumptions awaiting confirmation[ \t]*$/im.exec(content);
+  if (!heading) {
+    const separator = content ? (content.endsWith("\n") ? "\n" : "\n\n") : "";
+    return `${content}${separator}## Assumptions awaiting confirmation\n${canonicalBullets}`;
+  }
+
+  const sectionStart = heading.index + heading[0].length;
+  const sectionTail = content.slice(sectionStart);
+  const nextHeading = /^#{1,6}[ \t]+/m.exec(sectionTail);
+  const sectionEnd = nextHeading ? sectionStart + nextHeading.index : content.length;
+  const followingContent = nextHeading ? `\n\n${content.slice(sectionEnd)}` : "";
+  return `${content.slice(0, sectionStart)}\n${canonicalBullets}${followingContent}`;
 }
 
 // Function to generate insights
@@ -1711,7 +1821,17 @@ export async function getModeratorNextSpeakerSuggestion(
             console.warn("Moderator returned no next-speaker text. Falling back to round-robin.");
             return null;
         }
-        const rawSuggestion = responseContent.trim().replace(/\.$/, '').trim();
+        // Providers sometimes append an explanation after the decision line
+        // ("Go deeper: Chief Marketing Officer\n\nThe CMO has not..."). The
+        // decision is the first non-empty line; keep the whole response only
+        // as a fallback for single-line role names.
+        const rawSuggestion = responseContent.trim().split(/\r?\n/, 1)[0]
+            .trim()
+            .replace(/^[-*]\s+/, '')
+            .replace(/\*\*/g, '')
+            .replace(/^["'`]|["'`]$/g, '')
+            .replace(/\.$/, '')
+            .trim();
         let suggestedRole: string | null = null;
 
         if (rawSuggestion.toLowerCase() === 'continue') {
@@ -1766,7 +1886,6 @@ export async function generateClosingSynthesis(
 ): Promise<void> {
   console.log(`[SYNTHESIS] Generating closing synthesis for conversation ${conversationId}`);
   try {
-    const history = await storage.getConversationMessages(conversationId);
     const experts = await storage.getConversationExperts(conversationId);
     const openQuestions = await storage.listOpenQuestions(conversationId);
     const availableRoles = experts.map(e => e.role).filter(role => role !== "Moderator");
@@ -1784,7 +1903,11 @@ export async function generateClosingSynthesis(
     const firstExpertModel = experts.find(expert => expert.role !== "Moderator")?.model ?? null;
     const closingModel = await resolveAuxModelForUser(moderatorExpert.model, firstExpertModel, conversation?.userId);
 
-    const closingPrompt = buildClosingSynthesisPrompt(stanceLedger, openQuestions, charter);
+    // Refresh the persisted transcript immediately before building the closing
+    // prompt so the in-memory ledger cannot override the final stored stance.
+    const history = await storage.getConversationMessages(conversationId);
+    const latestStanceLedger = latestPersistedStanceLedger(experts, history, stanceLedger);
+    const closingPrompt = buildClosingSynthesisPrompt(latestStanceLedger, openQuestions, charter);
 
     const messages: AIMessage[] = [
       { role: "system", content: systemPrompt },
@@ -1833,7 +1956,7 @@ export async function generateClosingSynthesis(
       });
       response = await callOpenRouterAPIStream(messages, BUDGET_FALLBACK_MODEL, onClosingToken, conversation?.userId, false, closingOptions);
     }
-    const content = response.message.content;
+    const content = preserveOpenQuestionAssumptions(response.message.content, openQuestions, history);
 
     const storedMessage = await storage.createMessage({
       conversationId,

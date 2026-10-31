@@ -41,6 +41,8 @@ export class OpenRouterSpendLimitError extends Error {
 type OpenRouterAttempt = {
   id: string;
   model: string;
+  requestModel?: string;
+  routedModels?: string[];
   startedAt: number;
   reservedUsd: number;
   maxTokens: number;
@@ -58,14 +60,90 @@ export type OpenRouterUsageSnapshot = {
     requestId: string;
     generationId?: string;
     model: string;
+    attemptedModel: string;
+    requestModel?: string;
+    routedModels?: string[];
+    fallbackModels?: string[];
+    fallbackUsed?: boolean;
     responseModel?: string;
     provider?: string;
     elapsedMs: number;
     result: "success" | "failed";
     costUsd: number | null;
-    errorCode?: number;
+    httpStatus?: number;
+    providerStatus?: number;
+    failureCategory?: "timeout" | "rate_limit" | "configuration" | "upstream_transport";
   }>;
 };
+
+type ProviderFailureCategory = "timeout" | "rate_limit" | "configuration" | "upstream_transport";
+type ProviderErrorDiagnostics = { provider?: string; providerStatus?: number };
+
+function safeProviderIdentifier(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const provider = value.trim();
+  return provider.length <= 64 && /^[A-Za-z0-9][A-Za-z0-9 ._-]*$/.test(provider) ? provider : undefined;
+}
+
+function providerErrorDiagnostics(error: unknown): ProviderErrorDiagnostics {
+  if (typeof error !== "object" || error === null) return {};
+  const details = error as { code?: unknown; metadata?: unknown };
+  const metadata = typeof details.metadata === "object" && details.metadata !== null
+    ? details.metadata as { provider_name?: unknown }
+    : {};
+  const provider = safeProviderIdentifier(metadata.provider_name);
+  const providerStatus = typeof details.code === "number" && Number.isInteger(details.code) && details.code >= 100 && details.code <= 599
+    ? details.code
+    : undefined;
+  return {
+    ...(provider ? { provider } : {}),
+    ...(providerStatus === undefined ? {} : { providerStatus }),
+  };
+}
+
+function providerErrorDiagnosticsFromBody(body: string): ProviderErrorDiagnostics {
+  try {
+    return providerErrorDiagnostics(JSON.parse(body)?.error);
+  } catch {
+    return {};
+  }
+}
+
+function providerFailureCategory(error: unknown, httpStatus?: number, providerCode?: number): ProviderFailureCategory {
+  const details = typeof error === "object" && error !== null
+    ? error as { name?: unknown; code?: unknown; cause?: unknown; message?: unknown }
+    : {};
+  const cause = typeof details.cause === "object" && details.cause !== null
+    ? details.cause as { name?: unknown; code?: unknown }
+    : {};
+  const codes = [details.code, cause.code].map(value => String(value ?? ""));
+  const names = [details.name, cause.name].map(value => String(value ?? ""));
+
+  if (httpStatus === 408 || providerCode === 408 ||
+      names.some(name => /^(?:TimeoutError|APIConnectionTimeoutError)$/i.test(name)) ||
+      codes.some(code => /^(?:ETIMEDOUT|UND_ERR_CONNECT_TIMEOUT)$/i.test(code))) return "timeout";
+  if (httpStatus === 429 || providerCode === 429) return "rate_limit";
+  const errorStatus = providerCode ?? httpStatus;
+  if ((errorStatus !== undefined && errorStatus >= 400 && errorStatus < 500 && errorStatus !== 425) ||
+      /OpenRouter API key not provided|UsageCapError|SpendLimitError/i.test(`${names.join(" ")} ${details.message ?? ""}`)) {
+    return "configuration";
+  }
+  return "upstream_transport";
+}
+
+/**
+ * Transport failures (a reset mid-stream, an unclassified network error) are
+ * recoverable, but the raw error may carry no HTTP status or known code. Mark
+ * them the same way as provider errors so the orchestrator's single retry can
+ * run. Output-limit failures are also retryable for expert replies: the retry
+ * asks for a concise answer instead of persisting an empty turn. Configuration
+ * failures stay non-retryable.
+ */
+function markRetryableProviderFailure(error: unknown, failureCategory: ProviderFailureCategory): void {
+  if (failureCategory === "configuration" || !(error instanceof Error)) return;
+  if ((error as { isProviderError?: boolean }).isProviderError === true) return;
+  Object.assign(error, { isProviderError: true });
+}
 
 function configuredSpendCap(): number | null {
   const raw = process.env.OPENROUTER_SPEND_CAP_USD;
@@ -82,7 +160,11 @@ function numericCost(usage: any): number | undefined {
 
 const UNSUPPORTED_IMAGE_ERROR = /(?:image|vision|modalit|multimodal)[\s\S]{0,100}(?:not\s+support|unsupport\w*|reject\w*|invalid|disabled|not\s+allowed|can(?:not|'t)|unable)|(?:not\s+support|unsupport\w*|reject\w*|invalid|disabled|not\s+allowed|can(?:not|'t)|unable)[\s\S]{0,100}(?:image|vision|modalit|multimodal)|support\s+(?:[\w-]+\s+){0,2}(?:image|vision|multimodal|modalit)/i;
 
-function safeOpenRouterError(status: number | undefined, providerDetail?: unknown): Error {
+function safeOpenRouterError(
+  status: number | undefined,
+  providerDetail?: unknown,
+  diagnostics: ProviderErrorDiagnostics = {},
+): Error {
   let detail = "";
   try {
     detail = typeof providerDetail === "string" ? providerDetail : JSON.stringify(providerDetail ?? "");
@@ -100,7 +182,12 @@ function safeOpenRouterError(status: number | undefined, providerDetail?: unknow
       : status === 429
         ? "OpenRouter is temporarily rate-limited. Try again later."
         : `OpenRouter could not complete this request${status === undefined ? "" : ` (${status})`}. Retry or continue with available work.`;
-  return Object.assign(new Error(message), status === undefined ? {} : { statusCode: status });
+  return Object.assign(
+    new Error(message),
+    status === undefined ? {} : { statusCode: status },
+    { isProviderError: true },
+    diagnostics,
+  );
 }
 
 // ─── Provider Interface ───────────────────────────────────────────────────────
@@ -179,8 +266,9 @@ export class OpenRouterProvider implements AIProvider {
       generationId?: string;
       responseModel?: string;
       provider?: string;
-      errorCode?: number;
-      errorMessage?: string;
+      httpStatus?: number;
+      providerStatus?: number;
+      failureCategory?: ProviderFailureCategory;
     } = {},
   ): void {
     if (attempt.settled) return;
@@ -204,13 +292,24 @@ export class OpenRouterProvider implements AIProvider {
       requestId: attempt.id,
       ...(metadata.generationId ? { generationId: metadata.generationId } : {}),
       model: attempt.model,
+      attemptedModel: attempt.model,
+      ...(attempt.requestModel ? { requestModel: attempt.requestModel } : {}),
+      ...(attempt.routedModels ? {
+        routedModels: [...attempt.routedModels],
+        ...(attempt.routedModels.length > 1 ? { fallbackModels: attempt.routedModels.slice(1) } : {}),
+      } : {}),
+      ...(metadata.responseModel && attempt.routedModels?.length
+        ? { fallbackUsed: attempt.routedModels.slice(1).includes(metadata.responseModel) ||
+          (attempt.requestModel !== attempt.model && metadata.responseModel === attempt.requestModel) }
+        : {}),
       ...(metadata.responseModel ? { responseModel: metadata.responseModel } : {}),
       ...(metadata.provider ? { provider: metadata.provider } : {}),
       elapsedMs: Date.now() - attempt.startedAt,
       result,
       costUsd: costUsd ?? null,
-      ...(metadata.errorCode === undefined ? {} : { errorCode: metadata.errorCode }),
-      ...(metadata.errorMessage ? { errorMessage: metadata.errorMessage } : {}),
+      ...(metadata.httpStatus === undefined ? {} : { httpStatus: metadata.httpStatus }),
+      ...(metadata.providerStatus === undefined ? {} : { providerStatus: metadata.providerStatus }),
+      ...(metadata.failureCategory ? { failureCategory: metadata.failureCategory } : {}),
     };
     this.attempts.push(record);
     if (this.attempts.length > 100) this.attempts.splice(0, this.attempts.length - 100);
@@ -251,7 +350,6 @@ export class OpenRouterProvider implements AIProvider {
       // Graceful fallback: keep answering on a free model; the client shows
       // BUDGET_EXHAUSTED_NOTICE from /api/user/tier.
       console.info(`[CAPS] user ${userId} AI budget spent — ${model} -> ${BUDGET_FALLBACK_MODEL}`);
-      attempt.model = BUDGET_FALLBACK_MODEL;
       return { key, model: BUDGET_FALLBACK_MODEL };
     }
     if (denial) throw new UsageCapError(denial);
@@ -290,10 +388,14 @@ export class OpenRouterProvider implements AIProvider {
     let generationId: string | undefined;
     let provider: string | undefined;
     let responseModel: string | undefined;
+    let httpStatus: number | undefined;
     try {
       const authorized = await this.authorizeCall(attempt, model, userId);
       const openRouterKey = authorized.key;
       model = authorized.model;
+      const routing = modelRouting(model);
+      attempt.requestModel = model;
+      attempt.routedModels = routing.models ?? [routing.model];
 
       requestStarted = true;
       const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -305,7 +407,7 @@ export class OpenRouterProvider implements AIProvider {
           "X-Title": "Quorum"
         },
         body: JSON.stringify({
-          ...modelRouting(model),
+          ...routing,
           messages: messages,
           temperature: 0.7,
           ...this.requestBudget(attempt),
@@ -315,9 +417,11 @@ export class OpenRouterProvider implements AIProvider {
         }),
         signal: AbortSignal.timeout(AI_REQUEST_TIMEOUT_MS),
       });
+      httpStatus = response.status;
 
       if (!response.ok) {
-        throw safeOpenRouterError(response.status, await response.text().catch(() => ""));
+        const body = await response.text().catch(() => "");
+        throw safeOpenRouterError(response.status, body, providerErrorDiagnosticsFromBody(body));
       }
 
       const data = await response.json() as any;
@@ -327,7 +431,11 @@ export class OpenRouterProvider implements AIProvider {
       responseModel = typeof data?.model === "string" ? data.model : undefined;
 
       if (data && data.error) {
-        throw safeOpenRouterError(Number.isInteger(data.error.code) ? data.error.code : undefined, data.error);
+        throw safeOpenRouterError(
+          Number.isInteger(data.error.code) ? data.error.code : undefined,
+          data.error,
+          providerErrorDiagnostics(data.error),
+        );
       }
 
       if (!data || !data.choices || !Array.isArray(data.choices) || data.choices.length === 0 || !data.choices[0] || !data.choices[0].message) {
@@ -338,7 +446,7 @@ export class OpenRouterProvider implements AIProvider {
         throw new Error(OUTPUT_LIMIT_ERROR);
       }
 
-      this.settleAttempt(attempt, "success", usage, { generationId, responseModel, provider });
+      this.settleAttempt(attempt, "success", usage, { generationId, responseModel, provider, httpStatus });
       return {
         message: data.choices[0].message,
         ...(Array.isArray(data.citations) ? { citations: data.citations.filter((value: unknown): value is string => typeof value === "string") } : {}),
@@ -348,13 +456,17 @@ export class OpenRouterProvider implements AIProvider {
         ...(provider ? { providerName: provider } : {}),
       };
     } catch (error: unknown) {
-      const status = typeof (error as any)?.statusCode === "number" ? (error as any).statusCode : undefined;
+      const providerCode = typeof (error as any)?.statusCode === "number" ? (error as any).statusCode : undefined;
+      const diagnostics = typeof error === "object" && error !== null ? error as ProviderErrorDiagnostics : {};
+      const failureCategory = providerFailureCategory(error, httpStatus, providerCode);
+      markRetryableProviderFailure(error, failureCategory);
       this.settleAttempt(attempt, "failed", requestStarted ? usage : { cost: 0 }, {
         generationId,
         responseModel,
-        provider,
-        errorCode: status,
-        errorMessage: error instanceof Error ? error.message.slice(0, 300) : undefined,
+        provider: diagnostics.provider ?? provider,
+        httpStatus,
+        providerStatus: diagnostics.providerStatus,
+        failureCategory,
       });
       if (error instanceof Error) {
         throw error;
@@ -378,10 +490,14 @@ export class OpenRouterProvider implements AIProvider {
     let generationId: string | undefined;
     let provider: string | undefined;
     let responseModel: string | undefined;
+    let httpStatus: number | undefined;
     try {
       const authorized = await this.authorizeCall(attempt, model, userId);
       const openRouterKey = authorized.key;
       model = authorized.model;
+      const routing = modelRouting(model);
+      attempt.requestModel = model;
+      attempt.routedModels = routing.models ?? [routing.model];
 
       requestStarted = true;
       const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -393,7 +509,7 @@ export class OpenRouterProvider implements AIProvider {
           "X-Title": "Quorum"
         },
         body: JSON.stringify({
-          ...modelRouting(model),
+          ...routing,
           messages: messages,
           temperature: 0.7,
           ...this.requestBudget(attempt),
@@ -404,9 +520,11 @@ export class OpenRouterProvider implements AIProvider {
         }),
         signal: AbortSignal.timeout(AI_REQUEST_TIMEOUT_MS),
       });
+      httpStatus = response.status;
 
       if (!response.ok) {
-        throw safeOpenRouterError(response.status, await response.text().catch(() => ""));
+        const body = await response.text().catch(() => "");
+        throw safeOpenRouterError(response.status, body, providerErrorDiagnosticsFromBody(body));
       }
 
       if (!response.body) {
@@ -449,7 +567,11 @@ export class OpenRouterProvider implements AIProvider {
             if (parsed?.usage) usage = parsed.usage;
 
             if (parsed?.error) {
-              throw safeOpenRouterError(Number.isInteger(parsed.error.code) ? parsed.error.code : undefined, parsed.error);
+              throw safeOpenRouterError(
+                Number.isInteger(parsed.error.code) ? parsed.error.code : undefined,
+                parsed.error,
+                providerErrorDiagnostics(parsed.error),
+              );
             }
 
             const choice = parsed?.choices?.[0];
@@ -471,7 +593,7 @@ export class OpenRouterProvider implements AIProvider {
         throw new Error(OUTPUT_LIMIT_ERROR);
       }
 
-      this.settleAttempt(attempt, "success", usage, { generationId, responseModel, provider });
+      this.settleAttempt(attempt, "success", usage, { generationId, responseModel, provider, httpStatus });
 
       return {
         message: { role: "assistant", content: fullContent },
@@ -481,13 +603,17 @@ export class OpenRouterProvider implements AIProvider {
         ...(provider ? { providerName: provider } : {}),
       };
     } catch (error: unknown) {
-      const status = typeof (error as any)?.statusCode === "number" ? (error as any).statusCode : undefined;
+      const providerCode = typeof (error as any)?.statusCode === "number" ? (error as any).statusCode : undefined;
+      const diagnostics = typeof error === "object" && error !== null ? error as ProviderErrorDiagnostics : {};
+      const failureCategory = providerFailureCategory(error, httpStatus, providerCode);
+      markRetryableProviderFailure(error, failureCategory);
       this.settleAttempt(attempt, "failed", requestStarted ? usage : { cost: 0 }, {
         generationId,
         responseModel,
-        provider,
-        errorCode: status,
-        errorMessage: error instanceof Error ? error.message.slice(0, 300) : undefined,
+        provider: diagnostics.provider ?? provider,
+        httpStatus,
+        providerStatus: diagnostics.providerStatus,
+        failureCategory,
       });
       if (error instanceof Error) throw error;
       throw new Error("OpenRouter could not complete this request. Retry or continue with available work.");
