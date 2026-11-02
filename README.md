@@ -79,7 +79,8 @@ out of production builds.
 | `SESSION_SECRET` | yes | Express session signing key. |
 | `OPENROUTER_API_KEY` | yes | House model key for directors. Directors can also use a user-supplied key. |
 | `ENCRYPTION_KEY` | recommended | Encrypts stored user API keys. |
-| `DEFAULT_AUX_MODEL` | optional | Model for routing, insights, and closing synthesis. |
+| `DEFAULT_AUX_MODEL` | optional | Model for routing, insights, and closing synthesis. Use a paid slug on paid tiers. |
+| `OPENROUTER_PROVIDER_IGNORE` | optional | Comma-separated providers excluded from OpenRouter routing. Defaults to `Relace`. |
 | `STRIPE_SECRET_KEY` / `STRIPE_PRICE_ID_PRO` / `STRIPE_PRICE_ID_PRO_ANNUAL` | optional | Executive subscriptions. Without them every account stays on Associate and billing fails closed. |
 | `LOCAL_AI_BASE_URL` / `LOCAL_AI_MODEL` | optional | Route director calls to a local OpenAI-compatible endpoint. |
 | `PORT` | optional | Defaults to `5001`. |

@@ -25,6 +25,16 @@ export const EXPERT_REPLY_MAX_TOKENS = 1200;
 /** Output cap for the Moderator's closing decision memo (seven short sections). */
 export const CLOSING_MEMO_MAX_TOKENS = 2000;
 
+/**
+ * Default model for the pre-answer tool-planning call on paid tiers. The
+ * previous code default was a free preview model that could spend its whole
+ * budget on hidden reasoning and end with "Response reached the output limit."
+ * This small paid slug is stable and allowlisted.
+ */
+export const DEFAULT_AUX_MODEL_SLUG = "z-ai/glm-5.3-flash";
+/** Second paid aux choice when the default aux model fails. */
+export const DEFAULT_AUX_MODEL_FALLBACK_SLUG = "openai/gpt-6-luna";
+
 /** Free model experts use once a Pro user's monthly AI budget is spent. */
 export const BUDGET_FALLBACK_MODEL = "dots-studio/dots-3-note-preview:free";
 

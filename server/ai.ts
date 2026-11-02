@@ -11,7 +11,8 @@ import fs from "fs";
 import axios from "axios";
 import { randomBytes } from "crypto";
 import { getProvider, OUTPUT_LIMIT_ERROR, type ChatOptions } from "./ai-providers";
-import { BUDGET_FALLBACK_MODEL, CLOSING_MEMO_MAX_TOKENS, EXPERT_REPLY_MAX_TOKENS } from "./usage-caps";
+import { MAX_LOGGED_PROVIDER_TEXT, redactAndTruncateLogText } from "./log-redaction";
+import { BUDGET_FALLBACK_MODEL, CLOSING_MEMO_MAX_TOKENS, DEFAULT_AUX_MODEL_FALLBACK_SLUG, DEFAULT_AUX_MODEL_SLUG, EXPERT_REPLY_MAX_TOKENS } from "./usage-caps";
 import { findCatalogExpert } from "@shared/expert-catalog";
 import { isDeferentialStancePosition } from "@shared/stance";
 import { DELIVERABLE_PLACEHOLDER, pendingDeliverableFor, pendingDeliverableByMessage } from "./pending-deliverables";
@@ -43,13 +44,27 @@ function paidWebPluginEnabled(): boolean {
   return process.env.OPENROUTER_WEB_PLUGIN === "true";
 }
 
-/** Search planning is a tiny routing task: run it on a free model (override with TOOL_PLANNING_MODEL). */
-function toolPlanningModel(): string {
-  return process.env.TOOL_PLANNING_MODEL?.trim() || BUDGET_FALLBACK_MODEL;
+/** Planning output is at most one line per allowed tool call. */
+export const PLANNING_MAX_TOKENS = 2048;
+
+/** Expert reply calls see the last N transcript messages. */
+const EXPERT_HISTORY_MESSAGES = 8;
+
+function isPaidTier(tier: string | null | undefined): boolean {
+  return tier === "pro" || tier === "enterprise";
 }
 
-/** Expert reply calls see the last N transcript messages (was 15). */
-const EXPERT_HISTORY_MESSAGES = 8;
+/**
+ * Ordered planning models for a tier. Paid tiers use a small paid slug (and one
+ * fallback); free tiers stay on the free budget slug because a paid house-key
+ * call is rejected for them. TOOL_PLANNING_MODEL overrides the whole chain.
+ */
+export function planningModelsForTier(tier: string | null | undefined): string[] {
+  const override = process.env.TOOL_PLANNING_MODEL?.trim();
+  if (override) return [override];
+  if (!isPaidTier(tier)) return [BUDGET_FALLBACK_MODEL];
+  return [DEFAULT_AUX_MODEL_SLUG, DEFAULT_AUX_MODEL_FALLBACK_SLUG];
+}
 
 async function runExpertToolPhase(expert: Expert, question: string, userId?: number): Promise<ToolRun | null> {
   if (!expertToolsEnabled() || expert.role === "Moderator" || expert.role === "File Creator") return null;
@@ -57,16 +72,22 @@ async function runExpertToolPhase(expert: Expert, question: string, userId?: num
   try { tier = userId ? (await storage.getUser(userId))?.tier ?? undefined : undefined; } catch { tier = undefined; }
   const limit = toolCallLimitForTier(tier);
   let plan = "NONE";
-  try {
-    const planning = await callOpenRouterAPI([
-      { role: "system", content: buildToolPlanningPrompt(expert.role, question, limit) },
-      { role: "user", content: "List your tool calls now (or NONE)." },
-    ], toolPlanningModel(), userId);
-    plan = planning.message.content ?? "NONE";
-  } catch (error) {
-    console.warn(`[TOOLS] planning failed for ${expert.role}: ${(error as Error).message}`);
-    return null;
+  let planningFailed = false;
+  for (const model of planningModelsForTier(tier)) {
+    try {
+      const planning = await callOpenRouterAPI([
+        { role: "system", content: buildToolPlanningPrompt(expert.role, question, limit) },
+        { role: "user", content: "List your tool calls now (or NONE)." },
+      ], model, userId, false, { maxTokens: PLANNING_MAX_TOKENS, reasoningEffort: "none" });
+      plan = planning.message.content ?? "NONE";
+      planningFailed = false;
+      break;
+    } catch (error) {
+      planningFailed = true;
+      console.warn(`[TOOLS] planning failed for ${expert.role} on ${model}: ${(error as Error).message}`);
+    }
   }
+  if (planningFailed) return null;
   const calls = parseToolPlan(plan, limit);
   if (!calls.length) return null;
   const run = await runToolCalls(calls);
@@ -493,6 +514,41 @@ function isRetryableProviderError(error: unknown): boolean {
   return details.isProviderError === true || /(?:APIConnectionTimeoutError|TimeoutError|ETIMEDOUT|UND_ERR_CONNECT_TIMEOUT|ECONNRESET|ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN)/i.test(description);
 }
 
+/**
+ * Compact, log-only description of a provider failure: which provider served
+ * the attempt, how the stream ended, and the upstream error text. Never
+ * includes request headers or keys, and the text is truncated.
+ */
+export function providerFailureLogDetail(error: unknown): string {
+  if (typeof error !== "object" || error === null) return "";
+  const details = error as {
+    message?: unknown;
+    provider?: unknown;
+    providerStatus?: unknown;
+    statusCode?: unknown;
+    status?: unknown;
+    finishReason?: unknown;
+    nativeFinishReason?: unknown;
+    providerErrorText?: unknown;
+  };
+  const parts: string[] = [];
+  const add = (label: string, value: unknown) => {
+    if (typeof value === "number" && Number.isFinite(value)) parts.push(`${label}=${value}`);
+    else if (typeof value === "string") {
+      const cleaned = redactAndTruncateLogText(value);
+      if (cleaned) parts.push(`${label}=${cleaned.slice(0, MAX_LOGGED_PROVIDER_TEXT)}`);
+    }
+  };
+  add("provider", details.provider);
+  add("httpStatus", details.statusCode ?? details.status);
+  add("providerStatus", details.providerStatus);
+  add("finishReason", details.finishReason);
+  add("nativeFinishReason", details.nativeFinishReason);
+  add("error", details.message);
+  add("providerError", details.providerErrorText);
+  return parts.join(", ");
+}
+
 function deliverableSuccessMessage(
   saved: { file: DeliverableFile; created: boolean },
   request: DeliverableGenerationRequest,
@@ -789,6 +845,99 @@ export async function callOpenRouterAPIStream(
 ): Promise<AIModelResponse> {
   const provider = getProvider(model);
   return provider.chatStream(messages, model, onToken, userId, webSearch, options);
+}
+
+/** Retries after the first stream attempt for a live expert turn. */
+export const EXPERT_STREAM_MAX_RETRIES = 2;
+export const EXPERT_RETRY_BASE_DELAY_MS = 800;
+
+/** Exponential backoff: 800ms, 1600ms (override the base with EXPERT_RETRY_BASE_MS). */
+export function expertRetryDelayMs(retryIndex: number, baseMs = EXPERT_RETRY_BASE_DELAY_MS): number {
+  return Math.max(0, Math.round(baseMs * 2 ** Math.max(0, retryIndex)));
+}
+
+type ExpertStreamDeps = {
+  stream: (
+    messages: AIMessage[],
+    model: string,
+    onToken: (token: string) => void,
+    userId?: number,
+    webSearch?: boolean,
+    options?: ChatOptions,
+  ) => Promise<AIModelResponse>;
+  chat: (
+    messages: AIMessage[],
+    model: string,
+    userId?: number,
+    webSearch?: boolean,
+    options?: ChatOptions,
+  ) => Promise<AIModelResponse>;
+  sleep?: (ms: number) => Promise<void>;
+};
+
+/**
+ * Live expert turns retry transient stream failures. Attempts 1 and 2 stream
+ * (buffering tokens until the attempt proves healthy, because a failed attempt
+ * cannot be rewound once tokens reached the client); the final attempt asks for
+ * a non-streaming completion so one more transport path can answer the turn.
+ * A stream that already emitted tokens is left to the orchestrator, which
+ * clears the partial turn before its own single retry.
+ */
+export async function callExpertStreamWithResilience(
+  messages: AIMessage[],
+  model: string,
+  onToken: (token: string) => void,
+  userId?: number,
+  webSearch = false,
+  options?: ChatOptions,
+  deps: ExpertStreamDeps = { stream: callOpenRouterAPIStream, chat: callOpenRouterAPI },
+  retry: { maxRetries?: number; baseDelayMs?: number; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<AIModelResponse> {
+  const maxRetries = Math.max(0, retry.maxRetries ?? EXPERT_STREAM_MAX_RETRIES);
+  const baseDelayMs = retry.baseDelayMs ?? (Number(process.env.EXPERT_RETRY_BASE_MS) || EXPERT_RETRY_BASE_DELAY_MS);
+  const sleep = retry.sleep ?? deps.sleep ?? ((ms: number) => new Promise(resolve => setTimeout(resolve, ms)));
+  let bufferTokens = false;
+  let streamedToClient = false;
+  let lastError: unknown;
+
+  for (let attemptIndex = 0; attemptIndex <= maxRetries; attemptIndex++) {
+    const finalAttempt = attemptIndex === maxRetries;
+    // Attempt 0 streams live. Later attempts buffer, so a failed retry leaves
+    // no half-written text in the client.
+    const queued: string[] = [];
+    try {
+      if (finalAttempt) {
+        const response = await deps.chat(messages, model, userId, webSearch, options);
+        onToken(response.message.content);
+        return response;
+      }
+      const response = await deps.stream(messages, model, (token) => {
+        if (bufferTokens) {
+          queued.push(token);
+        } else {
+          streamedToClient = true;
+          onToken(token);
+        }
+      }, userId, webSearch, options);
+      if (bufferTokens && queued.length) onToken(queued.join(""));
+      return response;
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableProviderError(error)) break;
+      if (finalAttempt) {
+        // The expert layer already exhausted its retries; mark the failure so
+        // the orchestrator records one error row instead of another attempt.
+        if (error instanceof Object) Object.assign(error, { providerRetriesExhausted: true, providerAttempts: maxRetries + 1 });
+        break;
+      }
+      if (attemptIndex === 0 && streamedToClient) break;
+      bufferTokens = true;
+      const delayMs = expertRetryDelayMs(attemptIndex, baseDelayMs);
+      console.warn(`[STREAM] provider attempt ${attemptIndex + 1}/${maxRetries + 1} failed for ${model}: ${(error as Error).message}; retrying in ${delayMs}ms`);
+      if (delayMs > 0) await sleep(delayMs);
+    }
+  }
+  throw lastError;
 }
 
 const PERPLEXITY_RESEARCH_SYSTEM_PROMPT = `You are a Research Analyst specializing in business and market research. Prefer primary sources such as filings, regulator data, official statistics, and reputable press. Provide concise findings with exact retrieved URLs next to supported claims; use only URLs returned by retrieval and do not imply independent verification. Distinguish Chair-provided facts, calculations, and assumptions, and qualify conclusions when evidence or company-specific inputs are missing.`;
@@ -1137,6 +1286,7 @@ export async function getExpertResponseStream(
   onToken: (token: string) => void,
   deliverableRequest?: DeliverableGenerationRequest,
   retryInstruction?: string,
+  providerRetry?: { maxRetries?: number; baseDelayMs?: number },
 ): Promise<InsertMessage> { 
   console.log(`[STREAM] Generating streaming response for expert: ${expert.name} (${expert.role})`);
   
@@ -1203,6 +1353,13 @@ export async function getExpertResponseStream(
    console.log(`[STREAM] Sending ${messages.length} messages to LLM for ${expert.role}${imageParts.length > 0 ? ` (with ${imageParts.length} image part${imageParts.length > 1 ? "s" : ""})` : ""}.`);
 
   let streamFilter: TrailingStanceStreamFilter | null = null;
+  const callExpertStream = (model: string, webSearch: boolean, onStreamToken: (token: string) => void) =>
+    providerRetry
+      ? callExpertStreamWithResilience(
+          messages, model, onStreamToken, conversation?.userId, webSearch,
+          { maxTokens: EXPERT_REPLY_MAX_TOKENS }, undefined, providerRetry,
+        )
+      : callOpenRouterAPIStream(messages, model, onStreamToken, conversation?.userId, webSearch, { maxTokens: EXPERT_REPLY_MAX_TOKENS });
   try {
     let response: AIModelResponse;
     let stance: MessageStance | null = null;
@@ -1216,13 +1373,10 @@ export async function getExpertResponseStream(
       } else {
         console.log("[STREAM] No Perplexity key — Research Analyst using OpenRouter streaming");
         streamFilter = new TrailingStanceStreamFilter(onToken);
-        response = await callOpenRouterAPIStream(
-          messages,
+        response = await callExpertStream(
           expert.model,
-          streamFilter ? token => streamFilter!.push(token) : onToken,
-          conversation?.userId,
           paidWebPluginEnabled(),
-          { maxTokens: EXPERT_REPLY_MAX_TOKENS },
+          streamFilter ? token => streamFilter!.push(token) : onToken,
         );
         streamFilter?.finish();
         stance = stripExpertStance(response, expert.role);
@@ -1241,13 +1395,10 @@ export async function getExpertResponseStream(
     else {
       // MAIN PATH: Streaming via OpenRouter
       streamFilter = expert.role === "Moderator" ? null : new TrailingStanceStreamFilter(onToken);
-      response = await callOpenRouterAPIStream(
-        messages,
+      response = await callExpertStream(
         expert.model,
-        streamFilter ? token => streamFilter!.push(token) : onToken,
-        conversation?.userId,
         false,
-        { maxTokens: EXPERT_REPLY_MAX_TOKENS },
+        streamFilter ? token => streamFilter!.push(token) : onToken,
       );
       streamFilter?.finish();
       stance = stripExpertStance(response, expert.role);
@@ -1304,7 +1455,8 @@ export async function getExpertResponseStream(
     return streamedMessage;
 
   } catch (error) {
-    console.error(`[STREAM] Response generation failed for expert ${expert.name}`);
+    const failureDetail = providerFailureLogDetail(error);
+    console.error(`[STREAM] Response generation failed for expert ${expert.name}${failureDetail ? ` — ${failureDetail}` : ""}`);
     streamFilter?.finish();
     const errorMsg = expertResponseErrorMessage(error, expert.name, imageParts);
     onToken(errorMsg); // Show error inline
@@ -1318,8 +1470,10 @@ export async function getExpertResponseStream(
       expertRole: expert.role,
       stance: null,
     };
+    const retriesExhausted = typeof error === "object" && error !== null &&
+      (error as { providerRetriesExhausted?: unknown }).providerRetriesExhausted === true;
     if (!(error instanceof SafeDeliverableError) &&
-        !isVisionRejection(error, imageParts) && isRetryableProviderError(error)) {
+        !isVisionRejection(error, imageParts) && isRetryableProviderError(error) && !retriesExhausted) {
       retryableExpertResponses.add(failedResponse);
     }
     return failedResponse;

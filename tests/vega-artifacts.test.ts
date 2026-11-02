@@ -197,6 +197,33 @@ describe("themed Vega-Lite artifacts", () => {
     expect(extractArtifacts("```json\n" + JSON.stringify(chart) + "\n```").artifacts[0].type).toBe("chart");
     expect(extractArtifacts('```json\n{"a":1}\n```').artifacts[0].type).toBe("json");
   });
+  it("treats a vega-lite fence as a chart", () => {
+    expect(extractArtifacts("```vega-lite\n" + JSON.stringify(chart) + "\n```").artifacts[0]).toMatchObject({
+      type: "chart",
+      language: "json",
+    });
+  });
+  it("types a bare vega-lite envelope as a chart and renders it (live CFO regression)", () => {
+    const bare = JSON.stringify(chart);
+    const extracted = extractArtifacts(`Here is the requested chart.\n\n${bare}\n\nIt uses Chair figures only.`);
+    expect(extracted.artifacts).toHaveLength(1);
+    expect(extracted.artifacts[0]).toMatchObject({
+      type: "chart",
+      language: "json",
+      title: "Monthly revenue · Q2",
+    });
+    expect(extracted.cleanContent).not.toContain(bare);
+    const { kept, dropped } = filterChartArtifacts(extracted.artifacts, []);
+    expect(dropped).toBe(0);
+    expect(kept[0]).toMatchObject({ type: "chart", title: "Monthly revenue · Q2" });
+    expect(validateChartArtifact(kept[0].content, [])).not.toBeNull();
+  });
+  it("leaves a bare non-chart JSON object typed as json", () => {
+    expect(extractArtifacts('Totals follow.\n\n{"spend":60000,"months":["2026-02"]}\n').artifacts[0]).toMatchObject({
+      type: "json",
+      title: "JSON Data 1",
+    });
+  });
   it("repairs missing trailing closers but rejects other malformed JSON", () => {
     const text = JSON.stringify(chart);
     expect(validateChartArtifact(text.slice(0, -1), [])).not.toBeNull();

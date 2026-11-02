@@ -1,9 +1,13 @@
 import { checkHouseKeyCall, currentUsagePeriod, UsageCapError, BUDGET_FALLBACK_MODEL } from "./usage-caps";
+import { MAX_LOGGED_PROVIDER_TEXT, redactAndTruncateLogText } from "./log-redaction";
 import type { AIMessage, AIModelResponse } from './ai';
 import { randomUUID } from 'crypto';
 
 const AI_REQUEST_TIMEOUT_MS = 120_000;
 export const OUTPUT_LIMIT_ERROR = "Response reached the output limit. Please ask for a shorter response or split the request into smaller parts.";
+export { MAX_LOGGED_PROVIDER_TEXT };
+/** Providers excluded from OpenRouter routing by default; override with OPENROUTER_PROVIDER_IGNORE. */
+export const DEFAULT_PROVIDER_IGNORE = ["Relace"] as const;
 // Output ceiling per call. 1024 truncated File Creator SOPs mid-document;
 // 8192 let one runaway answer cost 8x a normal turn. 4096 (~3,000 words)
 // fits the longest documents we generate. Override with OPENROUTER_MAX_OUTPUT_TOKENS.
@@ -28,6 +32,26 @@ export const FREE_MODEL_FALLBACKS = [
 export function modelRouting(model: string): { model: string; models?: string[] } {
   if (!model.endsWith(":free")) return { model };
   return { model, models: [model, ...FREE_MODEL_FALLBACKS.filter(m => m !== model)].slice(0, 3) };
+}
+
+/**
+ * OpenRouter provider preferences for every house-key call. "Relace" routed
+ * live expert streams that returned HTTP 200 and then failed before any token,
+ * so it is ignored unless OPENROUTER_PROVIDER_IGNORE says otherwise (comma
+ * separated; set it to an empty string to allow every provider).
+ */
+export function providerPreferences(env: NodeJS.ProcessEnv = process.env): { ignore?: string[]; allow_fallbacks: boolean } {
+  const raw = env.OPENROUTER_PROVIDER_IGNORE;
+  const names = (raw === undefined ? DEFAULT_PROVIDER_IGNORE.join(",") : raw)
+    .split(",")
+    .map(name => name.trim())
+    .filter(Boolean);
+  return { ...(names.length ? { ignore: names } : {}), allow_fallbacks: true };
+}
+
+/** Truncate and redact provider error text before it reaches a log line. */
+export function sanitizeProviderErrorText(value: unknown): string | undefined {
+  return redactAndTruncateLogText(value);
 }
 const SPEND_CAP_PER_REQUEST_USD = 0.4;
 
@@ -73,6 +97,9 @@ export type OpenRouterUsageSnapshot = {
     httpStatus?: number;
     providerStatus?: number;
     failureCategory?: "timeout" | "rate_limit" | "configuration" | "upstream_transport";
+    finishReason?: string;
+    nativeFinishReason?: string;
+    providerError?: string;
   }>;
 };
 
@@ -187,7 +214,20 @@ function safeOpenRouterError(
     status === undefined ? {} : { statusCode: status },
     { isProviderError: true },
     diagnostics,
+    providerDetail === undefined ? {} : { providerErrorText: sanitizeProviderErrorText(providerDetail) },
   );
+}
+
+/** Attach log-only diagnostics to the error without changing its message. */
+function attachProviderLogDetails(error: unknown, details: {
+  provider?: string;
+  finishReason?: string;
+  nativeFinishReason?: string;
+  providerErrorText?: string;
+}): void {
+  if (typeof error !== "object" || error === null) return;
+  const cleaned = Object.fromEntries(Object.entries(details).filter(([, value]) => typeof value === "string" && value.length > 0));
+  Object.assign(error, cleaned);
 }
 
 // ─── Provider Interface ───────────────────────────────────────────────────────
@@ -269,6 +309,9 @@ export class OpenRouterProvider implements AIProvider {
       httpStatus?: number;
       providerStatus?: number;
       failureCategory?: ProviderFailureCategory;
+      finishReason?: string;
+      nativeFinishReason?: string;
+      providerError?: string;
     } = {},
   ): void {
     if (attempt.settled) return;
@@ -310,6 +353,9 @@ export class OpenRouterProvider implements AIProvider {
       ...(metadata.httpStatus === undefined ? {} : { httpStatus: metadata.httpStatus }),
       ...(metadata.providerStatus === undefined ? {} : { providerStatus: metadata.providerStatus }),
       ...(metadata.failureCategory ? { failureCategory: metadata.failureCategory } : {}),
+      ...(metadata.finishReason ? { finishReason: metadata.finishReason } : {}),
+      ...(metadata.nativeFinishReason ? { nativeFinishReason: metadata.nativeFinishReason } : {}),
+      ...(metadata.providerError ? { providerError: metadata.providerError } : {}),
     };
     this.attempts.push(record);
     if (this.attempts.length > 100) this.attempts.splice(0, this.attempts.length - 100);
@@ -325,7 +371,10 @@ export class OpenRouterProvider implements AIProvider {
   private requestBudget(attempt: OpenRouterAttempt) {
     return {
       max_tokens: attempt.maxTokens,
-      ...(attempt.providerPriceLimit ? { provider: { max_price: attempt.providerPriceLimit } } : {}),
+      provider: {
+        ...providerPreferences(),
+        ...(attempt.providerPriceLimit ? { max_price: attempt.providerPriceLimit } : {}),
+      },
     };
   }
 
@@ -373,8 +422,9 @@ export class OpenRouterProvider implements AIProvider {
       }
     }
 
-    // Fall back to platform key
-    const platformKey = process.env.OPENROUTER_API_KEY;
+    // Fall back to platform key. Trim: secrets pasted into a host dashboard
+    // routinely carry a trailing newline, which OpenRouter rejects.
+    const platformKey = process.env.OPENROUTER_API_KEY?.trim();
     if (!platformKey) {
       throw new Error("OpenRouter API key not provided");
     }
@@ -389,6 +439,8 @@ export class OpenRouterProvider implements AIProvider {
     let provider: string | undefined;
     let responseModel: string | undefined;
     let httpStatus: number | undefined;
+    let finishReason: string | undefined;
+    let nativeFinishReason: string | undefined;
     try {
       const authorized = await this.authorizeCall(attempt, model, userId);
       const openRouterKey = authorized.key;
@@ -442,11 +494,16 @@ export class OpenRouterProvider implements AIProvider {
         throw new Error("Invalid response format from OpenRouter API");
       }
 
+      finishReason = typeof data.choices[0].finish_reason === "string" ? data.choices[0].finish_reason : undefined;
+      nativeFinishReason = typeof data.choices[0].native_finish_reason === "string" ? data.choices[0].native_finish_reason : undefined;
+
       if (data.choices[0].finish_reason === "length") {
         throw new Error(OUTPUT_LIMIT_ERROR);
       }
 
-      this.settleAttempt(attempt, "success", usage, { generationId, responseModel, provider, httpStatus });
+      this.settleAttempt(attempt, "success", usage, {
+        generationId, responseModel, provider, httpStatus, finishReason, nativeFinishReason,
+      });
       return {
         message: data.choices[0].message,
         ...(Array.isArray(data.citations) ? { citations: data.citations.filter((value: unknown): value is string => typeof value === "string") } : {}),
@@ -458,8 +515,16 @@ export class OpenRouterProvider implements AIProvider {
     } catch (error: unknown) {
       const providerCode = typeof (error as any)?.statusCode === "number" ? (error as any).statusCode : undefined;
       const diagnostics = typeof error === "object" && error !== null ? error as ProviderErrorDiagnostics : {};
+      const logged = typeof error === "object" && error !== null
+        ? error as { finishReason?: string; nativeFinishReason?: string; providerErrorText?: string }
+        : {};
       const failureCategory = providerFailureCategory(error, httpStatus, providerCode);
       markRetryableProviderFailure(error, failureCategory);
+      attachProviderLogDetails(error, {
+        provider: diagnostics.provider ?? provider,
+        finishReason: finishReason ?? logged.finishReason,
+        nativeFinishReason: nativeFinishReason ?? logged.nativeFinishReason,
+      });
       this.settleAttempt(attempt, "failed", requestStarted ? usage : { cost: 0 }, {
         generationId,
         responseModel,
@@ -467,6 +532,9 @@ export class OpenRouterProvider implements AIProvider {
         httpStatus,
         providerStatus: diagnostics.providerStatus,
         failureCategory,
+        finishReason: finishReason ?? logged.finishReason,
+        nativeFinishReason: nativeFinishReason ?? logged.nativeFinishReason,
+        providerError: logged.providerErrorText,
       });
       if (error instanceof Error) {
         throw error;
@@ -491,6 +559,8 @@ export class OpenRouterProvider implements AIProvider {
     let provider: string | undefined;
     let responseModel: string | undefined;
     let httpStatus: number | undefined;
+    let streamFinishReason: string | undefined;
+    let nativeFinishReason: string | undefined;
     try {
       const authorized = await this.authorizeCall(attempt, model, userId);
       const openRouterKey = authorized.key;
@@ -535,7 +605,6 @@ export class OpenRouterProvider implements AIProvider {
       const decoder = new TextDecoder();
       let fullContent = "";
       let buffer = "";
-      let finishReason: string | null = null;
 
       try {
         while (true) {
@@ -576,7 +645,12 @@ export class OpenRouterProvider implements AIProvider {
 
             const choice = parsed?.choices?.[0];
             if (typeof choice?.finish_reason === "string") {
-              finishReason = choice.finish_reason;
+              streamFinishReason = choice.finish_reason;
+            }
+            if (typeof choice?.native_finish_reason === "string") {
+              nativeFinishReason = choice.native_finish_reason;
+            } else if (typeof parsed?.native_finish_reason === "string") {
+              nativeFinishReason = parsed.native_finish_reason;
             }
             const content = choice?.delta?.content;
             if (content) {
@@ -589,11 +663,26 @@ export class OpenRouterProvider implements AIProvider {
         reader.releaseLock();
       }
 
-      if (finishReason === "length") {
-        throw new Error(OUTPUT_LIMIT_ERROR);
+      if (streamFinishReason === "length") {
+        throw Object.assign(new Error(OUTPUT_LIMIT_ERROR), {
+          finishReason: streamFinishReason,
+          nativeFinishReason,
+        });
       }
 
-      this.settleAttempt(attempt, "success", usage, { generationId, responseModel, provider, httpStatus });
+      // An OpenRouter stream can close cleanly after an upstream provider
+      // stops early: HTTP 200, no error frame, no finish reason, no content.
+      // Surface it as a provider failure so the expert resilience retry runs.
+      if (!fullContent.trim() && !streamFinishReason) {
+        throw Object.assign(
+          new Error("The provider stream ended without content or a finish reason."),
+          { isProviderError: true, nativeFinishReason },
+        );
+      }
+
+      this.settleAttempt(attempt, "success", usage, {
+        generationId, responseModel, provider, httpStatus, finishReason: streamFinishReason, nativeFinishReason,
+      });
 
       return {
         message: { role: "assistant", content: fullContent },
@@ -605,8 +694,16 @@ export class OpenRouterProvider implements AIProvider {
     } catch (error: unknown) {
       const providerCode = typeof (error as any)?.statusCode === "number" ? (error as any).statusCode : undefined;
       const diagnostics = typeof error === "object" && error !== null ? error as ProviderErrorDiagnostics : {};
+      const logged = typeof error === "object" && error !== null
+        ? error as { finishReason?: string; nativeFinishReason?: string; providerErrorText?: string }
+        : {};
       const failureCategory = providerFailureCategory(error, httpStatus, providerCode);
       markRetryableProviderFailure(error, failureCategory);
+      attachProviderLogDetails(error, {
+        provider: diagnostics.provider ?? provider,
+        finishReason: streamFinishReason ?? logged.finishReason,
+        nativeFinishReason: nativeFinishReason ?? logged.nativeFinishReason,
+      });
       this.settleAttempt(attempt, "failed", requestStarted ? usage : { cost: 0 }, {
         generationId,
         responseModel,
@@ -614,6 +711,9 @@ export class OpenRouterProvider implements AIProvider {
         httpStatus,
         providerStatus: diagnostics.providerStatus,
         failureCategory,
+        finishReason: streamFinishReason ?? logged.finishReason,
+        nativeFinishReason: nativeFinishReason ?? logged.nativeFinishReason,
+        providerError: logged.providerErrorText,
       });
       if (error instanceof Error) throw error;
       throw new Error("OpenRouter could not complete this request. Retry or continue with available work.");
