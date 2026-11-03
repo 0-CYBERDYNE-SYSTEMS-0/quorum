@@ -80,10 +80,19 @@ export const BUDGET_EXHAUSTED_NOTICE = "You've used this month's included AI bud
 
 /** The model a tier falls back to when its budget is spent: paid for paid tiers. */
 export function budgetFallbackModelForTier(tier: string | null | undefined): string {
+  return budgetFallbackModelsForTier(tier)[0];
+}
+
+/**
+ * Ordered paid fallback chain once a tier's AI budget is spent. The provider
+ * routes a failed primary to the next paid slug instead of erroring (and never
+ * to a ':free' model). Free keeps its single free budget model.
+ */
+export function budgetFallbackModelsForTier(tier: string | null | undefined): string[] {
   const t = tier || "free";
   return t === "pro" || t === "boardroom" || t === "enterprise"
-    ? BUDGET_FALLBACK_MODEL
-    : FREE_TIER_BUDGET_MODEL;
+    ? [BUDGET_FALLBACK_MODEL, BUDGET_FALLBACK_MODEL_FALLBACK]
+    : [FREE_TIER_BUDGET_MODEL];
 }
 
 /** Hard ceiling on monthly AI spend: the tier budget plus the overage allowance. */
@@ -184,12 +193,42 @@ export function checkHouseKeyCall(
   credit?: CreditCapsContext,
 ): CapDenial | null {
   const t = tier || "free";
-  if (model.endsWith(":free")) return null;
-  if (t === "enterprise" && !credit) return null;
-
   const creditLimits = credit ? creditLimitsFor(credit.kind) : null;
-  const allowPaid = creditLimits ? true : getTierLimits(t).allowPaidModels;
-  const allowFrontier = creditLimits ? creditLimits.allowFrontierModels : getTierLimits(t).allowFrontierModels;
+  const tierLimits = creditLimits ? null : getTierLimits(t);
+  // A session credit turns even a Free account into a paid board. For a plain
+  // Free board nothing changes: free models are allowed and paid models are
+  // not. Never take an early pass for ':free' on a paid/credit path — the tier,
+  // credit and AI-cap checks below must always run for paying customers.
+  const paidContext = Boolean(creditLimits) || t !== "free";
+
+  if (!paidContext) {
+    if (!model.endsWith(":free")) {
+      return {
+        status: 402,
+        code: "paid_model_requires_pro",
+        message: "Upgrade to Pro for paid models, or buy a Single Session for one roundtable.",
+        upgradeUrl: "/subscribe",
+      };
+    }
+    return null;
+  }
+
+  if (model.endsWith(":free")) {
+    const contextName = creditLimits ? creditLimits.name : getTierLimits(t).name;
+    const allowed = creditLimits
+      ? [...HOUSE_KEY_PAID_MODEL_ALLOWLIST, ...(creditLimits.allowFrontierModels ? BOARDROOM_FRONTIER_MODEL_ALLOWLIST : [])]
+      : houseKeyModelsForTier(t);
+    return {
+      status: 402,
+      code: "paid_model_required",
+      message: `${contextName} runs paid models. Pick an included model (${allowed.join(", ")}) or add your own OpenRouter key in Settings.`,
+    };
+  }
+
+  if (!creditLimits && t === "enterprise") return null;
+
+  const allowPaid = creditLimits ? true : tierLimits!.allowPaidModels;
+  const allowFrontier = creditLimits ? creditLimits.allowFrontierModels : tierLimits!.allowFrontierModels;
 
   if (!allowPaid) {
     return {

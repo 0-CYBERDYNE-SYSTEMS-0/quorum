@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { DEFAULT_MAX_OUTPUT_TOKENS, FREE_MODEL_FALLBACKS, maxOutputTokens, modelRouting } from "../server/ai-providers";
+import { DEFAULT_MAX_OUTPUT_TOKENS, FREE_MODEL_FALLBACKS, PAID_BUDGET_FALLBACKS, maxOutputTokens, modelRouting } from "../server/ai-providers";
+import { BUDGET_FALLBACK_MODEL, BUDGET_FALLBACK_MODEL_FALLBACK } from "../server/usage-caps";
 
 describe("model routing and output cap", () => {
   afterEach(() => { delete process.env.OPENROUTER_MAX_OUTPUT_TOKENS; });
@@ -20,6 +21,14 @@ describe("model routing and output cap", () => {
     expect(modelRouting("dots-studio/dots-3-note-preview:free").models).toEqual([
       "dots-studio/dots-3-note-preview:free",
     ]);
+  });
+  it("routes a failed paid budget fallback to the second paid slug", () => {
+    expect(PAID_BUDGET_FALLBACKS).toEqual([BUDGET_FALLBACK_MODEL, BUDGET_FALLBACK_MODEL_FALLBACK]);
+    expect(modelRouting(BUDGET_FALLBACK_MODEL)).toEqual({
+      model: BUDGET_FALLBACK_MODEL,
+      models: [BUDGET_FALLBACK_MODEL, BUDGET_FALLBACK_MODEL_FALLBACK],
+    });
+    expect(modelRouting(BUDGET_FALLBACK_MODEL).models!.some(m => m.endsWith(":free"))).toBe(false);
   });
   it("defaults to 8192 and honours a sane override up to the ceiling", () => {
     expect(maxOutputTokens()).toBe(DEFAULT_MAX_OUTPUT_TOKENS);

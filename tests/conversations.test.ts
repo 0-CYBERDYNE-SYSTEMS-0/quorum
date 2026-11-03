@@ -453,7 +453,8 @@ describe("Conversations & Expert Flows", () => {
       expect(res.body).toHaveProperty("id");
       expect(res.body.name).toBe("Dr. Maria Soilson");
       expect(res.body.role).toBe("Soil Scientist");
-      expect(res.body.model).toBe("openai/gpt-4o:free");
+      expect(res.body.model).not.toBe("openai/gpt-4o:free");
+      expect(res.body.model.endsWith(":free")).toBe(false);
       expect(res.body.avatarUrl).toMatch(/^data:image\/svg\+xml/); // bundled catalog avatar
       expect(res.body.conversationId).toBe(convo.id);
       // System prompt should be generated

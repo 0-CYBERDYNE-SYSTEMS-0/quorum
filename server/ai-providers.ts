@@ -1,4 +1,5 @@
-import { checkHouseKeyCall, currentUsagePeriod, UsageCapError, budgetFallbackModelForTier, FREE_TIER_BUDGET_MODEL } from "./usage-caps";
+import { checkHouseKeyCall, currentUsagePeriod, UsageCapError, budgetFallbackModelForTier, BUDGET_FALLBACK_MODEL, BUDGET_FALLBACK_MODEL_FALLBACK, FREE_TIER_BUDGET_MODEL } from "./usage-caps";
+import { defaultPaidExpertModel } from "@shared/expert-catalog";
 import { MAX_LOGGED_PROVIDER_TEXT, redactAndTruncateLogText } from "./log-redaction";
 import type { AIMessage, AIModelResponse } from './ai';
 import { randomUUID } from 'crypto';
@@ -62,8 +63,22 @@ export function isMandatoryReasoningError(status: number | undefined, body: stri
 export const FREE_MODEL_FALLBACKS = [
   "dots-studio/dots-3-note-preview:free",
 ];
+/**
+ * Paid overage has a second, still-paid hop. When the primary budget fallback
+ * (deepseek/deepseek-v4.1-flash) fails at the provider, OpenRouter's `models`
+ * array retries openai/gpt-6-luna rather than erroring the Chair's turn.
+ */
+export const PAID_BUDGET_FALLBACKS = [
+  BUDGET_FALLBACK_MODEL,
+  BUDGET_FALLBACK_MODEL_FALLBACK,
+];
 export function modelRouting(model: string): { model: string; models?: string[] } {
-  if (!model.endsWith(":free")) return { model };
+  if (!model.endsWith(":free")) {
+    if (model === BUDGET_FALLBACK_MODEL) {
+      return { model, models: [model, ...PAID_BUDGET_FALLBACKS.filter(m => m !== model)] };
+    }
+    return { model };
+  }
   return { model, models: [model, ...FREE_MODEL_FALLBACKS.filter(m => m !== model)].slice(0, 3) };
 }
 
@@ -506,21 +521,41 @@ export class OpenRouterProvider implements AIProvider {
     options: ChatOptions = {},
   ): Promise<{ key: string; model: string }> {
     const { key, byok } = await this.resolveKey(userId);
-    if (byok || !userId) return { key, model };
+    if (!userId) return { key, model };
+    // Most BYOK calls need no billing context at all; only a ':free' model
+    // needs a tier/credit lookup to keep a paying board off a free slug.
+    if (byok && !model.endsWith(":free")) return { key, model };
     const { storage } = await import("./storage");
     const user = await storage.getUser(userId);
-    const period = currentUsagePeriod();
-    const usage = await storage.getMonthlyUsage(userId, period);
     const credit = options.conversationId
       ? await storage.getSessionCreditByConversationId(options.conversationId)
       : undefined;
+    const tier = user?.tier || "free";
+    const paidContext = Boolean(credit) || tier !== "free";
+    const allowFrontier = credit
+      ? credit.kind === "boardroom"
+      : tier === "boardroom" || tier === "enterprise";
+
+    // A paid plan or session credit must never dial a ':free' expert model,
+    // even if a stale row or an old client supplied one. Rewrite to the paid
+    // default before the BYOK short-circuit so no key path can run a paying
+    // board for free.
+    if (paidContext && model.endsWith(":free")) {
+      const paidDefault = defaultPaidExpertModel(allowFrontier);
+      console.info(`[CAPS] user ${userId} paid context — ${model} -> ${paidDefault}`);
+      model = paidDefault;
+    }
+    if (byok) return { key, model };
+
+    const period = currentUsagePeriod();
+    const usage = await storage.getMonthlyUsage(userId, period);
     const creditContext = credit
       ? {
           kind: credit.kind as "fast" | "boardroom",
           spentUsd: credit.aiSpendUsd,
         }
       : undefined;
-    const denial = checkHouseKeyCall(user?.tier, model, usage.aiSpendUsd, creditContext);
+    const denial = checkHouseKeyCall(tier, model, usage.aiSpendUsd, creditContext);
     if (denial?.code === "ai_budget_overage") {
       // Graceful paid overage: keep answering on the tier's PAID fallback model
       // (never a ':free' slug for paying customers). Past the 25% ceiling

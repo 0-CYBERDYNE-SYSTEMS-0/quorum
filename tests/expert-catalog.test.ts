@@ -1,5 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { BOARD_PRESETS, EXPERT_CATALOG, catalogAvatar, findCatalogExpert, TIER_EXPERT_LIMITS } from "../shared/expert-catalog";
+import {
+  BOARD_PRESETS,
+  EXPERT_CATALOG,
+  FAST_PAID_DEFAULT_EXPERT_MODEL,
+  FRONTIER_DEFAULT_EXPERT_MODEL,
+  FREE_DEFAULT_EXPERT_MODEL,
+  catalogAvatar,
+  defaultExpertModelForTier,
+  findCatalogExpert,
+  resolveExpertModelForContext,
+  TIER_EXPERT_LIMITS,
+} from "../shared/expert-catalog";
+import { BOARDROOM_FRONTIER_MODEL_ALLOWLIST, HOUSE_KEY_PAID_MODEL_ALLOWLIST } from "../shared/models";
 import { TIERS } from "../server/tiers";
 
 const TARGET_ROLES = [
@@ -55,5 +67,41 @@ describe("board expert catalog", () => {
   it("UI tier copy matches server tiers", () => {
     expect(TIER_EXPERT_LIMITS.free).toBe(TIERS.free.maxExperts);
     expect(TIER_EXPERT_LIMITS.pro).toBe(TIERS.pro.maxExperts);
+  });
+
+  it("defaults every paid and session board seat to a paid model in its allowlist", () => {
+    // Free keeps its existing free slug.
+    expect(FREE_DEFAULT_EXPERT_MODEL).toBe("poolside/laguna-s-2.1:free");
+    expect(defaultExpertModelForTier("free")).toBe(FREE_DEFAULT_EXPERT_MODEL);
+
+    expect(defaultExpertModelForTier("pro")).toBe(FAST_PAID_DEFAULT_EXPERT_MODEL);
+    expect(defaultExpertModelForTier("boardroom")).toBe(FRONTIER_DEFAULT_EXPERT_MODEL);
+    expect(defaultExpertModelForTier("enterprise")).toBe(FRONTIER_DEFAULT_EXPERT_MODEL);
+
+    expect(HOUSE_KEY_PAID_MODEL_ALLOWLIST).toContain(FAST_PAID_DEFAULT_EXPERT_MODEL);
+    expect(BOARDROOM_FRONTIER_MODEL_ALLOWLIST).toContain(FRONTIER_DEFAULT_EXPERT_MODEL);
+    expect(FAST_PAID_DEFAULT_EXPERT_MODEL.endsWith(":free")).toBe(false);
+    expect(FRONTIER_DEFAULT_EXPERT_MODEL.endsWith(":free")).toBe(false);
+  });
+
+  it("rewrites a stale free seat to the paid default on every paid or credit context", () => {
+    const contexts = [
+      { name: "pro", context: { paid: true, allowFrontier: false }, allowed: HOUSE_KEY_PAID_MODEL_ALLOWLIST },
+      { name: "$5 fast session", context: { paid: true, allowFrontier: false }, allowed: HOUSE_KEY_PAID_MODEL_ALLOWLIST },
+      { name: "boardroom", context: { paid: true, allowFrontier: true }, allowed: BOARDROOM_FRONTIER_MODEL_ALLOWLIST },
+      { name: "$15 boardroom session", context: { paid: true, allowFrontier: true }, allowed: BOARDROOM_FRONTIER_MODEL_ALLOWLIST },
+    ] as const;
+    for (const { name, context, allowed } of contexts) {
+      for (const expert of EXPERT_CATALOG) {
+        const resolved = resolveExpertModelForContext(expert.defaultModel, context);
+        expect(resolved.endsWith(":free"), `${name}: ${expert.role}`).toBe(false);
+        expect(allowed as readonly string[], `${name}: ${expert.role}`).toContain(resolved);
+      }
+      expect(resolveExpertModelForContext("google/gemma-4-31b-it:free", context).endsWith(":free")).toBe(false);
+    }
+
+    // Free board behaviour is unchanged.
+    expect(resolveExpertModelForContext(FREE_DEFAULT_EXPERT_MODEL, { paid: false, allowFrontier: false }))
+      .toBe(FREE_DEFAULT_EXPERT_MODEL);
   });
 });

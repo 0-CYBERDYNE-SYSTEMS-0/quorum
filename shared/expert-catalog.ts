@@ -2,6 +2,11 @@
  * Built-in board seats. One source of truth for the selector UI and director
  * prompts; avatars are inline SVG data URIs for offline and self-hosted use.
  */
+import {
+  BOARDROOM_FRONTIER_MODEL_ALLOWLIST,
+  HOUSE_KEY_PAID_MODEL_ALLOWLIST,
+} from "./models";
+
 export type ExpertCategory = "Strategy" | "Finance" | "Growth" | "Operations" | "Legal & Risk" | "People" | "Research" | "Support";
 
 export interface CatalogExpert {
@@ -19,10 +24,63 @@ export interface CatalogExpert {
 // 2026-10-25 against a house key: nemotron-3-super 404s at the provider,
 // gemma-4-31b is rate-limited, and nemotron-3.5-lightning errors mid-stream.
 // Dots and Laguna both stream reliably.
+//
+// Paid tiers and session credits never seat an expert on a ':free' slug
+// (owner rule, 2026-11-03). The catalog below keeps the Free-tier slug as its
+// legacy default; callers on a paid plan or a $5/$15 session must use
+// defaultExpertModelForTier()/resolveExpertModelForContext() instead.
 const M_SUPER = "poolside/laguna-s-2.1:free";
 const M_GEMMA = "poolside/laguna-s-2.1:free";
 const M_GEMMA_S = "poolside/laguna-s-2.1:free";
 const M_VL = "poolside/laguna-s-2.1:free";
+
+/** Free tier keeps its existing free budget model. Never introduce a new free id. */
+export const FREE_DEFAULT_EXPERT_MODEL = "poolside/laguna-s-2.1:free";
+/** Pro and a $5 Fast Session seat experts on a fast paid model. */
+export const FAST_PAID_DEFAULT_EXPERT_MODEL = "deepseek/deepseek-v4.1-flash";
+/** Boardroom and a $15 Boardroom Session seat experts on a frontier model. */
+export const FRONTIER_DEFAULT_EXPERT_MODEL = "anthropic/claude-sonnet-5.5";
+
+// Fail at import time if a default ever drifts outside its tier allowlist.
+if (!(HOUSE_KEY_PAID_MODEL_ALLOWLIST as readonly string[]).includes(FAST_PAID_DEFAULT_EXPERT_MODEL)) {
+  throw new Error("FAST_PAID_DEFAULT_EXPERT_MODEL must be in the fast paid allowlist");
+}
+if (!(BOARDROOM_FRONTIER_MODEL_ALLOWLIST as readonly string[]).includes(FRONTIER_DEFAULT_EXPERT_MODEL)) {
+  throw new Error("FRONTIER_DEFAULT_EXPERT_MODEL must be in the Boardroom frontier allowlist");
+}
+
+/** Paid default for a board: frontier when the board may use frontier models. */
+export function defaultPaidExpertModel(allowFrontier: boolean): string {
+  return allowFrontier ? FRONTIER_DEFAULT_EXPERT_MODEL : FAST_PAID_DEFAULT_EXPERT_MODEL;
+}
+
+/**
+ * Expert default for a tier. Free keeps its existing free slug; Pro gets a
+ * fast paid model; Boardroom/Enterprise get a frontier model.
+ */
+export function defaultExpertModelForTier(
+  tier: string | null | undefined,
+  allowFrontier: boolean = tier === "boardroom" || tier === "enterprise",
+): string {
+  if (!tier || tier === "free") return FREE_DEFAULT_EXPERT_MODEL;
+  return defaultPaidExpertModel(allowFrontier);
+}
+
+/**
+ * Resolve a requested expert model for the board's billing context. Paid tiers
+ * and session credits rewrite a ':free' request to the tier's paid default so
+ * a stale client or a stored seat can never run a paying board for free.
+ * Free boards keep whatever they sent (or the existing free default).
+ */
+export function resolveExpertModelForContext(
+  model: string | null | undefined,
+  context: { paid: boolean; allowFrontier: boolean },
+): string {
+  const requested = model?.trim();
+  if (!context.paid) return requested || FREE_DEFAULT_EXPERT_MODEL;
+  if (requested && !requested.endsWith(":free")) return requested;
+  return defaultPaidExpertModel(context.allowFrontier);
+}
 
 export const EXPERT_CATALOG: CatalogExpert[] = [
   { role: "Chief Strategy Officer", category: "Strategy", emoji: "🧭", color: "#455A64", defaultModel: M_SUPER, recommended: true,

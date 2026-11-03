@@ -71,10 +71,12 @@ describe("usage caps: pure rules", () => {
     expect(budgetFallbackModelForTier("free")).toBe(FREE_TIER_BUDGET_MODEL);
   });
 
-  it("admits included paid models and every free model, and nothing else", () => {
+  it("admits included paid models and free models only on the Free tier", () => {
     expect(isHouseKeyAllowedModel("z-ai/glm-5.3-flash")).toBe(true);
     expect(isHouseKeyAllowedModel("openai/gpt-6-luna")).toBe(true);
-    expect(isHouseKeyAllowedModel("google/gemma-4-31b-it:free")).toBe(true);
+    expect(isHouseKeyAllowedModel("google/gemma-4-31b-it:free", "free")).toBe(true);
+    expect(isHouseKeyAllowedModel("google/gemma-4-31b-it:free", "pro")).toBe(false);
+    expect(isHouseKeyAllowedModel("google/gemma-4-31b-it:free", "boardroom")).toBe(false);
     expect(isHouseKeyAllowedModel("openai/o1-pro")).toBe(false);
     expect(HOUSE_KEY_PAID_MODEL_ALLOWLIST.every((model) => !model.endsWith(":free"))).toBe(true);
   });
@@ -105,8 +107,23 @@ describe("usage caps: pure rules", () => {
     // Past 25% overage the call is refused with the existing message.
     expect(checkHouseKeyCall("pro", "z-ai/glm-5.3-flash", 10)?.code).toBe("ai_budget_exhausted");
     expect(checkHouseKeyCall("pro", "z-ai/glm-5.3-flash", 10)?.message).toContain("included AI budget");
-    expect(checkHouseKeyCall("pro", "google/gemma-4-31b-it:free", 100)).toBeNull();
+    expect(checkHouseKeyCall("pro", "google/gemma-4-31b-it:free", 100)?.code).toBe("paid_model_required");
+    expect(checkHouseKeyCall("boardroom", "google/gemma-4-31b-it:free", 0)?.code).toBe("paid_model_required");
+    expect(checkHouseKeyCall("enterprise", "google/gemma-4-31b-it:free", 0)?.code).toBe("paid_model_required");
     expect(checkHouseKeyCall("enterprise", "openai/o1-pro", 1e6)).toBeNull();
+  });
+
+  it("runs the credit AI cap for paid models and never lets a credit dial a free model", () => {
+    const fastCredit = { kind: "fast" as const, usedMessages: 0, spentUsd: 0 };
+    // The old early ':free' pass-through is gone: a credit path checks the cap.
+    expect(checkHouseKeyCall("free", "google/gemma-4-31b-it:free", 0, { ...fastCredit, spentUsd: 1 }))
+      .toMatchObject({ status: 402, code: "paid_model_required" });
+    expect(checkHouseKeyCall("free", "google/gemma-4-31b-it:free", 0, fastCredit)?.code).toBe("paid_model_required");
+    expect(checkHouseKeyCall("free", "deepseek/deepseek-v4.1-flash", 0, { ...fastCredit, spentUsd: 1 })?.code)
+      .toBe("ai_budget_exhausted");
+    const boardroomCredit = { kind: "boardroom" as const, spentUsd: 4 };
+    expect(checkHouseKeyCall("free", "anthropic/claude-sonnet-5.5", 0, boardroomCredit)?.code).toBe("ai_budget_exhausted");
+    expect(checkHouseKeyCall("free", "google/gemma-4-31b-it:free", 0, boardroomCredit)?.code).toBe("paid_model_required");
   });
 
   it("caps the paid overage at 25% of the tier budget", () => {

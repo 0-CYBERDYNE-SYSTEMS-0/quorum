@@ -62,6 +62,8 @@ import {
   tierForSubscriptionPriceId,
   checkoutUrls,
 } from "../server/billing-plans";
+import { resolveExpertModelForContext } from "../shared/expert-catalog";
+import { BOARDROOM_FRONTIER_MODEL_ALLOWLIST, HOUSE_KEY_PAID_MODEL_ALLOWLIST } from "../shared/models";
 
 let app: Express;
 
@@ -248,11 +250,51 @@ describe("pricing v1: webhook", () => {
     expect((await agent.get("/api/user/tier")).body.sessionCredits).toMatchObject({ available: 1, boardroom: 1 });
   });
 
+  it("does not grant a one-time credit for a no_payment_required payment session", async () => {
+    const { agent, userId } = await registerUser("hook_payment_nopay");
+    await webhookEvent({
+      type: "checkout.session.completed",
+      data: { object: { id: "cs_nopay", mode: "payment", payment_status: "no_payment_required", customer: "cus_nopay", metadata: { userId: String(userId), sessionKind: "fast" } } },
+    });
+    expect((await agent.get("/api/user/tier")).body.sessionCredits.available).toBe(0);
+  });
+
+  it("grants a subscription only after payment, and allows a trial with no_payment_required", async () => {
+    const { agent, userId } = await registerUser("hook_sub_unpaid");
+    await webhookEvent({
+      type: "checkout.session.completed",
+      data: { object: { id: "cs_unpaid", mode: "subscription", payment_status: "unpaid", customer: "cus_unpaid", subscription: "sub_unpaid", metadata: { userId: String(userId), plan: "pro" } } },
+    });
+    expect((await agent.get("/api/user/tier")).body.tier).toBe("free");
+
+    await webhookEvent({
+      type: "checkout.session.async_payment_succeeded",
+      data: { object: { id: "cs_unpaid", mode: "subscription", payment_status: "paid", customer: "cus_unpaid", subscription: "sub_unpaid", metadata: { userId: String(userId), plan: "pro" } } },
+    });
+    expect((await agent.get("/api/user/tier")).body.tier).toBe("pro");
+
+    const trial = await registerUser("hook_trial");
+    await webhookEvent({
+      type: "checkout.session.completed",
+      data: { object: { id: "cs_trial", mode: "subscription", payment_status: "no_payment_required", customer: "cus_trial", subscription: "sub_trial", metadata: { userId: String(trial.userId), plan: "boardroom" } } },
+    });
+    expect((await trial.agent.get("/api/user/tier")).body.tier).toBe("boardroom");
+  });
+
+  it("answers non-2xx when a handler throws so Stripe retries", async () => {
+    mockConstructEvent.mockReturnValue({
+      type: "invoice.payment_succeeded",
+      data: { object: { get subscription(): string { throw new Error("db unavailable"); } } },
+    });
+    const res = await request(app).post("/api/webhook").set("stripe-signature", "sig").send({});
+    expect(res.status).toBe(500);
+  });
+
   it("sets the plan from checkout metadata and maps price ids on subscription.updated", async () => {
     const { agent, userId } = await registerUser("hook_sub");
     await webhookEvent({
       type: "checkout.session.completed",
-      data: { object: { id: "cs_sub", mode: "subscription", customer: "cus_sub", subscription: "sub_1", metadata: { userId: String(userId), plan: "pro" } } },
+      data: { object: { id: "cs_sub", mode: "subscription", payment_status: "paid", customer: "cus_sub", subscription: "sub_1", metadata: { userId: String(userId), plan: "pro" } } },
     });
     let tier = await agent.get("/api/user/tier");
     expect(tier.body.tier).toBe("pro");
@@ -278,7 +320,7 @@ describe("pricing v1: webhook", () => {
     const { agent, userId } = await registerUser("hook_delete");
     await webhookEvent({
       type: "checkout.session.completed",
-      data: { object: { id: "cs_del", mode: "subscription", customer: "cus_del", subscription: "sub_del", metadata: { userId: String(userId), plan: "boardroom" } } },
+      data: { object: { id: "cs_del", mode: "subscription", payment_status: "paid", customer: "cus_del", subscription: "sub_del", metadata: { userId: String(userId), plan: "boardroom" } } },
     });
     let tier = await agent.get("/api/user/tier");
     expect(tier.body.tier).toBe("boardroom");
@@ -297,7 +339,7 @@ describe("pricing v1: webhook", () => {
     const { agent, userId } = await registerUser("hook_invoice");
     await webhookEvent({
       type: "checkout.session.completed",
-      data: { object: { id: "cs_inv", mode: "subscription", customer: "cus_inv", subscription: "sub_inv", metadata: { userId: String(userId), plan: "pro" } } },
+      data: { object: { id: "cs_inv", mode: "subscription", payment_status: "paid", customer: "cus_inv", subscription: "sub_inv", metadata: { userId: String(userId), plan: "pro" } } },
     });
     await webhookEvent({ type: "invoice.payment_failed", data: { object: { subscription: "sub_inv" } } });
     expect((await agent.get("/api/subscription-status")).body.status).toBe("past_due");
@@ -308,6 +350,31 @@ describe("pricing v1: webhook", () => {
 });
 
 describe("pricing v1: session credit conversations", () => {
+  it("does not spend a held credit on an ordinary Free board", async () => {
+    const { agent, userId } = await registerUser("credit_optin");
+    await webhookEvent({
+      type: "checkout.session.completed",
+      data: { object: { id: "cs_optin", mode: "payment", payment_status: "paid", customer: "cus_optin", metadata: { userId: String(userId), sessionKind: "boardroom" } } },
+    });
+
+    const freeBoard = await agent.post("/api/protected/conversations").send({ title: "Free board" });
+    expect(freeBoard.status).toBe(201);
+    expect(freeBoard.body.sessionCreditKind).toBeNull();
+    expect((await agent.get("/api/user/tier")).body.sessionCredits).toMatchObject({ available: 1, boardroom: 1 });
+
+    // Choosing the session board spends exactly that credit.
+    const credited = await agent.post("/api/protected/conversations").send({ title: "Chosen", sessionCreditKind: "boardroom" });
+    expect(credited.body.sessionCreditKind).toBe("boardroom");
+    expect((await agent.get("/api/user/tier")).body.sessionCredits).toMatchObject({ available: 0, used: 1 });
+  });
+
+  it("refuses an explicit credit kind the account does not hold", async () => {
+    const { agent } = await registerUser("credit_missing");
+    const res = await agent.post("/api/protected/conversations").send({ title: "No credit", sessionCreditKind: "fast" });
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe("SESSION_CREDIT_UNAVAILABLE");
+  });
+
   it("consumes one credit for one conversation and applies its seat cap", async () => {
     const { agent, userId } = await registerUser("credit_conv");
     await webhookEvent({
@@ -315,11 +382,12 @@ describe("pricing v1: session credit conversations", () => {
       data: { object: { id: "cs_conv", mode: "payment", payment_status: "paid", customer: "cus_conv", metadata: { userId: String(userId), sessionKind: "fast" } } },
     });
 
-    const first = await agent.post("/api/protected/conversations").send({ title: "On the credit" });
+    const first = await agent.post("/api/protected/conversations").send({ title: "On the credit", sessionCreditKind: "fast" });
     expect(first.status).toBe(201);
     expect(first.body.sessionCreditKind).toBe("fast");
 
-    // Fast credit allows five seats (the Free plan alone allows three).
+    // Fast credit allows five seats (the Free plan alone allows three). A
+    // ':free' model request is rewritten to the credit's paid default.
     for (let seat = 1; seat <= 5; seat += 1) {
       const added = await agent.post(`/api/protected/conversations/${first.body.id}/experts`).send({
         name: `Director ${seat}`,
@@ -327,6 +395,7 @@ describe("pricing v1: session credit conversations", () => {
         model: "google/gemma-4-31b-it:free",
       });
       expect(added.status).toBe(201);
+      expect(added.body.model.endsWith(":free")).toBe(false);
     }
     const sixth = await agent.post(`/api/protected/conversations/${first.body.id}/experts`).send({
       name: "Director 6",
@@ -360,7 +429,7 @@ describe("pricing v1: session credit conversations", () => {
       type: "checkout.session.completed",
       data: { object: { id: "cs_frontier", mode: "payment", payment_status: "paid", customer: "cus_f", metadata: { userId: String(userId), sessionKind: "boardroom" } } },
     });
-    const credited = await agent.post("/api/protected/conversations").send({ title: "Boardroom session" });
+    const credited = await agent.post("/api/protected/conversations").send({ title: "Boardroom session", sessionCreditKind: "boardroom" });
     expect(credited.body.sessionCreditKind).toBe("boardroom");
     const allowed = await agent.post(`/api/protected/conversations/${credited.body.id}/experts`).send({
       name: "Frontier",
@@ -371,12 +440,53 @@ describe("pricing v1: session credit conversations", () => {
   });
 });
 
+describe("pricing v1: paid expert model defaults", () => {
+  it("rewrites a free seat on Pro and Boardroom, on create and update", async () => {
+    const { agent, userId } = await registerUser("expert_models");
+    await webhookEvent({
+      type: "checkout.session.completed",
+      data: { object: { id: "cs_models_pro", mode: "subscription", payment_status: "paid", customer: "cus_models", subscription: "sub_models", metadata: { userId: String(userId), plan: "pro" } } },
+    });
+
+    const proConv = await agent.post("/api/protected/conversations").send({ title: "Pro board" });
+    const proSeat = await agent.post(`/api/protected/conversations/${proConv.body.id}/experts`).send({
+      name: "Chief Strategy Officer",
+      role: "Chief Strategy Officer",
+      model: "poolside/laguna-s-2.1:free",
+    });
+    expect(proSeat.status).toBe(201);
+    expect(proSeat.body.model.endsWith(":free")).toBe(false);
+    expect(HOUSE_KEY_PAID_MODEL_ALLOWLIST as readonly string[]).toContain(proSeat.body.model);
+
+    // The settings route applies the same rewrite.
+    const patched = await agent.patch(`/api/experts/${proSeat.body.id}`).send({ model: "google/gemma-4-31b-it:free" });
+    expect(patched.status).toBe(200);
+    expect(patched.body.model.endsWith(":free")).toBe(false);
+    expect(HOUSE_KEY_PAID_MODEL_ALLOWLIST as readonly string[]).toContain(patched.body.model);
+
+    // Upgrading to Boardroom seats the frontier default.
+    await webhookEvent({
+      type: "customer.subscription.updated",
+      data: { object: { id: "sub_models", customer: "cus_models", status: "active", items: { data: [{ price: { id: "price_br_y" } }] } } },
+    });
+    const brConv = await agent.post("/api/protected/conversations").send({ title: "Boardroom board" });
+    const brSeat = await agent.post(`/api/protected/conversations/${brConv.body.id}/experts`).send({
+      name: "Chief Financial Officer",
+      role: "Chief Financial Officer",
+      model: "poolside/laguna-s-2.1:free",
+    });
+    expect(brSeat.status).toBe(201);
+    expect(BOARDROOM_FRONTIER_MODEL_ALLOWLIST as readonly string[]).toContain(brSeat.body.model);
+    expect(brSeat.body.model).toBe(resolveExpertModelForContext("poolside/laguna-s-2.1:free", { paid: true, allowFrontier: true }));
+  });
+});
+
 describe("pricing v1: plan changes and billing portal", () => {
   it("switches an active Pro subscriber to Boardroom in place", async () => {
     const { agent, userId } = await registerUser("upgrade_switch");
     await webhookEvent({
       type: "checkout.session.completed",
-      data: { object: { id: "cs_up", mode: "subscription", customer: "cus_up", subscription: "sub_up", metadata: { userId: String(userId), plan: "pro" } } },
+      data: { object: { id: "cs_up", mode: "subscription", payment_status: "paid", customer: "cus_up", subscription: "sub_up", metadata: { userId: String(userId), plan: "pro" } } },
     });
     mockSubscriptionRetrieve.mockResolvedValue({
       id: "sub_up",
@@ -400,7 +510,7 @@ describe("pricing v1: plan changes and billing portal", () => {
     const { agent, userId } = await registerUser("portal_user");
     await webhookEvent({
       type: "checkout.session.completed",
-      data: { object: { id: "cs_portal", mode: "subscription", customer: "cus_portal", subscription: "sub_portal", metadata: { userId: String(userId), plan: "pro" } } },
+      data: { object: { id: "cs_portal", mode: "subscription", payment_status: "paid", customer: "cus_portal", subscription: "sub_portal", metadata: { userId: String(userId), plan: "pro" } } },
     });
     const res = await agent.post("/api/billing-portal").send({});
     expect(res.status).toBe(200);

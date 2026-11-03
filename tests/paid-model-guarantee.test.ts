@@ -38,8 +38,15 @@ import {
   DEFAULT_AUX_MODEL_FALLBACK_SLUG,
   DEFAULT_AUX_MODEL_SLUG,
   FREE_TIER_BUDGET_MODEL,
+  budgetFallbackModelsForTier,
   UsageCapError,
 } from "../server/usage-caps";
+import {
+  EXPERT_CATALOG,
+  defaultExpertModelForTier,
+  resolveExpertModelForContext,
+} from "../shared/expert-catalog";
+import { HOUSE_KEY_PAID_MODEL_ALLOWLIST, BOARDROOM_FRONTIER_MODEL_ALLOWLIST } from "../shared/models";
 
 const FREE_SLUG = "google/gemma-4-31b-it:free";
 const messages = [{ role: "user" as const, content: "hello" }];
@@ -130,7 +137,26 @@ describe("helper calls (planning, insights, moderator, closing memo)", () => {
 
   it("never resolves a paid tier or session path to a ':free' model", async () => {
     const resolved: string[] = [];
+    // Expert seat defaults, fallbacks and helper chains for every paid and
+    // session-credit context.
+    const expertContexts = [
+      { tier: "pro", context: { paid: true, allowFrontier: false }, allowed: HOUSE_KEY_PAID_MODEL_ALLOWLIST },
+      { tier: "boardroom", context: { paid: true, allowFrontier: true }, allowed: BOARDROOM_FRONTIER_MODEL_ALLOWLIST },
+      { tier: "enterprise", context: { paid: true, allowFrontier: true }, allowed: BOARDROOM_FRONTIER_MODEL_ALLOWLIST },
+      { tier: "fast-session", context: { paid: true, allowFrontier: false }, allowed: HOUSE_KEY_PAID_MODEL_ALLOWLIST },
+      { tier: "boardroom-session", context: { paid: true, allowFrontier: true }, allowed: BOARDROOM_FRONTIER_MODEL_ALLOWLIST },
+    ] as const;
+    for (const { context, allowed } of expertContexts) {
+      resolved.push(resolveExpertModelForContext(FREE_SLUG, context));
+      for (const expert of EXPERT_CATALOG) {
+        const seat = resolveExpertModelForContext(expert.defaultModel, context);
+        resolved.push(seat);
+        expect((allowed as readonly string[]).includes(seat), `${context.allowFrontier}: ${expert.role}`).toBe(true);
+      }
+    }
     for (const tier of PAID_TIERS) {
+      resolved.push(defaultExpertModelForTier(tier));
+      resolved.push(...budgetFallbackModelsForTier(tier));
       store.getUser.mockResolvedValue({ id: 1, tier });
       store.getSessionCreditByConversationId.mockResolvedValue(undefined);
       resolved.push((await resolveAuxModelForUser(FREE_SLUG, FREE_SLUG, 1, 10))!);
@@ -140,11 +166,13 @@ describe("helper calls (planning, insights, moderator, closing memo)", () => {
     store.getUser.mockResolvedValue({ id: 2, tier: "free" });
     for (const kind of SESSION_KINDS) {
       store.getSessionCreditByConversationId.mockResolvedValue({ id: 9, kind });
+      resolved.push(defaultExpertModelForTier(kind === "boardroom" ? "boardroom" : "pro"));
       resolved.push((await resolveAuxModelForUser(FREE_SLUG, null, 2, 77))!);
       resolved.push(...planningModelsForTier("free", true));
     }
     expect(resolved.length).toBeGreaterThan(0);
     expect(resolved.filter(model => model.endsWith(":free"))).toEqual([]);
+    expect(budgetFallbackModelsForTier("pro")).toEqual([BUDGET_FALLBACK_MODEL, BUDGET_FALLBACK_MODEL_FALLBACK]);
     // Closing-memo retry never dials a free slug for paid work.
     expect(closingSynthesisFallbackModel(DEFAULT_AUX_MODEL_SLUG)).toBe(DEFAULT_AUX_MODEL_FALLBACK_SLUG);
     expect(closingSynthesisFallbackModel(FREE_TIER_BUDGET_MODEL)).toBeNull();
@@ -191,6 +219,25 @@ describe("provider enforcement for paid and session-credit calls", () => {
     expect(error).toBeInstanceOf(UsageCapError);
     expect(error.denial).toMatchObject({ status: 429, code: "ai_budget_exhausted" });
     expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it("rewrites a stored ':free' expert model on a paid tier before the request", async () => {
+    store.getUser.mockResolvedValue({ id: 1, tier: "pro" });
+    mockFetch.mockResolvedValue(okResponse(0.01));
+    await new OpenRouterProvider(null).chat(messages, FREE_SLUG, 1);
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.model.endsWith(":free")).toBe(false);
+    expect(body.model).toBe(resolveExpertModelForContext(FREE_SLUG, { paid: true, allowFrontier: false }));
+  });
+
+  it("rewrites a stored ':free' expert model on a session-credit board", async () => {
+    store.getUser.mockResolvedValue({ id: 2, tier: "free" });
+    store.getSessionCreditByConversationId.mockResolvedValue({ id: 5, kind: "boardroom", aiSpendUsd: 0 });
+    mockFetch.mockResolvedValue(okResponse(0.01));
+    await new OpenRouterProvider(null).chat(messages, FREE_SLUG, 2, false, { conversationId: 77 });
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.model.endsWith(":free")).toBe(false);
+    expect(body.model).toBe(resolveExpertModelForContext(FREE_SLUG, { paid: true, allowFrontier: true }));
   });
 
   it("keeps Free-plan free-model calls unchanged", async () => {

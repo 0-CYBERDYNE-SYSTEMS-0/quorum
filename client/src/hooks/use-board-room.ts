@@ -91,12 +91,16 @@ export function useBoardRoom() {
   }, []);
 
   const createConversationMutation = useMutation({
-    mutationFn: async (title?: string) => {
-      const res = await apiRequest("POST", "/api/protected/conversations", { title: title ?? "New board session" });
+    mutationFn: async (input?: { title?: string; sessionCreditKind?: "fast" | "boardroom" }) => {
+      const res = await apiRequest("POST", "/api/protected/conversations", {
+        title: input?.title ?? "New board session",
+        ...(input?.sessionCreditKind ? { sessionCreditKind: input.sessionCreditKind } : {}),
+      });
       return (await res.json()) as Conversation;
     },
     onSuccess: (conversation) => {
       queryClient.invalidateQueries({ queryKey: ["/api/protected/conversations"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/user/tier"] });
       setHasQueuedMessage(false);
       setActiveConversation(conversation.id);
     },
@@ -587,8 +591,8 @@ export function useBoardRoom() {
   );
 
   const startSession = useCallback(
-    async (title?: string) => {
-      const conversation = await createConversationMutation.mutateAsync(title);
+    async (title?: string, sessionCreditKind?: "fast" | "boardroom") => {
+      const conversation = await createConversationMutation.mutateAsync({ title, sessionCreditKind });
       setActiveConversation(conversation.id);
       return conversation;
     },

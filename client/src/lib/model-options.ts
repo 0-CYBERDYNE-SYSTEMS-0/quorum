@@ -13,6 +13,7 @@ import {
   MODEL_LABELS,
   modelLabel,
 } from "@shared/models";
+import { FREE_DEFAULT_EXPERT_MODEL } from "@shared/expert-catalog";
 
 export type ModelOption = {
   id: string;
@@ -35,8 +36,31 @@ export const CLIENT_MODEL_OPTIONS: ModelOption[] = [
 
 /** Fast options always; frontier options only for Boardroom/Enterprise. */
 export function modelOptionsForTier(tier: string | null | undefined): ModelOption[] {
-  const frontierAllowed = tier === "boardroom" || tier === "enterprise";
+  const t = tier || "free";
+  // Free keeps its existing free expert model; paid slugs are not offered.
+  if (t === "free") {
+    return [{
+      id: FREE_DEFAULT_EXPERT_MODEL,
+      label: MODEL_LABELS[FREE_DEFAULT_EXPERT_MODEL] ?? modelLabel(FREE_DEFAULT_EXPERT_MODEL),
+      boardroomOnly: false,
+    }];
+  }
+  const frontierAllowed = t === "boardroom" || t === "enterprise";
   return CLIENT_MODEL_OPTIONS.filter((option) => frontierAllowed || !option.boardroomOnly);
+}
+
+/**
+ * The tier whose model rules apply to a board. A session-credit conversation
+ * uses its credit's rules: $5 Fast = Pro's fast allowlist, $15 Boardroom =
+ * the frontier allowlist.
+ */
+export function effectiveModelTier(
+  tier: string | null | undefined,
+  creditKind?: "fast" | "boardroom" | null,
+): string {
+  if (creditKind === "boardroom") return "boardroom";
+  if (creditKind === "fast") return "pro";
+  return tier || "free";
 }
 
 export function isBoardroomOnlyModel(modelId: string | null | undefined): boolean {

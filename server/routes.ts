@@ -1,4 +1,4 @@
-import { catalogAvatar } from "@shared/expert-catalog";
+import { catalogAvatar, resolveExpertModelForContext } from "@shared/expert-catalog";
 import { billingErrorResponse, billingUnavailable } from "./billing-errors";
 import type { Express, Request, Response } from "express";
 import express from "express";
@@ -1188,24 +1188,37 @@ export async function registerRoutes(app: Express): Promise<Server> {
       return res.status(400).send(`Webhook Error: ${err.message}`);
     }
     
-    switch (event.type) {
-      case "checkout.session.completed":
-      case "checkout.session.async_payment_succeeded":
-        try {
+    // A delivery without an object payload cannot be processed; acknowledge it
+    // (a retry would send the same malformed body). Real handler failures below
+    // answer 500 so Stripe retries.
+    if (!event.data?.object) {
+      console.warn(`[BILLING] webhook ${event.type} has no data object; ignoring`);
+      return res.json({ received: true });
+    }
+
+    try {
+      switch (event.type) {
+        case "checkout.session.completed":
+        case "checkout.session.async_payment_succeeded": {
           const session = event.data.object as any;
           const userId = Number(session.metadata?.userId ?? session.client_reference_id);
           const user = Number.isSafeInteger(userId) && userId > 0
             ? await storage.getUser(userId)
             : null;
 
+          // Never grant a plan or a credit before the money lands. Delayed
+          // payment methods complete the session as "unpaid"; the later
+          // checkout.session.async_payment_succeeded event is the grant.
+          // A subscription trial legitimately reports no_payment_required.
+          const paymentStatus = session.payment_status;
+          const paid = paymentStatus === "paid"
+            || (session.mode === "subscription" && paymentStatus === "no_payment_required");
+          if (!paid) {
+            console.log(`[BILLING] checkout ${session.id} ${event.type} with payment_status=${paymentStatus}; not granting yet`);
+            break;
+          }
+
           if (session.mode === "payment") {
-            // Delayed payment methods complete the session before the money
-            // lands; only grant a credit once Stripe says it is paid.
-            const paid = session.payment_status === "paid" || session.payment_status === "no_payment_required";
-            if (!paid) {
-              console.log(`[BILLING] checkout ${session.id} completed but payment_status=${session.payment_status}; waiting for async_payment_succeeded`);
-              break;
-            }
             const kind = session.metadata?.sessionKind;
             if (!user) {
               console.error(`[BILLING] checkout.session.completed payment has no resolvable user (metadata.userId=${session.metadata?.userId ?? "-"})`);
@@ -1242,13 +1255,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
           });
           await storage.updateUserPlan(targetUser.id, { tier: plan, status: "active" });
           console.log(`[BILLING] user ${targetUser.id} upgraded to ${plan}`);
-        } catch (error) {
-          console.error("Error processing checkout.session.completed:", error);
+          break;
         }
-        break;
 
-      case "invoice.payment_succeeded":
-        try {
+        case "invoice.payment_succeeded": {
           const invoice = event.data.object as any; // Type assertion to avoid TS errors
           if (invoice.subscription) {
             // Look the user up by their stored subscription id — scanning ids
@@ -1267,13 +1277,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
               console.log(`Updated user ${user.id} subscription to active${plan ? ` (${plan})` : ""}`);
             }
           }
-        } catch (error) {
-          console.error("Error processing invoice.payment_succeeded:", error);
+          break;
         }
-        break;
 
-      case "invoice.payment_failed":
-        try {
+        case "invoice.payment_failed": {
           const invoice = event.data.object as any;
           if (invoice.subscription) {
             const user = await storage.getUserByStripeSubscriptionId(invoice.subscription);
@@ -1282,13 +1289,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
               console.log(`User ${user.id} subscription is past_due`);
             }
           }
-        } catch (error) {
-          console.error("Error processing invoice.payment_failed:", error);
+          break;
         }
-        break;
 
-      case "customer.subscription.deleted":
-        try {
+        case "customer.subscription.deleted": {
           const subscription = event.data.object as any;
           const user = await storage.getUserByStripeSubscriptionId(subscription.id)
             ?? (typeof subscription.customer === "string"
@@ -1299,13 +1303,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
             await storage.updateUserPlan(user.id, { tier: "free", status: "canceled" });
             console.log(`User ${user.id} subscription deleted — downgraded to free`);
           }
-        } catch (error) {
-          console.error("Error processing customer.subscription.deleted:", error);
+          break;
         }
-        break;
 
-      case "customer.subscription.updated":
-        try {
+        case "customer.subscription.updated": {
           const subscription = event.data.object as any; // Type assertion to avoid TS errors
           const user = await storage.getUserByStripeSubscriptionId(subscription.id)
             ?? (typeof subscription.customer === "string"
@@ -1332,12 +1333,17 @@ export async function registerRoutes(app: Express): Promise<Server> {
               console.log(`User ${user.id} subscription status ${status}`);
             }
           }
-        } catch (error) {
-          console.error("Error processing customer.subscription.updated:", error);
+          break;
         }
-        break;
+      }
+    } catch (error) {
+      // A handler failure must reach Stripe as non-2xx so it retries. Every
+      // grant is idempotent (checkout session id / plan write), so a retry
+      // cannot double-grant a credit or a tier.
+      console.error(`[BILLING] webhook ${event.type} failed:`, error);
+      return res.status(500).json({ error: "Webhook processing failed" });
     }
-    
+
     res.json({ received: true });
   });
   
@@ -1396,22 +1402,32 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const title = req.body.title || "New board session";
       const user = await storage.getUser(userId);
       const tier = user?.tier || "free";
-      // Optional explicit credit kind; otherwise the oldest available credit.
+      // A one-time credit is spent ONLY when the Chair explicitly picks a
+      // session board. A Free user holding a credit who starts an ordinary
+      // board keeps the credit for later.
       const requestedKind = req.body?.sessionCreditKind;
+      if (requestedKind !== undefined && !isSessionKind(requestedKind)) {
+        return res.status(400).json({ code: "INVALID_SESSION_CREDIT_KIND", message: "Choose a fast or boardroom session." });
+      }
 
-      // Pricing v1: a Free account with an available one-time credit starts
+      // Pricing v1: a Free account that chooses a $5/$15 session board starts
       // this conversation on that credit. The credit is consumed here (the
       // conversation's creation), and its limits apply for the conversation's
       // whole life. consumeSessionCredit is atomic, so two tabs cannot spend
       // the same credit twice.
-      if (tier === "free") {
+      if (tier === "free" && isSessionKind(requestedKind)) {
         const available = (await storage.listSessionCredits(userId))
-          .filter(credit => credit.status === "available")
-          .filter(credit => !isSessionKind(requestedKind) || credit.kind === requestedKind)
+          .filter(credit => credit.status === "available" && credit.kind === requestedKind)
           .sort((a, b) => (a.createdAt?.getTime() ?? 0) - (b.createdAt?.getTime() ?? 0));
         for (const candidate of available) {
           consumedCredit = await storage.consumeSessionCredit(candidate.id, userId);
           if (consumedCredit) break;
+        }
+        if (!consumedCredit) {
+          return res.status(409).json({
+            code: "SESSION_CREDIT_UNAVAILABLE",
+            message: `No ${requestedKind === "boardroom" ? "Boardroom Session" : "Single Session"} credit is available. Buy one or start a Free board.`,
+          });
         }
       }
 
@@ -1570,6 +1586,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (typeof model !== "string" || !model.trim()) {
         return res.status(400).json({ message: "Choose a model for this seat." });
       }
+      // Paid plans and session credits always seat a paid expert model. A
+      // ':free' request (stale client, bundled catalog default) is rewritten
+      // to the tier's paid default before the allowlist gate runs.
+      const resolvedModel = resolveExpertModelForContext(model, {
+        paid: Boolean(limits.credit) || tier !== "free",
+        allowFrontier: Boolean(limits.allowFrontierModels),
+      });
       const role = typeof req.body.role === "string" ? req.body.role.trim().slice(0, 60) : "";
       if (!role || /^(user|chair|farmer)$/i.test(role)) {
         return res.status(400).json({ message: "Choose a valid expert role." });
@@ -1584,8 +1607,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const avatarUrl = catalogAvatar(role);
 
       // House-key model gate: paid models need Pro/Boardroom (or a session
-      // credit); frontier slugs are Boardroom-only. BYOK may pick anything.
-      const modelDenial = await houseKeyModelDenial(req.user!.id, tier, model, conversationId);
+      // credit); frontier slugs are Boardroom-only. BYOK may pick anything
+      // except a free model on a paid board (handled above).
+      const modelDenial = await houseKeyModelDenial(req.user!.id, tier, resolvedModel, conversationId);
       if (modelDenial) {
         return res.status(modelDenial.status).json({
           code: modelDenial.code,
@@ -1598,7 +1622,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         conversationId,
         name,
         role,
-        model,
+        model: resolvedModel,
         systemPrompt: generateSystemPrompt({ role, customInstructions } as any),
         avatarUrl,
         customInstructions,
@@ -1681,16 +1705,25 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const updates: Partial<any> = {};
 
       if (name !== undefined) updates.name = name;
-      if (model !== undefined) updates.model = model;
       if (customInstructions !== undefined) updates.customInstructions = customInstructions;
 
       // Enforce the same model gate as expert creation — without this,
       // free-tier users could upgrade any expert's model via the settings
-      // modal and bypass the gate entirely.
+      // modal and bypass the gate entirely. A paid board also rewrites any
+      // ':free' model to its paid default here.
       if (model !== undefined) {
+        if (typeof model !== "string" || !model.trim()) {
+          return res.status(400).json({ message: "Choose a model for this seat." });
+        }
         const user = await storage.getUser(req.user!.id);
         const tier = user?.tier || "free";
-        const modelDenial = await houseKeyModelDenial(req.user!.id, tier, model, expert.conversationId);
+        const limits = await effectiveLimits(tier, expert.conversationId);
+        const resolvedModel = resolveExpertModelForContext(model, {
+          paid: Boolean(limits.credit) || tier !== "free",
+          allowFrontier: Boolean(limits.allowFrontierModels),
+        });
+        updates.model = resolvedModel;
+        const modelDenial = await houseKeyModelDenial(req.user!.id, tier, resolvedModel, expert.conversationId);
         if (modelDenial) {
           return res.status(modelDenial.status).json({
             code: modelDenial.code,
