@@ -17,7 +17,7 @@ import {
 import { QuorumLogo, QuorumMark } from "@/components/brand";
 import { Btn, Chip, SectionLabel } from "@/components/design";
 import { EXPERT_CATALOG } from "@shared/expert-catalog";
-import { PLAN_PRICING, SESSION_PRICING, YEARLY_MONTHS_FREE } from "@shared/pricing";
+import { PLAN_PRICING, SESSION_PRICING, YEARLY_MONTHS_FREE, formatUsd } from "@shared/pricing";
 import { cn } from "@/lib/utils";
 
 /* ------------------------------------------------------------------ */
@@ -219,7 +219,7 @@ function Hero() {
               </a>
             </div>
             <p className="mt-4 text-[12px] text-faint-ink">
-              Three seats on the house. No card. Your workspace stays private.
+              One roundtable from {formatUsd(SESSION_PRICING.fast.priceUsd)}. {PLAN_PRICING.pro.name} and {PLAN_PRICING.boardroom.name} plans. Your workspace stays private.
             </p>
 
             <dl className="mt-10 grid max-w-[540px] grid-cols-3 gap-4 border-t border-line pt-5">
@@ -448,7 +448,7 @@ function EnterpriseSection() {
             room: private deployment, explicit model routing, and a clean export when you leave.
           </p>
           <Link href="/auth?mode=register" className="mt-7 inline-flex items-center gap-1.5 text-[13px] font-medium text-bronze-ink hover:underline">
-            Start with three seats <ChevronRight className="h-3.5 w-3.5" />
+            Start a boardroom <ChevronRight className="h-3.5 w-3.5" />
           </Link>
         </div>
         <div className="grid gap-x-10 gap-y-8 sm:grid-cols-2">
@@ -577,7 +577,7 @@ function Closing() {
             </Btn>
           </Link>
         </div>
-        <p className="mt-4 text-[12px] text-faint-ink">Three seats on the house. Sign in with the same account across devices.</p>
+        <p className="mt-4 text-[12px] text-faint-ink">One roundtable from {formatUsd(SESSION_PRICING.fast.priceUsd)}. Sign in with the same account across devices.</p>
       </div>
     </section>
   );

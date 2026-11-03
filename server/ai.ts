@@ -73,8 +73,8 @@ export function planningModelsForTier(_tier: string | null | undefined, _session
 
 /**
  * The paid aux model to use for a helper call. A paid context must never send
- * a ':free' slug, so anything free (a paid account whose Moderator still runs a
- * free model, or a stray env override) is replaced with the paid default.
+ * a ':free' slug, so any stored or env-supplied ':free' value is replaced with
+ * the paid default.
  */
 export function paidAuxModelFor(preferred?: string | null): string {
   const candidate = preferred?.trim();
@@ -544,8 +544,9 @@ async function saveGeneratedDeliverable(
 function expertResponseErrorMessage(error: unknown, expertName: string, imageParts: ImagePart[]): string {
   if (isVisionRejection(error, imageParts)) return visionRejectionMessage(expertName);
   if (error instanceof SafeDeliverableError) return error.message;
-  // Plan caps are actionable ("switch experts to free models…"), so show the
-  // cap message instead of the generic incomplete-response text.
+  // Plan caps are actionable ("add your own OpenRouter key, or wait for the
+  // monthly reset"), so show the cap message instead of the generic
+  // incomplete-response text.
   if (error instanceof UsageCapError) return error.message;
   return INCOMPLETE_EXPERT_RESPONSE_MESSAGE;
 }

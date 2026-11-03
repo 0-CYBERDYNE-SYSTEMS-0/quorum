@@ -77,7 +77,7 @@ export const PLAN_REQUIRED_DENIAL = {
   upgradeUrl: "/subscribe",
 };
 
-/** Session credits a Free account can spend one at a time. */
+/** Session credits a no-plan account can spend one at a time. */
 export const SESSION_CREDIT_LIMITS = SESSION_PRICING;
 
 export type SessionCreditLimits = {

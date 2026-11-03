@@ -84,15 +84,3 @@ export enum ExpertRole {
   ImagerySpecialist = "Imagery Specialist",
   Moderator = "Moderator"
 }
-
-// Expert model options
-export enum AIModel {
-  Claude3Haiku = "claude-3-haiku-20240307",
-  Claude3Sonnet = "claude-3-sonnet-20240229",
-  Claude3Opus = "claude-3-opus-20240229",
-  GPT35Turbo = "gpt-3.5-turbo",
-  GPT4 = "gpt-4-0613",
-  Llama2 = "meta-llama/llama-2-70b-chat",
-  Llama3Sonar = "perplexity/llama-3.1-sonar-small-128k-online",
-  GeminiFlash = "gemini/flash-2-0"
-}

@@ -47,9 +47,9 @@ export const CLOSING_MEMO_MAX_TOKENS = 8192;
 
 /**
  * Default model for the pre-answer tool-planning call on paid tiers. The
- * previous code default was a free preview model that could spend its whole
- * budget on hidden reasoning and end with "Response reached the output limit."
- * This small paid slug is stable and allowlisted.
+ * previous code default was a zero-cost preview model that could spend its
+ * whole budget on hidden reasoning and end with "Response reached the output
+ * limit." This small paid slug is stable and allowlisted.
  */
 export const DEFAULT_AUX_MODEL_SLUG = "z-ai/glm-5.3-flash";
 /** Second paid aux choice when the default aux model fails. */

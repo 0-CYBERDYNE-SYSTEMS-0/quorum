@@ -1198,7 +1198,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // - checkout.session.completed → subscription tier or one session credit
   // - customer.subscription.updated → price id maps to a tier; past_due and
   //   cancel transitions are reflected, never guessed
-  // - customer.subscription.deleted → downgrade to free
+  // - customer.subscription.deleted → downgrade to no plan (legacy "free" tier)
   // - invoice.payment_succeeded / invoice.payment_failed → status only
   app.post("/api/webhook", async (req, res) => {
     const sig = req.headers["stripe-signature"];
@@ -1333,9 +1333,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
               ? await storage.getUserByStripeCustomerId(subscription.customer)
               : undefined);
           if (user) {
-            // A deleted subscription is a real downgrade: plan back to free.
+            // A deleted subscription is a real downgrade: plan back to no plan.
             await storage.updateUserPlan(user.id, { tier: "free", status: "canceled" });
-            console.log(`User ${user.id} subscription deleted — downgraded to free`);
+            console.log(`User ${user.id} subscription deleted — downgraded to no plan`);
           }
           break;
         }
@@ -1353,7 +1353,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
             const status: string = subscription.status;
             if (status === "canceled" || status === "unpaid" || status === "incomplete_expired") {
               await storage.updateUserPlan(user.id, { tier: "free", status });
-              console.log(`User ${user.id} subscription ${status} — downgraded to free`);
+              console.log(`User ${user.id} subscription ${status} — downgraded to no plan`);
             } else if (status === "past_due") {
               // Grace: keep the plan while Stripe retries the card.
               await storage.updateSubscriptionStatus(user.id, "past_due");
@@ -1658,7 +1658,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       // House-key model gate: paid models need Pro/Boardroom (or a session
       // credit); frontier slugs are Boardroom-only. BYOK may pick anything
-      // except a free model on a paid board (handled above).
+      // except a ':free' slug on a paid board (handled above).
       const modelDenial = await houseKeyModelDenial(req.user!.id, tier, resolvedModel, conversationId);
       if (modelDenial) {
         return res.status(modelDenial.status).json({
@@ -1758,7 +1758,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (customInstructions !== undefined) updates.customInstructions = customInstructions;
 
       // Enforce the same model gate as expert creation — without this,
-      // free-tier users could upgrade any expert's model via the settings
+      // no-plan users could upgrade any expert's model via the settings
       // modal and bypass the gate entirely. A paid board also rewrites any
       // ':free' model to its paid default here.
       if (model !== undefined) {
