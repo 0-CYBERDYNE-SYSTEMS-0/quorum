@@ -54,14 +54,13 @@ export function isFrontierModel(model: string): boolean {
 }
 
 /**
- * True when the house key may run `model` for this tier. Free slugs are
- * Free-tier only: a paid plan or session credit must never run one. Frontier
- * slugs are Boardroom-only. Passing no tier means "Free tier" (legacy
- * callers); paid callers always pass their plan.
+ * True when the house key may run `model` for this tier. Quorum has no free
+ * plan, so a ':free' slug is never allowed for anyone. Frontier slugs are
+ * Boardroom-only. Passing no tier means "no plan" (never allowed).
  */
 export function isHouseKeyAllowedModel(model: string, tier?: string | null): boolean {
   const t = tier || "free";
-  if (model.endsWith(":free")) return t === "free";
+  if (model.endsWith(":free")) return false;
   if (isFastHouseKeyModel(model)) return true;
   if (isFrontierModel(model)) return t === "boardroom" || t === "enterprise";
   return false;
@@ -70,7 +69,7 @@ export function isHouseKeyAllowedModel(model: string, tier?: string | null): boo
 /** Models a plan may pick on the house key, for UI copy. */
 export function houseKeyModelsForTier(tier: string | null | undefined): string[] {
   const t = tier || "free";
-  const fast = t === "free" ? [] : [...HOUSE_KEY_PAID_MODEL_ALLOWLIST];
+  const fast = t === "pro" || t === "boardroom" || t === "enterprise" ? [...HOUSE_KEY_PAID_MODEL_ALLOWLIST] : [];
   const frontier = t === "boardroom" || t === "enterprise" ? [...BOARDROOM_FRONTIER_MODEL_ALLOWLIST] : [];
   return [...fast, ...frontier];
 }

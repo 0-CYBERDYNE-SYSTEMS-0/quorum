@@ -103,7 +103,7 @@ The same deployment can answer on the Replit host and on a custom domain.
 
 ## Stripe (optional)
 
-Billing fails closed: with no price IDs, accounts remain on Associate and only the affected
+Billing fails closed: with no price IDs, accounts have no plan and only the affected
 checkout option returns the readable "billing is not configured" message.
 
 ### Prices to create

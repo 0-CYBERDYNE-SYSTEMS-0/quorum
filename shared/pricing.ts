@@ -10,7 +10,11 @@
  * expert/message cap can never drift from the enforced one.
  */
 
-export type PlanKey = "free" | "pro" | "boardroom";
+/**
+ * Paid plans. "free" is deliberately absent: Quorum has no free plan. A stored
+ * users.tier of "free" (legacy rows) means "no plan", never a free tier.
+ */
+export type PlanKey = "pro" | "boardroom";
 export type BillingInterval = "month" | "year";
 export type SessionKind = "fast" | "boardroom";
 
@@ -30,22 +34,6 @@ export type PlanPricing = {
 };
 
 export const PLAN_PRICING: Record<PlanKey, PlanPricing> = {
-  free: {
-    name: "Associate",
-    shortName: "Free",
-    monthlyUsd: 0,
-    annualUsd: 0,
-    maxExperts: 3,
-    maxMessages: 100,
-    aiBudgetUsd: 0,
-    tagline: "Free forever. The board on the house.",
-    features: [
-      "3 seated directors",
-      "100 chair briefs a month",
-      "Free models on the house key",
-      "Decision memos and transcript export",
-    ],
-  },
   pro: {
     name: "Executive",
     shortName: "Pro",
@@ -125,11 +113,29 @@ export function planDisplayName(tier: string | null | undefined): string {
   if (tier === "pro") return PLAN_PRICING.pro.name;
   if (tier === "boardroom") return PLAN_PRICING.boardroom.name;
   if (tier === "enterprise") return "Enterprise";
-  return PLAN_PRICING.free.name;
+  return "No plan";
 }
 
 export function planPriceFor(plan: PlanKey, interval: BillingInterval): number {
   return interval === "year" ? PLAN_PRICING[plan].annualUsd : PLAN_PRICING[plan].monthlyUsd;
+}
+
+/** True for the paid plans that can open a board. Legacy "free" is no plan. */
+export function hasPaidPlan(tier: string | null | undefined): boolean {
+  return tier === "pro" || tier === "boardroom" || tier === "enterprise";
+}
+
+/**
+ * Session credits a tier may buy. A no-plan account can buy either one-time
+ * session (that is how it boards without a subscription). Pro may buy only a
+ * Boardroom Session because it has no frontier access. Boardroom and
+ * Enterprise include every session type, so selling them a credit would
+ * strand it — the server refuses that purchase.
+ */
+export function purchasableSessionKinds(tier: string | null | undefined): SessionKind[] {
+  if (!hasPaidPlan(tier)) return ["fast", "boardroom"];
+  if (tier === "pro") return ["boardroom"];
+  return [];
 }
 
 export function formatUsd(amount: number): string {

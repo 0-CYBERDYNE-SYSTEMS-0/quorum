@@ -12,7 +12,7 @@ import axios from "axios";
 import { randomBytes } from "crypto";
 import { getProvider, OUTPUT_LIMIT_ERROR, escalatedOutputTokens, type ChatOptions } from "./ai-providers";
 import { MAX_LOGGED_PROVIDER_TEXT, redactAndTruncateLogText } from "./log-redaction";
-import { CLOSING_MEMO_MAX_TOKENS, DEFAULT_AUX_MODEL_FALLBACK_SLUG, DEFAULT_AUX_MODEL_SLUG, EXPERT_REPLY_MAX_TOKENS, FREE_TIER_BUDGET_MODEL, UsageCapError } from "./usage-caps";
+import { CLOSING_MEMO_MAX_TOKENS, DEFAULT_AUX_MODEL_FALLBACK_SLUG, DEFAULT_AUX_MODEL_SLUG, EXPERT_REPLY_MAX_TOKENS, UsageCapError } from "./usage-caps";
 import { findCatalogExpert } from "@shared/expert-catalog";
 import { isDeferentialStancePosition } from "@shared/stance";
 import { DELIVERABLE_PLACEHOLDER, pendingDeliverableFor, pendingDeliverableByMessage } from "./pending-deliverables";
@@ -61,21 +61,14 @@ function isPaidTier(tier: string | null | undefined): boolean {
 }
 
 /**
- * Ordered planning models for a tier. Paid tiers and conversations funded by a
- * one-time session credit use the small paid aux slug (and one paid fallback);
- * free tiers stay on the free budget slug because a paid house-key call is
- * rejected for them. TOOL_PLANNING_MODEL overrides the whole chain, except
- * that a paid context never accepts a ':free' override (owner rule: no free
- * models for paying customers).
+ * Ordered planning models. There is no free plan, so every board call uses the
+ * small paid aux slug (and one paid fallback). TOOL_PLANNING_MODEL overrides
+ * the chain, except that a ':free' override is never accepted.
  */
-export function planningModelsForTier(tier: string | null | undefined, sessionCredit = false): string[] {
+export function planningModelsForTier(_tier: string | null | undefined, _sessionCredit = false): string[] {
   const override = process.env.TOOL_PLANNING_MODEL?.trim();
-  if (sessionCredit || isPaidTier(tier)) {
-    if (override && !override.endsWith(":free")) return [override];
-    return [DEFAULT_AUX_MODEL_SLUG, DEFAULT_AUX_MODEL_FALLBACK_SLUG];
-  }
-  if (override) return [override];
-  return [FREE_TIER_BUDGET_MODEL];
+  if (override && !override.endsWith(":free")) return [override];
+  return [DEFAULT_AUX_MODEL_SLUG, DEFAULT_AUX_MODEL_FALLBACK_SLUG];
 }
 
 /**
@@ -106,7 +99,7 @@ async function conversationCreditFor(conversationId?: number): Promise<{ id: num
 /**
  * True when helper calls for this conversation are billed to a paying
  * customer: a paid tier, or a conversation funded by a $5/$15 session credit
- * (whose Chair is usually on the Free plan).
+ * (whose Chair may have no plan).
  */
 export async function isPaidAuxContext(userId?: number, conversationId?: number): Promise<boolean> {
   if (await conversationCreditFor(conversationId)) return true;
@@ -1717,11 +1710,9 @@ export async function getExpertResponse(
  * empty; the returned slug is trimmed.
  */
 /**
- * Auxiliary calls (routing, insights, closing memo) must be usable by every
- * tier. A paid DEFAULT_AUX_MODEL would otherwise make the moderator fail for
- * free accounts with "upgrade to Pro", so free-tier conversations keep the
- * free budget model. Paid tiers and one-time session-credit conversations
- * always get a paid aux model (never a ':free' slug).
+ * Auxiliary calls (routing, insights, closing memo) always use a paid aux
+ * model. There is no free plan and no ':free' slug, so nothing may fall back
+ * to one.
  */
 export async function resolveAuxModelForUser(
   moderatorModel: string | null | undefined,
@@ -1730,11 +1721,11 @@ export async function resolveAuxModelForUser(
   conversationId?: number,
 ): Promise<string | null> {
   const model = resolveAuxModel(moderatorModel, firstExpertModel);
-  // No billing context at all (internal call): keep whatever was configured.
-  if (!userId && !conversationId) return model;
+  // No billing context at all (internal call): keep a paid configured model.
+  if (!userId && !conversationId) return model && model.endsWith(":free") ? paidAuxModelFor(model) : model;
   if (await isPaidAuxContext(userId, conversationId)) return paidAuxModelFor(model);
-  if (!model || model.endsWith(":free")) return model;
-  return FREE_TIER_BUDGET_MODEL;
+  if (!model || !model.endsWith(":free")) return model;
+  return paidAuxModelFor(model);
 }
 
 export function resolveAuxModel(
@@ -2098,13 +2089,10 @@ export async function getModeratorNextSpeakerSuggestion(
 }
 
 /**
- * The paid aux model used when the closing memo's own model fails. Free-tier
- * calls already resolved to the free budget model (resolveAuxModelForUser), so
- * they stay there: a paid fallback would be rejected by the tier cap. Paid and
- * session-credit conversations always resolve to a paid model.
+ * The paid aux model used when the closing memo's own model fails. There is no
+ * free plan, so the chain is always paid.
  */
 export function closingSynthesisFallbackModel(closingModel: string): string | null {
-  if (closingModel === FREE_TIER_BUDGET_MODEL) return null;
   if (closingModel === DEFAULT_AUX_MODEL_FALLBACK_SLUG) return null;
   return DEFAULT_AUX_MODEL_FALLBACK_SLUG;
 }

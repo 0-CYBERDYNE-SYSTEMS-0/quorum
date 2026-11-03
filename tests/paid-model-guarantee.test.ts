@@ -9,6 +9,8 @@
  * 4. No paid-tier or session path can resolve to a ':free' model id.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import fs from "fs";
+import path from "path";
 
 const mockFetch = vi.fn();
 global.fetch = mockFetch;
@@ -37,7 +39,6 @@ import {
   BUDGET_FALLBACK_MODEL_FALLBACK,
   DEFAULT_AUX_MODEL_FALLBACK_SLUG,
   DEFAULT_AUX_MODEL_SLUG,
-  FREE_TIER_BUDGET_MODEL,
   budgetFallbackModelsForTier,
   UsageCapError,
 } from "../server/usage-caps";
@@ -66,9 +67,9 @@ describe("paid-tier model fallback", () => {
     expect(BUDGET_FALLBACK_MODEL_FALLBACK.endsWith(":free")).toBe(false);
   });
 
-  it("leaves the free tier on its existing free budget model", () => {
-    expect(FREE_TIER_BUDGET_MODEL).toBe("dots-studio/dots-3-note-preview:free");
-    expect(planningModelsForTier("free")).toEqual([FREE_TIER_BUDGET_MODEL]);
+  it("has no free tier: a legacy 'free' account gets the paid fallback chain", () => {
+    expect(budgetFallbackModelsForTier("free")).toEqual([BUDGET_FALLBACK_MODEL, BUDGET_FALLBACK_MODEL_FALLBACK]);
+    expect(planningModelsForTier("free")).toEqual([DEFAULT_AUX_MODEL_SLUG, DEFAULT_AUX_MODEL_FALLBACK_SLUG]);
   });
 });
 
@@ -119,18 +120,18 @@ describe("helper calls (planning, insights, moderator, closing memo)", () => {
     }
   });
 
-  it("leaves Free-plan helper calls unchanged", async () => {
+  it("keeps a legacy no-plan helper call on a paid model, never a ':free' one", async () => {
     store.getUser.mockResolvedValue({ id: 3, tier: "free" });
     store.getSessionCreditByConversationId.mockResolvedValue(undefined);
-    // A free model stays as configured; a stray paid model is downgraded to the
-    // free budget model so the free tier keeps working.
-    expect(await resolveAuxModelForUser(FREE_SLUG, null, 3, 11)).toBe(FREE_SLUG);
-    expect(await resolveAuxModelForUser("z-ai/glm-5.3-flash", null, 3, 11)).toBe(FREE_TIER_BUDGET_MODEL);
+    // No free plan and no free models: a configured paid model stays, and a
+    // ':free' slug is upgraded to the paid aux model.
+    expect(await resolveAuxModelForUser("z-ai/glm-5.3-flash", null, 3, 11)).toBe("z-ai/glm-5.3-flash");
+    expect(await resolveAuxModelForUser(FREE_SLUG, null, 3, 11)).toBe(DEFAULT_AUX_MODEL_SLUG);
   });
 
   it("keeps the configured model when there is no billing context at all", async () => {
     expect(await resolveAuxModelForUser("z-ai/glm-5.3-flash", null)).toBe("z-ai/glm-5.3-flash");
-    expect(await resolveAuxModelForUser(FREE_SLUG, null)).toBe(FREE_SLUG);
+    expect(await resolveAuxModelForUser(FREE_SLUG, null)).toBe(DEFAULT_AUX_MODEL_SLUG);
     expect(store.getUser).not.toHaveBeenCalled();
     expect(store.getSessionCreditByConversationId).not.toHaveBeenCalled();
   });
@@ -141,10 +142,10 @@ describe("helper calls (planning, insights, moderator, closing memo)", () => {
     // session-credit context.
     const expertContexts = [
       { tier: "pro", context: { paid: true, allowFrontier: false }, allowed: HOUSE_KEY_PAID_MODEL_ALLOWLIST },
-      { tier: "boardroom", context: { paid: true, allowFrontier: true }, allowed: BOARDROOM_FRONTIER_MODEL_ALLOWLIST },
-      { tier: "enterprise", context: { paid: true, allowFrontier: true }, allowed: BOARDROOM_FRONTIER_MODEL_ALLOWLIST },
+      { tier: "boardroom", context: { paid: true, allowFrontier: true }, allowed: [...HOUSE_KEY_PAID_MODEL_ALLOWLIST, ...BOARDROOM_FRONTIER_MODEL_ALLOWLIST] },
+      { tier: "enterprise", context: { paid: true, allowFrontier: true }, allowed: [...HOUSE_KEY_PAID_MODEL_ALLOWLIST, ...BOARDROOM_FRONTIER_MODEL_ALLOWLIST] },
       { tier: "fast-session", context: { paid: true, allowFrontier: false }, allowed: HOUSE_KEY_PAID_MODEL_ALLOWLIST },
-      { tier: "boardroom-session", context: { paid: true, allowFrontier: true }, allowed: BOARDROOM_FRONTIER_MODEL_ALLOWLIST },
+      { tier: "boardroom-session", context: { paid: true, allowFrontier: true }, allowed: [...HOUSE_KEY_PAID_MODEL_ALLOWLIST, ...BOARDROOM_FRONTIER_MODEL_ALLOWLIST] },
     ] as const;
     for (const { context, allowed } of expertContexts) {
       resolved.push(resolveExpertModelForContext(FREE_SLUG, context));
@@ -173,10 +174,9 @@ describe("helper calls (planning, insights, moderator, closing memo)", () => {
     expect(resolved.length).toBeGreaterThan(0);
     expect(resolved.filter(model => model.endsWith(":free"))).toEqual([]);
     expect(budgetFallbackModelsForTier("pro")).toEqual([BUDGET_FALLBACK_MODEL, BUDGET_FALLBACK_MODEL_FALLBACK]);
-    // Closing-memo retry never dials a free slug for paid work.
+    // Closing-memo retry never dials a free slug.
     expect(closingSynthesisFallbackModel(DEFAULT_AUX_MODEL_SLUG)).toBe(DEFAULT_AUX_MODEL_FALLBACK_SLUG);
-    expect(closingSynthesisFallbackModel(FREE_TIER_BUDGET_MODEL)).toBeNull();
-    expect(closingSynthesisFallbackModel(FREE_SLUG).endsWith(":free")).toBe(false);
+    expect(closingSynthesisFallbackModel(FREE_SLUG)).toBe(DEFAULT_AUX_MODEL_FALLBACK_SLUG);
   });
 
   it("uses the paid default whenever the preferred aux model is free", () => {
@@ -240,11 +240,13 @@ describe("provider enforcement for paid and session-credit calls", () => {
     expect(body.model).toBe(resolveExpertModelForContext(FREE_SLUG, { paid: true, allowFrontier: true }));
   });
 
-  it("keeps Free-plan free-model calls unchanged", async () => {
+  it("refuses a no-plan call before the provider is dialed", async () => {
     store.getUser.mockResolvedValue({ id: 3, tier: "free" });
     mockFetch.mockResolvedValue(okResponse(0));
-    await new OpenRouterProvider(null).chat(messages, FREE_SLUG, 3);
-    expect(JSON.parse(mockFetch.mock.calls[0][1].body).model).toBe(FREE_SLUG);
+    const error = await new OpenRouterProvider(null).chat(messages, FREE_SLUG, 3).catch(e => e);
+    expect(error).toBeInstanceOf(UsageCapError);
+    expect(error.denial).toMatchObject({ status: 402, code: "plan_required" });
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it("runs the paid fallback model past the budget and refuses past the ceiling", async () => {
@@ -260,5 +262,25 @@ describe("provider enforcement for paid and session-credit calls", () => {
     expect(error).toBeInstanceOf(UsageCapError);
     expect(error.denial.message).toMatch(/included AI budget/);
     expect(mockFetch).not.toHaveBeenCalled();
+  });
+});
+
+describe("no ':free' model ids in shipped code", () => {
+  function walk(dir: string): string[] {
+    return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) return walk(full);
+      return /\.(ts|tsx|json)$/.test(entry.name) ? [full] : [];
+    });
+  }
+
+  it("contains no ':free' slug under server/ or shared/", () => {
+    const slugPattern = /\b[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._-]*:free\b/gi;
+    const hits = ["server", "shared"].flatMap((root) =>
+      walk(path.join(process.cwd(), root)).flatMap((file) =>
+        (fs.readFileSync(file, "utf8").match(slugPattern) ?? []).map((match) => `${path.relative(process.cwd(), file)}: ${match}`),
+      ),
+    );
+    expect(hits).toEqual([]);
   });
 });

@@ -31,9 +31,10 @@ describe("tool planning", () => {
     expect(prompt).toContain("Prefer filings, regulator data, official statistics, and reputable press");
     expect(prompt).toContain("Use company data, periods, and assumptions exactly as supplied");
   });
-  it("tier caps: free 2, paid up to MAX", () => {
-    expect(toolCallLimitForTier("free")).toBe(2);
+  it("tier caps: every board gets MAX tool calls (no free-tier cap)", () => {
+    expect(toolCallLimitForTier("free")).toBe(MAX_TOOL_CALLS_PER_TURN);
     expect(toolCallLimitForTier("pro")).toBe(MAX_TOOL_CALLS_PER_TURN);
+    expect(toolCallLimitForTier("boardroom")).toBe(MAX_TOOL_CALLS_PER_TURN);
   });
 });
 

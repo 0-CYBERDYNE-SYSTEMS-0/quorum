@@ -218,7 +218,7 @@ export type Artifact = z.infer<typeof artifactSchema>;
 
 // Schemas
 export const insertUserSchema = createInsertSchema(users, {
-  tier: z.enum(["free", "pro", "enterprise"]).optional(),
+  tier: userTierSchema.optional(),
 }).omit({
   id: true,
   stripeCustomerId: true,

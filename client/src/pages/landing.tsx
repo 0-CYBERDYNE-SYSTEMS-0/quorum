@@ -472,17 +472,6 @@ function ShieldIcon({ className, strokeWidth }: { className?: string; strokeWidt
 function Pricing() {
   const plans = [
     {
-      name: PLAN_PRICING.free.name,
-      price: `$${PLAN_PRICING.free.monthlyUsd}`,
-      cadence: "forever",
-      line: PLAN_PRICING.free.tagline,
-      features: PLAN_PRICING.free.features.slice(0, 4),
-      cta: "Start free",
-      href: "/auth?mode=register",
-      featured: false,
-      badge: null as string | null,
-    },
-    {
       name: PLAN_PRICING.pro.name,
       price: `$${PLAN_PRICING.pro.monthlyUsd}`,
       cadence: "per month",
@@ -532,7 +521,7 @@ function Pricing() {
           </p>
         </div>
 
-        <div className="mt-10 grid gap-5 md:grid-cols-2 xl:grid-cols-4">
+        <div className="mt-10 grid gap-5 md:grid-cols-3">
           {plans.map((plan) => (
             <div
               key={plan.name}

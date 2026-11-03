@@ -1,12 +1,11 @@
 /**
  * Core tools every board director can use (web search, page fetch,
  * deliverables, sourced charts). Works with any chat model via a small text
- * protocol, so free OpenRouter models and local Ollama models both qualify.
+ * protocol, so paid OpenRouter models and local Ollama models both qualify.
  *
  * Cost controls: one planning call per turn, at most MAX_TOOL_CALLS_PER_TURN
- * tool executions (fewer on Free), no paid search API required. Search uses
- * DuckDuckGo's HTML endpoint ($0); if it fails the expert answers without
- * sources and says so.
+ * tool executions, no paid search API required. Search uses DuckDuckGo's HTML
+ * endpoint ($0); if it fails the expert answers without sources and says so.
  */
 import fs from "fs";
 import path from "path";
@@ -26,8 +25,8 @@ export type ToolCall = { tool: "search"; query: string } | { tool: "fetch"; url:
 export type ToolSource = { id: string; title: string; url: string; snippet: string };
 export type ToolRun = { calls: ToolCall[]; sources: ToolSource[]; notes: string[] };
 
-export function toolCallLimitForTier(tier: string | null | undefined): number {
-  return tier === "free" || !tier ? 2 : MAX_TOOL_CALLS_PER_TURN;
+export function toolCallLimitForTier(_tier: string | null | undefined): number {
+  return MAX_TOOL_CALLS_PER_TURN;
 }
 
 /** Prompt for the cheap pre-answer planning call. */

@@ -4,22 +4,22 @@
     {
       "name": "Chief Strategy Officer",
       "role": "Chief Strategy Officer",
-      "model": "poolside/laguna-s-2.1:free"
+      "model": "deepseek/deepseek-v4.1-flash"
     },
     {
       "name": "Chief Financial Officer",
       "role": "Chief Financial Officer",
-      "model": "poolside/laguna-s-2.1:free"
+      "model": "deepseek/deepseek-v4.1-flash"
     },
     {
       "name": "Chief Revenue Officer",
       "role": "Chief Revenue Officer",
-      "model": "poolside/laguna-s-2.1:free"
+      "model": "deepseek/deepseek-v4.1-flash"
     },
     {
       "name": "General Counsel",
       "role": "General Counsel",
-      "model": "poolside/laguna-s-2.1:free"
+      "model": "deepseek/deepseek-v4.1-flash"
     }
   ]
 }

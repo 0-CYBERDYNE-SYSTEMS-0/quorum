@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link, Redirect } from "wouter";
+import { Link, Redirect, useLocation } from "wouter";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowUpRight,
@@ -22,7 +22,7 @@ import { useBoardRoom } from "@/hooks/use-board-room";
 import { useTheme } from "@/lib/theme";
 import { apiRequest, getQueryFn } from "@/lib/queryClient";
 import { EXPERT_CATALOG, TIER_EXPERT_LIMITS, resolveExpertModelForContext } from "@shared/expert-catalog";
-import { SESSION_PRICING } from "@shared/pricing";
+import { SESSION_PRICING, PLAN_PRICING, hasPaidPlan } from "@shared/pricing";
 import { effectiveModelTier } from "@/lib/model-options";
 import type { TierStatus } from "@/components/board/plan-card";
 import { BoardModal } from "@/components/board/board-modal";
@@ -41,16 +41,74 @@ function EmptyBoard({
   onConvene,
   isCreating,
   credits,
+  planActive,
+  planName,
 }: {
   onConvene: (decision: string, presetId: string, sessionCreditKind?: "fast" | "boardroom") => Promise<void>;
   isCreating: boolean;
-  /** A Free Chair holding credits chooses a session board explicitly. */
+  /** Session credits the Chair may spend explicitly. */
   credits?: { fast: number; boardroom: number };
+  /** A paid plan can open an included board; no plan needs a session credit. */
+  planActive: boolean;
+  planName?: string;
 }) {
   const [decision, setDecision] = useState("");
   const [presetId, setPresetId] = useState("full");
-  const [sessionKind, setSessionKind] = useState<"free" | "fast" | "boardroom">("free");
+  const [sessionKind, setSessionKind] = useState<"plan" | "fast" | "boardroom">(planActive ? "plan" : "boardroom");
   const hasCredits = Boolean(credits && (credits.fast > 0 || credits.boardroom > 0));
+
+  useEffect(() => {
+    if (!planActive && sessionKind === "plan") {
+      setSessionKind(credits?.boardroom ? "boardroom" : "fast");
+    }
+    if (sessionKind === "boardroom" && !credits?.boardroom) {
+      setSessionKind(planActive ? "plan" : "fast");
+    }
+    if (sessionKind === "fast" && !credits?.fast) {
+      setSessionKind(planActive ? "plan" : "boardroom");
+    }
+  }, [planActive, credits?.boardroom, credits?.fast, sessionKind]);
+
+  // No plan and no credit: there is no board to open. Send the Chair to the
+  // pricing page, which lists Pro, Boardroom, and both session options.
+  if (!planActive && !hasCredits) {
+    return (
+      <div className="mx-auto flex w-full max-w-[720px] flex-1 flex-col justify-center px-6 py-16">
+        <div className="animate-fade-up">
+          <p className="eyebrow flex items-center gap-2">
+            <span className="h-1.5 w-1.5 rounded-full bg-bronze" /> No plan
+          </p>
+          <h1 className="mt-4 max-w-[560px] font-display text-[clamp(2.1rem,4vw,3.2rem)] leading-[1.05] text-ink">
+            Seat a board with a plan or a session.
+          </h1>
+          <p className="mt-3 max-w-[520px] text-[14px] leading-relaxed text-muted-ink">
+            Executive and Boardroom open boards every month. A one-time session opens a single
+            board without a subscription.
+          </p>
+          <div className="mt-7 grid gap-2 sm:grid-cols-2">
+            {[
+              { label: "Executive", detail: `$${PLAN_PRICING.pro.monthlyUsd}/mo · 8 directors · fast models` },
+              { label: "Boardroom", detail: `$${PLAN_PRICING.boardroom.monthlyUsd}/mo · 12 directors · frontier models` },
+              { label: "Single Session", detail: `$${SESSION_PRICING.fast.priceUsd} once · 5 directors · fast models` },
+              { label: "Boardroom Session", detail: `$${SESSION_PRICING.boardroom.priceUsd} once · 8 directors · frontier models` },
+            ].map((option) => (
+              <div key={option.label} className="rounded-lg border border-line bg-surface/60 p-3">
+                <p className="text-[12.5px] font-medium text-ink">{option.label}</p>
+                <p className="mt-0.5 text-[11px] leading-relaxed text-muted-ink">{option.detail}</p>
+              </div>
+            ))}
+          </div>
+          <Link href="/subscribe">
+            <Btn variant="bronze" size="md" className="mt-6">
+              See plans and sessions
+            </Btn>
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  const activeKind: "fast" | "boardroom" | undefined = sessionKind === "plan" ? undefined : sessionKind;
 
   return (
     <div className="mx-auto flex w-full max-w-[860px] flex-1 flex-col justify-center px-6 py-16">
@@ -74,21 +132,23 @@ function EmptyBoard({
             placeholder="State the decision in one or two sentences. Add the guardrails that constrain it, and the facts the board should not have to guess."
             className="min-h-[104px] border-0 bg-transparent px-2 py-1 font-display text-[17px] leading-relaxed shadow-none focus:ring-0"
           />
-          {hasCredits && (
+          {(planActive || hasCredits) && (
             <div className="mt-2 border-t border-line px-2 pb-1 pt-3">
               <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-faint-ink">Board type</p>
               <div className="mt-1.5 flex flex-wrap gap-1.5">
-                <button
-                  type="button"
-                  onClick={() => setSessionKind("free")}
-                  className={cn(
-                    "rounded-full border px-2.5 py-1 text-[10.5px]",
-                    sessionKind === "free" ? "border-bronze bg-bronze-wash/60 text-ink" : "border-line text-muted-ink hover:border-line-strong",
-                  )}
-                >
-                  Free board · keeps your credit
-                </button>
-                {credits!.fast > 0 && (
+                {planActive && (
+                  <button
+                    type="button"
+                    onClick={() => setSessionKind("plan")}
+                    className={cn(
+                      "rounded-full border px-2.5 py-1 text-[10.5px]",
+                      sessionKind === "plan" ? "border-bronze bg-bronze-wash/60 text-ink" : "border-line text-muted-ink hover:border-line-strong",
+                    )}
+                  >
+                    {planName ?? "Plan"} board · included
+                  </button>
+                )}
+                {credits?.fast ? (
                   <button
                     type="button"
                     onClick={() => setSessionKind("fast")}
@@ -97,10 +157,10 @@ function EmptyBoard({
                       sessionKind === "fast" ? "border-bronze bg-bronze-wash/60 text-ink" : "border-line text-muted-ink hover:border-line-strong",
                     )}
                   >
-                    ${SESSION_PRICING.fast.priceUsd} session · fast models ({credits!.fast})
+                    ${SESSION_PRICING.fast.priceUsd} session · fast models ({credits.fast})
                   </button>
-                )}
-                {credits!.boardroom > 0 && (
+                ) : null}
+                {credits?.boardroom ? (
                   <button
                     type="button"
                     onClick={() => setSessionKind("boardroom")}
@@ -109,9 +169,9 @@ function EmptyBoard({
                       sessionKind === "boardroom" ? "border-bronze bg-bronze-wash/60 text-ink" : "border-line text-muted-ink hover:border-line-strong",
                     )}
                   >
-                    ${SESSION_PRICING.boardroom.priceUsd} session · frontier models ({credits!.boardroom})
+                    ${SESSION_PRICING.boardroom.priceUsd} session · frontier models ({credits.boardroom})
                   </button>
-                )}
+                ) : null}
               </div>
             </div>
           )}
@@ -122,8 +182,8 @@ function EmptyBoard({
             <Btn
               variant="bronze"
               size="md"
-              onClick={() => onConvene(decision, presetId, sessionKind === "free" ? undefined : sessionKind)}
-              disabled={!decision.trim() || isCreating}
+              onClick={() => onConvene(decision, presetId, activeKind)}
+              disabled={!decision.trim() || isCreating || (!planActive && !activeKind)}
             >
               {isCreating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
               Convene board
@@ -135,11 +195,11 @@ function EmptyBoard({
           <div className="flex items-center justify-between">
             <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-faint-ink">Choose a starting board</p>
             <div className="flex items-center gap-3">
-              <span className="hidden text-[10px] text-faint-ink sm:inline">Associate seats 3 · Executive 8</span>
+              <span className="hidden text-[10px] text-faint-ink sm:inline">Executive seats 8 · Boardroom 12</span>
               <button
                 type="button"
-                onClick={() => onConvene(decision, "empty", sessionKind === "free" ? undefined : sessionKind)}
-                disabled={!decision.trim() || isCreating}
+                onClick={() => onConvene(decision, "empty", activeKind)}
+                disabled={!decision.trim() || isCreating || (!planActive && !activeKind)}
                 className="text-[10.5px] text-faint-ink hover:text-ink disabled:opacity-40"
               >
                 Seat them manually →
@@ -173,7 +233,7 @@ function EmptyBoard({
           <span>Private workspace</span>
           <span>Your model keys</span>
           <span>Export always</span>
-          <span className="ml-auto normal-case tracking-normal">Three seats on the house, no card.</span>
+          <span className="ml-auto normal-case tracking-normal">Plans include a monthly AI budget.</span>
         </div>
       </div>
     </div>
@@ -344,6 +404,7 @@ function CommandPalette({
 export default function WorkspacePage() {
   const { user, isLoading, logoutMutation } = useAuth();
   const { toast } = useToast();
+  const [, navigate] = useLocation();
   const board = useBoardRoom();
   const { theme, setTheme } = useTheme();
   const queryClient = useQueryClient();
@@ -365,21 +426,42 @@ export default function WorkspacePage() {
     queryFn: getQueryFn({ on401: "returnNull" }),
   });
   const availableCredits = tierStatus?.sessionCredits;
-  const freeCredits = user?.tier === "free" && availableCredits && availableCredits.available > 0
-    ? { fast: availableCredits.fast, boardroom: availableCredits.boardroom }
+  const planActive = hasPaidPlan(user?.tier) || Boolean(tierStatus?.hasPlan);
+  const planName =
+    user?.tier === "boardroom" ? "Boardroom"
+    : user?.tier === "enterprise" ? "Enterprise"
+    : user?.tier === "pro" ? "Executive"
     : undefined;
+  // Boardroom and Enterprise include every session type, so session credits are
+  // hidden there (and the server refuses to sell them). Pro sees the $15
+  // Boardroom Session only; a no-plan account may hold either session.
+  const sessionCredits = (() => {
+    if (!availableCredits || availableCredits.available <= 0) return undefined;
+    if (user?.tier === "boardroom" || user?.tier === "enterprise") return undefined;
+    // Pro sees only the $15 Boardroom Session; a no-plan account may hold both.
+    const counts = {
+      fast: user?.tier === "pro" ? 0 : availableCredits.fast,
+      boardroom: availableCredits.boardroom,
+    };
+    return counts.fast + counts.boardroom > 0 ? counts : undefined;
+  })();
 
-  // A Free Chair with credits picks the board explicitly; an ordinary "new
-  // session" never spends a credit on its own.
+  // A Chair with no plan and no credit goes to pricing. A Chair holding a
+  // credit picks the session explicitly; an ordinary "new session" never
+  // spends a credit on its own.
   const requestNewSession = useCallback(() => {
-    if (freeCredits) {
+    if (!planActive && !sessionCredits) {
+      navigate("/subscribe");
+      return;
+    }
+    if (sessionCredits) {
       setCreditPromptOpen(true);
       return;
     }
     void board.startSession().catch(() => undefined);
-  }, [board, freeCredits]);
+  }, [board, planActive, sessionCredits, navigate]);
 
-  const startWithCredit = async (kind?: "fast" | "boardroom") => {
+  const startWithCredit = async (kind: "fast" | "boardroom") => {
     setCreditPromptOpen(false);
     try {
       await board.startSession(undefined, kind);
@@ -452,8 +534,8 @@ export default function WorkspacePage() {
       const creditKind = (conversation as { sessionCreditKind?: "fast" | "boardroom" | null }).sessionCreditKind;
       const creditSeatLimit = creditKind ? SESSION_PRICING[creditKind].maxExperts : undefined;
       const seatLimit = creditSeatLimit
-        ?? TIER_EXPERT_LIMITS[(user?.tier as keyof typeof TIER_EXPERT_LIMITS) ?? "free"]
-        ?? TIER_EXPERT_LIMITS.free;
+        ?? TIER_EXPERT_LIMITS[(user?.tier as keyof typeof TIER_EXPERT_LIMITS)]
+        ?? 0;
       const modelTier = effectiveModelTier(user?.tier, creditKind);
       const modelContext = {
         paid: modelTier !== "free",
@@ -682,7 +764,13 @@ export default function WorkspacePage() {
           <section className="flex min-w-0 flex-1 flex-col">
             <div ref={scroller} className="min-h-0 flex-1 overflow-y-auto">
               {!board.activeConversation ? (
-                <EmptyBoard onConvene={convene} isCreating={convening || board.isCreatingSession} credits={freeCredits} />
+                <EmptyBoard
+                  onConvene={convene}
+                  isCreating={convening || board.isCreatingSession}
+                  credits={sessionCredits}
+                  planActive={planActive}
+                  planName={planName}
+                />
               ) : (
                 <div className="mx-auto w-full max-w-[780px] px-5 sm:px-8">
                   <SessionIntro
@@ -764,7 +852,7 @@ export default function WorkspacePage() {
         open={boardOpen}
         onOpenChange={setBoardOpen}
         experts={board.experts}
-        tier={user.tier ?? "free"}
+        tier={user.tier ?? ""}
         creditKind={activeCreditKind}
         seatLimit={
           activeCreditKind ? SESSION_PRICING[activeCreditKind].maxExperts : undefined
@@ -776,8 +864,8 @@ export default function WorkspacePage() {
       <Modal
         open={creditPromptOpen}
         onOpenChange={setCreditPromptOpen}
-        title="Choose your board"
-        description="A session credit is only spent when you choose that session. Starting a Free board keeps every credit."
+        title="Start with a session credit"
+        description="A session credit is spent only when you choose that board session. An included plan board never spends one."
         footer={
           <Btn variant="ghost" size="sm" onClick={() => setCreditPromptOpen(false)}>
             Cancel
@@ -785,38 +873,28 @@ export default function WorkspacePage() {
         }
       >
         <div className="space-y-2">
-          <button
-            type="button"
-            onClick={() => void startWithCredit()}
-            className="w-full rounded-lg border border-line bg-surface px-3 py-3 text-left transition-colors hover:border-line-strong"
-          >
-            <span className="block text-[12.5px] font-medium text-ink">Free board</span>
-            <span className="mt-0.5 block text-[11px] text-muted-ink">
-              Up to 3 directors on free models. Keeps your {availableCredits?.available ?? 0} credit{(availableCredits?.available ?? 0) === 1 ? "" : "s"}.
-            </span>
-          </button>
-          {freeCredits?.fast ? (
+          {sessionCredits?.fast ? (
             <button
               type="button"
               onClick={() => void startWithCredit("fast")}
               className="w-full rounded-lg border border-bronze/40 bg-bronze-wash/40 px-3 py-3 text-left transition-colors hover:border-bronze"
             >
               <span className="block text-[12.5px] font-medium text-ink">
-                ${SESSION_PRICING.fast.priceUsd} Single Session · {freeCredits.fast} available
+                ${SESSION_PRICING.fast.priceUsd} Single Session · {sessionCredits.fast} available
               </span>
               <span className="mt-0.5 block text-[11px] text-muted-ink">
                 One roundtable, up to {SESSION_PRICING.fast.maxExperts} directors, fast paid models, {SESSION_PRICING.fast.maxMessages} chair briefs.
               </span>
             </button>
           ) : null}
-          {freeCredits?.boardroom ? (
+          {sessionCredits?.boardroom ? (
             <button
               type="button"
               onClick={() => void startWithCredit("boardroom")}
               className="w-full rounded-lg border border-bronze/40 bg-bronze-wash/40 px-3 py-3 text-left transition-colors hover:border-bronze"
             >
               <span className="block text-[12.5px] font-medium text-ink">
-                ${SESSION_PRICING.boardroom.priceUsd} Boardroom Session · {freeCredits.boardroom} available
+                ${SESSION_PRICING.boardroom.priceUsd} Boardroom Session · {sessionCredits.boardroom} available
               </span>
               <span className="mt-0.5 block text-[11px] text-muted-ink">
                 One roundtable, up to {SESSION_PRICING.boardroom.maxExperts} directors, frontier models, {SESSION_PRICING.boardroom.maxMessages} chair briefs.

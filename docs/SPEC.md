@@ -48,7 +48,8 @@ Presets (client-side): Growth Board, Capital Board, Operating Board, Full Board.
 
 ## Tiers
 
-- Associate (free): 3 seats, 100 chair briefs/mo, free models on the house key.
+- No free plan. A stored tier of `free` (legacy rows) means no plan: it cannot
+  open or run a board unless it holds a one-time session credit.
 - Executive / Pro: 8 seats, 1,000 briefs/mo, fast paid models, $8/mo AI budget,
   bring-your-own OpenRouter key. $29/mo or $290/yr.
 - Boardroom: 12 seats, 3,000 briefs/mo, fast + frontier models, $35/mo AI budget.
@@ -57,7 +58,7 @@ Presets (client-side): Growth Board, Capital Board, Operating Board, Full Board.
   (8 seats, frontier models); 25 chair briefs and a $1/$4 AI cap per conversation.
 - Enterprise: unlimited seats, SSO/audit, self-host or dedicated.
 
-Internal tier keys are `free | pro | boardroom | enterprise`. Prices live in
+Internal tier keys are `pro | boardroom | enterprise`, plus the legacy stored value `free` (no plan). Prices live in
 `shared/pricing.ts`; Stripe price ids come only from the environment.
 
 ## API contract (frozen for the client)

@@ -64,6 +64,8 @@ import {
 } from "../server/billing-plans";
 import { resolveExpertModelForContext } from "../shared/expert-catalog";
 import { BOARDROOM_FRONTIER_MODEL_ALLOWLIST, HOUSE_KEY_PAID_MODEL_ALLOWLIST } from "../shared/models";
+import { purchasableSessionKinds } from "../shared/pricing";
+import { storage } from "../server/storage";
 
 let app: Express;
 
@@ -83,10 +85,11 @@ beforeEach(() => {
   mockConstructEvent.mockReset();
 });
 
-async function registerUser(username: string) {
+async function registerUser(username: string, tier?: "pro" | "boardroom") {
   const agent = request.agent(app);
   const res = await agent.post("/api/register").send({ username, password: "pass12345", email: `${username}@example.com` });
   expect(res.status).toBe(201);
+  if (tier) await storage.updateUserTier(res.body.id, tier);
   return { agent, userId: res.body.id as number };
 }
 
@@ -349,21 +352,42 @@ describe("pricing v1: webhook", () => {
   });
 });
 
-describe("pricing v1: session credit conversations", () => {
-  it("does not spend a held credit on an ordinary Free board", async () => {
+describe("pricing v1: no free plan", () => {
+  it("blocks a no-plan account from opening a board server-side", async () => {
+    const { agent } = await registerUser("no_plan_create");
+    const res = await agent.post("/api/protected/conversations").send({ title: "No plan" });
+    expect(res.status).toBe(402);
+    expect(res.body.code).toBe("plan_required");
+    expect(res.body.upgradeUrl).toBe("/subscribe");
+    expect((await agent.get("/api/user/tier")).body.hasPlan).toBe(false);
+  });
+
+  it("blocks a no-plan account from running an existing (legacy) board", async () => {
+    const { agent, userId } = await registerUser("no_plan_run");
+    // A board created before the plan change still belongs to the account, but
+    // it cannot run without a plan or a credit.
+    const legacy = await storage.createConversation({ userId, title: "Legacy board" });
+    const res = await agent.post(`/api/protected/conversations/${legacy.id}/messages`).send({ content: "Run it" });
+    expect(res.status).toBe(402);
+    expect(res.body.code).toBe("plan_required");
+  });
+
+  it("keeps a held credit opt-in and lets it open exactly one board", async () => {
     const { agent, userId } = await registerUser("credit_optin");
     await webhookEvent({
       type: "checkout.session.completed",
       data: { object: { id: "cs_optin", mode: "payment", payment_status: "paid", customer: "cus_optin", metadata: { userId: String(userId), sessionKind: "boardroom" } } },
     });
 
-    const freeBoard = await agent.post("/api/protected/conversations").send({ title: "Free board" });
-    expect(freeBoard.status).toBe(201);
-    expect(freeBoard.body.sessionCreditKind).toBeNull();
+    // Holding a credit does not open an ordinary board (spending is opt-in).
+    const ordinary = await agent.post("/api/protected/conversations").send({ title: "Ordinary board" });
+    expect(ordinary.status).toBe(402);
+    expect(ordinary.body.code).toBe("plan_required");
     expect((await agent.get("/api/user/tier")).body.sessionCredits).toMatchObject({ available: 1, boardroom: 1 });
 
     // Choosing the session board spends exactly that credit.
     const credited = await agent.post("/api/protected/conversations").send({ title: "Chosen", sessionCreditKind: "boardroom" });
+    expect(credited.status).toBe(201);
     expect(credited.body.sessionCreditKind).toBe("boardroom");
     expect((await agent.get("/api/user/tier")).body.sessionCredits).toMatchObject({ available: 0, used: 1 });
   });
@@ -386,8 +410,8 @@ describe("pricing v1: session credit conversations", () => {
     expect(first.status).toBe(201);
     expect(first.body.sessionCreditKind).toBe("fast");
 
-    // Fast credit allows five seats (the Free plan alone allows three). A
-    // ':free' model request is rewritten to the credit's paid default.
+    // Fast credit allows five seats. A ':free' model request is rewritten to
+    // the credit's paid default.
     for (let seat = 1; seat <= 5; seat += 1) {
       const added = await agent.post(`/api/protected/conversations/${first.body.id}/experts`).send({
         name: `Director ${seat}`,
@@ -405,24 +429,24 @@ describe("pricing v1: session credit conversations", () => {
     expect(sixth.status).toBe(403);
     expect(sixth.body).toMatchObject({ code: "TIER_LIMIT_EXPERTS", limit: 5 });
 
-    // The credit is spent: the next conversation is back on the Free plan.
-    const second = await agent.post("/api/protected/conversations").send({ title: "Free again" });
-    expect(second.body.sessionCreditKind).toBeNull();
+    // The credit is spent: the next ordinary conversation needs a plan.
+    const second = await agent.post("/api/protected/conversations").send({ title: "No plan again" });
+    expect(second.status).toBe(402);
+    expect(second.body.code).toBe("plan_required");
     const tier = await agent.get("/api/user/tier");
     expect(tier.body.sessionCredits).toMatchObject({ available: 0, used: 1 });
   });
 
   it("gates frontier models for Pro but allows them on a Boardroom credit", async () => {
-    const { agent, userId } = await registerUser("credit_frontier");
-    // Free plan, no credit: paid model is rejected.
-    const freeConv = await agent.post("/api/protected/conversations").send({ title: "Free" });
-    const denied = await agent.post(`/api/protected/conversations/${freeConv.body.id}/experts`).send({
+    const { agent, userId } = await registerUser("credit_frontier", "pro");
+    const proConv = await agent.post("/api/protected/conversations").send({ title: "Pro board" });
+    const denied = await agent.post(`/api/protected/conversations/${proConv.body.id}/experts`).send({
       name: "Frontier",
       role: "Frontier seat",
       model: "anthropic/claude-opus-5.5",
     });
     expect(denied.status).toBe(402);
-    expect(denied.body.code).toBe("paid_model_requires_pro");
+    expect(denied.body.code).toBe("boardroom_model_required");
 
     // A Boardroom Session credit unlocks frontier models for its conversation.
     await webhookEvent({
@@ -440,9 +464,44 @@ describe("pricing v1: session credit conversations", () => {
   });
 });
 
+describe("pricing v1: session credit visibility and purchases", () => {
+  it("returns only the sessions each plan can actually spend", () => {
+    expect(purchasableSessionKinds("free")).toEqual(["fast", "boardroom"]);
+    expect(purchasableSessionKinds(null)).toEqual(["fast", "boardroom"]);
+    expect(purchasableSessionKinds("pro")).toEqual(["boardroom"]);
+    expect(purchasableSessionKinds("boardroom")).toEqual([]);
+    expect(purchasableSessionKinds("enterprise")).toEqual([]);
+  });
+
+  it("exposes those rules on /api/user/tier", async () => {
+    const free = await registerUser("credits_free");
+    expect((await free.agent.get("/api/user/tier")).body.purchasableSessions).toEqual(["fast", "boardroom"]);
+    const pro = await registerUser("credits_pro", "pro");
+    expect((await pro.agent.get("/api/user/tier")).body.purchasableSessions).toEqual(["boardroom"]);
+    const boardroom = await registerUser("credits_boardroom", "boardroom");
+    const status = (await boardroom.agent.get("/api/user/tier")).body;
+    expect(status.purchasableSessions).toEqual([]);
+  });
+
+  it("rejects a credit the account can never spend", async () => {
+    const pro = await registerUser("credit_pro_fast", "pro");
+    const fast = await pro.agent.post("/api/create-checkout-session").send({ session: "fast" });
+    expect(fast.status).toBe(400);
+    expect(fast.body.code).toBe("SESSION_NOT_AVAILABLE");
+    const boardroomSession = await pro.agent.post("/api/create-checkout-session").send({ session: "boardroom" });
+    expect(boardroomSession.status).toBe(200);
+    expect(boardroomSession.body).toMatchObject({ mode: "payment", sessionKind: "boardroom" });
+
+    const boardroom = await registerUser("credit_boardroom_none", "boardroom");
+    const anySession = await boardroom.agent.post("/api/create-checkout-session").send({ session: "boardroom" });
+    expect(anySession.status).toBe(400);
+    expect(anySession.body.code).toBe("SESSION_NOT_AVAILABLE");
+  });
+});
+
 describe("pricing v1: paid expert model defaults", () => {
   it("rewrites a free seat on Pro and Boardroom, on create and update", async () => {
-    const { agent, userId } = await registerUser("expert_models");
+    const { agent, userId } = await registerUser("expert_models", "pro");
     await webhookEvent({
       type: "checkout.session.completed",
       data: { object: { id: "cs_models_pro", mode: "subscription", payment_status: "paid", customer: "cus_models", subscription: "sub_models", metadata: { userId: String(userId), plan: "pro" } } },
@@ -478,6 +537,28 @@ describe("pricing v1: paid expert model defaults", () => {
     expect(brSeat.status).toBe(201);
     expect(BOARDROOM_FRONTIER_MODEL_ALLOWLIST as readonly string[]).toContain(brSeat.body.model);
     expect(brSeat.body.model).toBe(resolveExpertModelForContext("poolside/laguna-s-2.1:free", { paid: true, allowFrontier: true }));
+  });
+
+  it("persists a model change on an already-seated director", async () => {
+    const { agent } = await registerUser("seat_model_change", "pro");
+    const conv = await agent.post("/api/protected/conversations").send({ title: "Model change" });
+    const seat = await agent.post(`/api/protected/conversations/${conv.body.id}/experts`).send({
+      name: "Chief Strategy Officer",
+      role: "Chief Strategy Officer",
+      model: "deepseek/deepseek-v4.1-flash",
+    });
+    expect(seat.status).toBe(201);
+    expect(seat.body.model).toBe("deepseek/deepseek-v4.1-flash");
+
+    const patched = await agent.patch(`/api/experts/${seat.body.id}`).send({ model: "z-ai/glm-5.3-flash" });
+    expect(patched.status).toBe(200);
+    expect(patched.body.model).toBe("z-ai/glm-5.3-flash");
+
+    // Re-reading the board (what the Chair sees after reopening the modal)
+    // returns the newly chosen model, not the original seat.
+    const seated = await agent.get(`/api/protected/conversations/${conv.body.id}/experts`);
+    expect(seated.status).toBe(200);
+    expect(seated.body.find((expert: { id: number }) => expert.id === seat.body.id).model).toBe("z-ai/glm-5.3-flash");
   });
 });
 

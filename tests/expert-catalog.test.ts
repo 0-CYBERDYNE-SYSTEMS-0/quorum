@@ -4,7 +4,6 @@ import {
   EXPERT_CATALOG,
   FAST_PAID_DEFAULT_EXPERT_MODEL,
   FRONTIER_DEFAULT_EXPERT_MODEL,
-  FREE_DEFAULT_EXPERT_MODEL,
   catalogAvatar,
   defaultExpertModelForTier,
   findCatalogExpert,
@@ -32,7 +31,8 @@ describe("board expert catalog", () => {
       expect(expert.rolePrompt, expert.role).toMatch(/\b(Own|Advis|Frame|Surface|Maintain|Evaluate)\b/);
       expect(expert.rolePrompt, expert.role).toMatch(/\b(demand|prefer|prioritize)\b/i);
       expect(expert.rolePrompt, expert.role).toMatch(/\bHand\b/);
-      expect(expert.defaultModel.endsWith(":free"), expert.role).toBe(true);
+      expect(expert.defaultModel.endsWith(":free"), expert.role).toBe(false);
+      expect(HOUSE_KEY_PAID_MODEL_ALLOWLIST as readonly string[], expert.role).toContain(expert.defaultModel);
     }
   });
 
@@ -64,15 +64,16 @@ describe("board expert catalog", () => {
     expect(catalogAvatar("Board Observer")).toContain(encodeURIComponent("🧑‍💼"));
   });
 
-  it("UI tier copy matches server tiers", () => {
-    expect(TIER_EXPERT_LIMITS.free).toBe(TIERS.free.maxExperts);
+  it("UI tier copy matches server tiers and has no free entry", () => {
+    expect(TIER_EXPERT_LIMITS).not.toHaveProperty("free");
     expect(TIER_EXPERT_LIMITS.pro).toBe(TIERS.pro.maxExperts);
+    expect(TIER_EXPERT_LIMITS.boardroom).toBe(TIERS.boardroom.maxExperts);
+    expect(TIER_EXPERT_LIMITS.enterprise).toBe(TIERS.enterprise.maxExperts);
   });
 
   it("defaults every paid and session board seat to a paid model in its allowlist", () => {
-    // Free keeps its existing free slug.
-    expect(FREE_DEFAULT_EXPERT_MODEL).toBe("poolside/laguna-s-2.1:free");
-    expect(defaultExpertModelForTier("free")).toBe(FREE_DEFAULT_EXPERT_MODEL);
+    // A legacy no-plan row still resolves to a paid default (never a free slug).
+    expect(defaultExpertModelForTier("free")).toBe(FAST_PAID_DEFAULT_EXPERT_MODEL);
 
     expect(defaultExpertModelForTier("pro")).toBe(FAST_PAID_DEFAULT_EXPERT_MODEL);
     expect(defaultExpertModelForTier("boardroom")).toBe(FRONTIER_DEFAULT_EXPERT_MODEL);
@@ -88,8 +89,8 @@ describe("board expert catalog", () => {
     const contexts = [
       { name: "pro", context: { paid: true, allowFrontier: false }, allowed: HOUSE_KEY_PAID_MODEL_ALLOWLIST },
       { name: "$5 fast session", context: { paid: true, allowFrontier: false }, allowed: HOUSE_KEY_PAID_MODEL_ALLOWLIST },
-      { name: "boardroom", context: { paid: true, allowFrontier: true }, allowed: BOARDROOM_FRONTIER_MODEL_ALLOWLIST },
-      { name: "$15 boardroom session", context: { paid: true, allowFrontier: true }, allowed: BOARDROOM_FRONTIER_MODEL_ALLOWLIST },
+      { name: "boardroom", context: { paid: true, allowFrontier: true }, allowed: [...HOUSE_KEY_PAID_MODEL_ALLOWLIST, ...BOARDROOM_FRONTIER_MODEL_ALLOWLIST] },
+      { name: "$15 boardroom session", context: { paid: true, allowFrontier: true }, allowed: [...HOUSE_KEY_PAID_MODEL_ALLOWLIST, ...BOARDROOM_FRONTIER_MODEL_ALLOWLIST] },
     ] as const;
     for (const { name, context, allowed } of contexts) {
       for (const expert of EXPERT_CATALOG) {
@@ -100,8 +101,10 @@ describe("board expert catalog", () => {
       expect(resolveExpertModelForContext("google/gemma-4-31b-it:free", context).endsWith(":free")).toBe(false);
     }
 
-    // Free board behaviour is unchanged.
-    expect(resolveExpertModelForContext(FREE_DEFAULT_EXPERT_MODEL, { paid: false, allowFrontier: false }))
-      .toBe(FREE_DEFAULT_EXPERT_MODEL);
+    // A no-plan / legacy context resolves to a paid default too.
+    expect(resolveExpertModelForContext("google/gemma-4-31b-it:free", { paid: false, allowFrontier: false }))
+      .toBe(FAST_PAID_DEFAULT_EXPERT_MODEL);
+    expect(resolveExpertModelForContext(null, { paid: false, allowFrontier: false }))
+      .toBe(FAST_PAID_DEFAULT_EXPERT_MODEL);
   });
 });

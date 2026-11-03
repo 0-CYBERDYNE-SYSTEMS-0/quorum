@@ -4,13 +4,12 @@ import { PLAN_PRICING, SESSION_PRICING, type PlanKey, type SessionKind } from "@
  * Enforced plan limits. Displayed amounts live in shared/pricing.ts; the
  * expert/message caps are mirrored from the same table so UI copy and the
  * gates can never disagree.
+ *
+ * Quorum has no free plan. There is no `free` entry: a stored tier of "free"
+ * (or anything unknown) is a legacy "no plan" account, which may not open a
+ * board except through a one-time session credit.
  */
 export const TIERS = {
-  free: {
-    ...PLAN_PRICING.free,
-    allowPaidModels: false,
-    allowFrontierModels: false,
-  },
   pro: {
     ...PLAN_PRICING.pro,
     allowPaidModels: true,
@@ -38,6 +37,16 @@ export const TIERS = {
 
 export type TierKey = keyof typeof TIERS;
 
+/** Limits for an account with no active plan: it cannot open or run a board. */
+export const NO_PLAN_LIMITS = {
+  name: "No plan",
+  shortName: "No plan",
+  maxExperts: 0,
+  maxMessages: 0,
+  allowPaidModels: false,
+  allowFrontierModels: false,
+} as const;
+
 export type TierLimits = {
   maxExperts: number;
   maxMessages: number;
@@ -51,13 +60,22 @@ export type TierLimits = {
 
 export function getTierLimits(tier: string): TierLimits {
   const key = tier as TierKey;
-  const t = TIERS[key] ?? TIERS.free;
-  return { ...t } as TierLimits;
+  const t = TIERS[key];
+  if (t) return { ...t } as TierLimits;
+  return { ...NO_PLAN_LIMITS };
 }
 
 export function isKnownTier(tier: string | null | undefined): tier is PlanKey | "enterprise" {
-  return tier === "free" || tier === "pro" || tier === "boardroom" || tier === "enterprise";
+  return tier === "pro" || tier === "boardroom" || tier === "enterprise";
 }
+
+/** A board may only be created or run by a paid plan or a session credit. */
+export const PLAN_REQUIRED_DENIAL = {
+  status: 402 as const,
+  code: "plan_required",
+  message: "Choose Pro or Boardroom to open a board, or buy a one-time $5 or $15 session.",
+  upgradeUrl: "/subscribe",
+};
 
 /** Session credits a Free account can spend one at a time. */
 export const SESSION_CREDIT_LIMITS = SESSION_PRICING;

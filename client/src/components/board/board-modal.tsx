@@ -61,9 +61,9 @@ export function BoardModal({
   /** Overrides the plan cap for a conversation running on a session credit. */
   seatLimit?: number;
   onApply: (adds: SeatDraft[], removes: number[]) => Promise<void>;
-  onUpdateSeat: (expertId: number, body: { customInstructions?: string }) => Promise<void>;
+  onUpdateSeat: (expertId: number, body: { customInstructions?: string; model?: string }) => Promise<void>;
 }) {
-  const limit = seatLimit ?? TIER_EXPERT_LIMITS[(tier as keyof typeof TIER_EXPERT_LIMITS)] ?? TIER_EXPERT_LIMITS.free;
+  const limit = seatLimit ?? TIER_EXPERT_LIMITS[(tier as keyof typeof TIER_EXPERT_LIMITS)] ?? 0;
   const modelTier = effectiveModelTier(tier, creditKind);
   const modelContext: ModelContext = {
     paid: modelTier !== "free",
@@ -144,9 +144,16 @@ export function BoardModal({
       for (const draft of drafts) {
         if (!draft.existingId) continue;
         const original = experts.find((expert) => expert.id === draft.existingId);
-        if (original && (original.customInstructions ?? "") !== (draft.customInstructions ?? "")) {
-          await onUpdateSeat(draft.existingId, { customInstructions: draft.customInstructions ?? "" });
+        if (!original) continue;
+        // An already-seated director keeps the settings just chosen: both the
+        // standing brief and the model must persist (a model change used to be
+        // dropped because only customInstructions was patched).
+        const body: { customInstructions?: string; model?: string } = {};
+        if ((original.customInstructions ?? "") !== (draft.customInstructions ?? "")) {
+          body.customInstructions = draft.customInstructions ?? "";
         }
+        if (original.model !== draft.model) body.model = draft.model;
+        if (Object.keys(body).length > 0) await onUpdateSeat(draft.existingId, body);
       }
       await onApply(adds, removes);
       onOpenChange(false);

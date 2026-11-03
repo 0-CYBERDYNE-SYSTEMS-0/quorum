@@ -811,6 +811,8 @@ describe("GET /api/protected/conversations/:id/export.ics", () => {
   ) {
     const res = await agent.post("/api/register").send({ username, password, email: `${username}.${email}` });
     expect(res.status).toBe(201);
+    // Quorum has no free plan: a registered account needs a plan to open a board.
+    await storage.updateUserTier(res.body.id, "pro");
     return agent;
   }
 

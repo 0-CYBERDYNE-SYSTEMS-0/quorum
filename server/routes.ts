@@ -24,9 +24,9 @@ import { extractScheduleRows, parseIsoDate, nextMondayFrom, resolveRowStartDate,
 import { generateComprehensiveMarkdown } from './export-utils';
 import { isDuplicateUserSubmission } from './text-similarity';
 import { format } from 'date-fns';
-import { getTierLimits, sessionCreditLimits, isSessionKind } from './tiers';
+import { getTierLimits, sessionCreditLimits, isSessionKind, PLAN_REQUIRED_DENIAL } from './tiers';
 import { checkHouseKeyCall, checkMessageAllowance, currentUsagePeriod, BOARDROOM_FRONTIER_MODEL_ALLOWLIST, FRONTIER_MODEL_LABELS, houseKeyModelsForTier, UsageCapError, monthlyAiBudgetUsd, BUDGET_EXHAUSTED_NOTICE } from './usage-caps';
-import { PLAN_PRICING, SESSION_PRICING } from '@shared/pricing';
+import { PLAN_PRICING, SESSION_PRICING, hasPaidPlan, purchasableSessionKinds } from '@shared/pricing';
 import {
   checkoutUrls,
   parseCheckoutRequest,
@@ -178,6 +178,25 @@ async function effectiveLimits(userTier: string, conversationId?: number | null)
     };
   }
   return { credit: undefined, ...getTierLimits(userTier) };
+}
+
+/**
+ * Quorum has no free plan. Opening or running a board requires a paid plan
+ * (Pro/Boardroom/Enterprise) or a one-time session credit attached to that
+ * conversation. A stored tier of "free" is simply "no plan".
+ */
+async function boardRunPlanDenial(userId: number, conversationId: number) {
+  const user = await storage.getUser(userId);
+  if (hasPaidPlan(user?.tier)) return null;
+  if (await creditForConversation(conversationId)) return null;
+  return PLAN_REQUIRED_DENIAL;
+}
+
+function sendPlanRequired(res: Response, message?: string) {
+  return res.status(PLAN_REQUIRED_DENIAL.status).json({
+    ...PLAN_REQUIRED_DENIAL,
+    ...(message ? { message } : {}),
+  });
 }
 
 /**
@@ -391,7 +410,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           }
 
           const experts = await storage.getConversationExperts(conversationId);
-          const testModel = devConfig.experts[0]?.model || "nvidia/nemotron-3-super-120b-a12b:free";
+          const testModel = devConfig.experts[0]?.model || "deepseek/deepseek-v4.1-flash";
 
           // Update all experts to use the test model
           const updatePromises = experts.map((expert) =>
@@ -967,6 +986,21 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       if (request.mode === "payment") {
+        // Never sell a credit the account can never spend. Boardroom and
+        // Enterprise already include every session type; Pro may buy only the
+        // $15 Boardroom Session because it has no frontier access.
+        const purchasable = purchasableSessionKinds(user.tier);
+        if (!purchasable.includes(request.sessionKind)) {
+          const planName = user.tier === "boardroom" ? "Boardroom" : user.tier === "enterprise" ? "Enterprise" : "Pro";
+          return res.status(400).json({
+            code: "SESSION_NOT_AVAILABLE",
+            message: hasPaidPlan(user.tier)
+              ? user.tier === "pro"
+                ? "Pro already includes fast models. The $15 Boardroom Session is the only one-time session available to Pro."
+                : `${planName} already includes every session type, so a one-time session credit would never be spent.`
+              : "That session is not available for this account.",
+          });
+        }
         const { envName, priceId } = resolveSessionPriceId(request.sessionKind);
         if (!priceId) {
           { const r = billingUnavailable(`${envName} is not configured`); return res.status(r.status).json(r.body); }
@@ -1362,7 +1396,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.json({
         tier,
         planName: PLAN_PRICING[tier as keyof typeof PLAN_PRICING]?.name ?? limits.name,
+        hasPlan: hasPaidPlan(tier),
         limits,
+        // Session credits this account may still buy (Boardroom: none,
+        // Pro: Boardroom Session only, no plan: both).
+        purchasableSessions: purchasableSessionKinds(tier),
         usage: { period: currentUsagePeriod(), messages: usage.messageCount, aiSpendUsd: usage.aiSpendUsd },
         // True once house-key paid calls are on the paid overage fallback.
         aiBudgetExhausted: (tier === "pro" || tier === "boardroom") && !user?.openRouterKey && usage.aiSpendUsd >= monthlyAiBudgetUsd(tier),
@@ -1403,19 +1441,31 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const user = await storage.getUser(userId);
       const tier = user?.tier || "free";
       // A one-time credit is spent ONLY when the Chair explicitly picks a
-      // session board. A Free user holding a credit who starts an ordinary
-      // board keeps the credit for later.
+      // session board. Starting an ordinary board never spends a credit.
       const requestedKind = req.body?.sessionCreditKind;
       if (requestedKind !== undefined && !isSessionKind(requestedKind)) {
         return res.status(400).json({ code: "INVALID_SESSION_CREDIT_KIND", message: "Choose a fast or boardroom session." });
       }
 
-      // Pricing v1: a Free account that chooses a $5/$15 session board starts
-      // this conversation on that credit. The credit is consumed here (the
-      // conversation's creation), and its limits apply for the conversation's
-      // whole life. consumeSessionCredit is atomic, so two tabs cannot spend
-      // the same credit twice.
-      if (tier === "free" && isSessionKind(requestedKind)) {
+      // No plan and no session chosen: there is no free board to open. Tell a
+      // credit holder to pick the session instead of silently creating a board
+      // that could never run.
+      if (!isSessionKind(requestedKind) && !hasPaidPlan(tier)) {
+        const available = (await storage.listSessionCredits(userId)).filter(credit => credit.status === "available");
+        return sendPlanRequired(
+          res,
+          available.length
+            ? "Choose Pro or Boardroom, or start this board with one of your session credits."
+            : undefined,
+        );
+      }
+
+      // Pricing v1: choosing a $5/$15 session board starts this conversation on
+      // that credit. The credit is consumed here (the conversation's creation),
+      // and its limits apply for the conversation's whole life.
+      // consumeSessionCredit is atomic, so two tabs cannot spend one credit
+      // twice.
+      if (isSessionKind(requestedKind)) {
         const available = (await storage.listSessionCredits(userId))
           .filter(credit => credit.status === "available" && credit.kind === requestedKind)
           .sort((a, b) => (a.createdAt?.getTime() ?? 0) - (b.createdAt?.getTime() ?? 0));
@@ -1426,7 +1476,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         if (!consumedCredit) {
           return res.status(409).json({
             code: "SESSION_CREDIT_UNAVAILABLE",
-            message: `No ${requestedKind === "boardroom" ? "Boardroom Session" : "Single Session"} credit is available. Buy one or start a Free board.`,
+            message: `No ${requestedKind === "boardroom" ? "Boardroom Session" : "Single Session"} credit is available. Buy one or choose a plan.`,
           });
         }
       }
@@ -1442,7 +1492,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         await storage.attachSessionCreditToConversation(consumedCredit.id, createdConversation.id);
       }
       // sessionCreditKind lets the client size the board to the credit's cap
-      // (5 vs 8 seats) instead of the Free plan's 3.
+      // (5 vs 8 seats) instead of a plan's seat cap.
       res.status(201).json({
         ...createdConversation,
         sessionCreditKind: consumedCredit?.kind ?? null,
@@ -1794,6 +1844,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
       
       const userId = req.user!.id;
+      // Running a board needs a plan or this conversation's session credit.
+      const planDenial = await boardRunPlanDenial(userId, conversationId);
+      if (planDenial) return res.status(planDenial.status).json(planDenial);
       const { content, answersQuestionId } = req.body ?? {};
       const resolution = await resolveAnswerQuestion(conversationId, answersQuestionId);
       if ("status" in resolution) {
@@ -1833,6 +1886,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (!Number.isSafeInteger(questionId) || questionId <= 0) {
         return res.status(400).json({ message: "Invalid question id." });
       }
+      const planDenial = await boardRunPlanDenial(req.user!.id, conversationId);
+      if (planDenial) return res.status(planDenial.status).json(planDenial);
       const { content } = req.body ?? {};
       if (typeof content !== "string" || content.trim().length === 0) {
         return res.status(400).json({ message: "An answer is required." });
@@ -1869,6 +1924,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (!conversation || conversation.userId !== req.user!.id) {
         return res.status(404).json({ message: "Conversation not found" });
       }
+
+      const planDenial = await boardRunPlanDenial(req.user!.id, conversationId);
+      if (planDenial) return res.status(planDenial.status).json(planDenial);
 
       const requestedTopic = typeof req.body?.topic === "string"
         ? req.body.topic.trim()
@@ -2091,7 +2149,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (!conversation || conversation.userId !== req.user!.id) {
         return res.status(404).json({ message: "Conversation not found" });
       }
-      
+      const insightsPlanDenial = await boardRunPlanDenial(req.user!.id, conversationId);
+      if (insightsPlanDenial) return res.status(insightsPlanDenial.status).json(insightsPlanDenial);
       await generateInsights(conversationId);
       
       const insights = await storage.getConversationInsights(conversationId);
@@ -2349,6 +2408,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
         res.status(403).json({ message: "Forbidden" });
         return;
       }
+      const planDenial = await boardRunPlanDenial(req.user!.id, conversationId);
+      if (planDenial) {
+        res.status(planDenial.status).json(planDenial);
+        return;
+      }
 
       if (!getConversationState(conversationId)) {
         // No live in-memory state. A paused snapshot persisted on the row is
@@ -2381,6 +2445,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(404).json({ message: "Conversation not found" });
       }
       const experts = await storage.getConversationExperts(conversationId);
+      const planDenial = await boardRunPlanDenial(req.user!.id, conversationId);
+      if (planDenial) return res.status(planDenial.status).json(planDenial);
       if (experts.filter(expert => expert.role !== "Moderator").length === 0) {
         return res.status(409).json({ message: "Seat at least one director before closing the session." });
       }
@@ -2427,6 +2493,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (!conversation || conversation.userId !== req.user!.id) {
         return res.status(404).json({ message: "Conversation not found" });
       }
+      const autonomyPlanDenial = await boardRunPlanDenial(req.user!.id, conversationId);
+      if (autonomyPlanDenial) return res.status(autonomyPlanDenial.status).json(autonomyPlanDenial);
 
       const body = req.body && typeof req.body === "object" ? req.body : {};
       const hasMaxTurns = Object.prototype.hasOwnProperty.call(body, "maxTurns");

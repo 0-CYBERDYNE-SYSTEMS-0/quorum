@@ -2,10 +2,11 @@
  * Client model options. The canonical slugs live in shared/models.ts so the
  * server gate and this picker can never disagree.
  *
- * Frontier models are labelled "Boardroom only" everywhere they appear: they
- * are included with the Boardroom plan and with a $15 Boardroom Session
- * credit, and are rejected with a 402 for Pro (unless the Chair adds their
- * own OpenRouter key).
+ * There is no free plan and no ':free' model. Executive (Pro) sees the fast
+ * paid models. Frontier models are labelled "Boardroom only" everywhere they
+ * appear: they are included with the Boardroom plan and with a $15 Boardroom
+ * Session credit, and are rejected with a 402 for Pro (unless the Chair adds
+ * their own OpenRouter key).
  */
 import {
   BOARDROOM_FRONTIER_MODEL_ALLOWLIST,
@@ -13,7 +14,6 @@ import {
   MODEL_LABELS,
   modelLabel,
 } from "@shared/models";
-import { FREE_DEFAULT_EXPERT_MODEL } from "@shared/expert-catalog";
 
 export type ModelOption = {
   id: string;
@@ -36,15 +36,7 @@ export const CLIENT_MODEL_OPTIONS: ModelOption[] = [
 
 /** Fast options always; frontier options only for Boardroom/Enterprise. */
 export function modelOptionsForTier(tier: string | null | undefined): ModelOption[] {
-  const t = tier || "free";
-  // Free keeps its existing free expert model; paid slugs are not offered.
-  if (t === "free") {
-    return [{
-      id: FREE_DEFAULT_EXPERT_MODEL,
-      label: MODEL_LABELS[FREE_DEFAULT_EXPERT_MODEL] ?? modelLabel(FREE_DEFAULT_EXPERT_MODEL),
-      boardroomOnly: false,
-    }];
-  }
+  const t = tier || "";
   const frontierAllowed = t === "boardroom" || t === "enterprise";
   return CLIENT_MODEL_OPTIONS.filter((option) => frontierAllowed || !option.boardroomOnly);
 }
@@ -60,7 +52,7 @@ export function effectiveModelTier(
 ): string {
   if (creditKind === "boardroom") return "boardroom";
   if (creditKind === "fast") return "pro";
-  return tier || "free";
+  return tier || "";
 }
 
 export function isBoardroomOnlyModel(modelId: string | null | undefined): boolean {

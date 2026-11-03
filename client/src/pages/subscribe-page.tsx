@@ -6,7 +6,7 @@ import { apiRequest } from "@/lib/queryClient";
 import { QuorumLogo } from "@/components/brand";
 import { Btn, Chip } from "@/components/design";
 import { cn } from "@/lib/utils";
-import { PLAN_PRICING, SESSION_PRICING, YEARLY_MONTHS_FREE, type BillingInterval, type PlanKey, type SessionKind } from "@shared/pricing";
+import { PLAN_PRICING, SESSION_PRICING, YEARLY_MONTHS_FREE, purchasableSessionKinds, type BillingInterval, type PlanKey, type SessionKind } from "@shared/pricing";
 import { BOARDROOM_FRONTIER_MODEL_ALLOWLIST, modelLabel } from "@/lib/model-options";
 
 type CheckoutBody =
@@ -22,7 +22,7 @@ function friendly(err: unknown): string {
   } catch {
     /* not JSON */
   }
-  return "Billing is not available on this instance yet. Keep using the free board; nothing is lost.";
+  return "Billing is not available on this instance yet. Nothing is lost; your boards stay saved.";
 }
 
 function PlanColumn({
@@ -39,10 +39,9 @@ function PlanColumn({
   onSubscribe: (plan: PlanKey) => void;
 }) {
   const pricing = PLAN_PRICING[plan];
-  const isFree = plan === "free";
   const isBoardroom = plan === "boardroom";
   const amount = interval === "year" ? pricing.annualUsd : pricing.monthlyUsd;
-  const isCurrent = currentTier === plan || (plan === "pro" && currentTier === "pro");
+  const isCurrent = currentTier === plan;
 
   return (
     <section
@@ -67,13 +66,13 @@ function PlanColumn({
 
       <div className="mt-5 flex items-baseline gap-2">
         <span className="font-display text-[38px] leading-none text-ink">
-          {isFree ? "$0" : `$${amount}`}
+          {`$${amount}`}
         </span>
         <span className="text-[11.5px] text-faint-ink">
-          {isFree ? "forever" : interval === "year" ? "/ year" : "/ month"}
+          {interval === "year" ? "/ year" : "/ month"}
         </span>
       </div>
-      {!isFree && interval === "year" && (
+      {interval === "year" && (
         <p className="mt-1 text-[10.5px] text-bronze-ink">
           {YEARLY_MONTHS_FREE} months free versus monthly (${pricing.monthlyUsd * YEARLY_MONTHS_FREE} saved)
         </p>
@@ -87,24 +86,16 @@ function PlanColumn({
         ))}
       </ul>
 
-      {isFree ? (
-        <Link href="/" className="mt-6">
-          <Btn variant="outline" className="w-full">
-            {currentTier === "free" || !currentTier ? "Open the free board" : "Included forever"}
-          </Btn>
-        </Link>
-      ) : (
-        <Btn
-          variant={isBoardroom ? "bronze" : "primary"}
-          size="lg"
-          className="mt-6 w-full"
-          onClick={() => onSubscribe(plan)}
-          disabled={busy || isCurrent}
-        >
-          {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Lock className="h-4 w-4" />}
-          {isCurrent ? "Current plan" : `Choose ${pricing.name}`}
-        </Btn>
-      )}
+      <Btn
+        variant={isBoardroom ? "bronze" : "primary"}
+        size="lg"
+        className="mt-6 w-full"
+        onClick={() => onSubscribe(plan)}
+        disabled={busy || isCurrent}
+      >
+        {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Lock className="h-4 w-4" />}
+        {isCurrent ? "Current plan" : `Choose ${pricing.name}`}
+      </Btn>
     </section>
   );
 }
@@ -157,7 +148,8 @@ export default function SubscribePage() {
     }
   };
 
-  const currentTier = user?.tier ?? "free";
+  const currentTier = user?.tier ?? "";
+  const sessionKinds = purchasableSessionKinds(currentTier);
 
   return (
     <div className="min-h-screen bg-paper">
@@ -176,8 +168,8 @@ export default function SubscribePage() {
         <p className="eyebrow">Pricing</p>
         <h1 className="mt-3 font-display text-[40px] leading-tight text-ink">Keep the room open.</h1>
         <p className="mt-3 max-w-[560px] text-[14px] leading-relaxed text-muted-ink">
-          The Associate board is free forever. Executive adds seats, volume, and fast paid models.
-          Boardroom adds the frontier models and the full table.
+          Executive seats eight directors on fast paid models. Boardroom opens the frontier models
+          and the full table. No plan yet? A one-time session opens one board.
         </p>
 
         <div className="mt-7 inline-flex rounded-md border border-line bg-surface p-0.5" role="group" aria-label="Billing interval">
@@ -197,8 +189,7 @@ export default function SubscribePage() {
           ))}
         </div>
 
-        <div className="mt-6 grid gap-5 md:grid-cols-3">
-          <PlanColumn plan="free" interval={interval} currentTier={currentTier} busy={false} onSubscribe={() => {}} />
+        <div className="mt-6 grid gap-5 md:grid-cols-2">
           <PlanColumn
             plan="pro"
             interval={interval}
@@ -215,20 +206,21 @@ export default function SubscribePage() {
           />
         </div>
 
+        {sessionKinds.length > 0 && (
         <section className="mt-8 rounded-xl border border-line bg-surface p-6">
           <div className="flex flex-wrap items-baseline justify-between gap-2">
             <div>
               <p className="text-[13px] font-semibold text-ink">Just one roundtable?</p>
               <p className="mt-1 text-[11.5px] leading-relaxed text-muted-ink">
-                No subscription. One session credit, consumed when you open the next board — its
-                limits apply for that conversation.
+                No subscription. One session credit, spent only when you choose that session board —
+                its limits apply for that conversation.
               </p>
             </div>
             <Chip tone="neutral">One-time</Chip>
           </div>
 
           <div className="mt-5 grid gap-4 sm:grid-cols-2">
-            {(["fast", "boardroom"] as const).map((kind) => {
+            {sessionKinds.map((kind) => {
               const session = SESSION_PRICING[kind];
               return (
                 <div key={kind} className="flex items-center justify-between gap-4 rounded-lg border border-line bg-paper/60 p-4">
@@ -254,10 +246,14 @@ export default function SubscribePage() {
 
           <p className="mt-4 flex items-start gap-1.5 text-[10.5px] leading-relaxed text-faint-ink">
             <Sparkles className="mt-0.5 h-3 w-3 shrink-0 text-bronze" />
-            A Boardroom Session includes {BOARDROOM_FRONTIER_MODEL_ALLOWLIST.slice(0, 3).map(modelLabel).join(", ")} and{" "}
+            {currentTier === "pro"
+              ? "Pro includes fast models. The Boardroom Session adds one frontier-model board: "
+              : "A Boardroom Session includes "}
+            {BOARDROOM_FRONTIER_MODEL_ALLOWLIST.slice(0, 3).map(modelLabel).join(", ")} and{" "}
             {BOARDROOM_FRONTIER_MODEL_ALLOWLIST.slice(3).map(modelLabel).join(", ")} for one conversation.
           </p>
         </section>
+        )}
 
         <section className="mt-6 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-line bg-surface px-6 py-5">
           <div>
@@ -286,7 +282,7 @@ export default function SubscribePage() {
         )}
 
         <p className="mt-6 text-center text-[10.5px] leading-relaxed text-faint-ink">
-          Secure checkout by Stripe. Cancel any time; the Associate board stays free. Prices in USD.
+          Secure checkout by Stripe. Cancel any time; your boards and data stay. Prices in USD.
         </p>
       </main>
     </div>

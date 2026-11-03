@@ -1,26 +1,17 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { DEFAULT_MAX_OUTPUT_TOKENS, FREE_MODEL_FALLBACKS, PAID_BUDGET_FALLBACKS, maxOutputTokens, modelRouting } from "../server/ai-providers";
+import { DEFAULT_MAX_OUTPUT_TOKENS, PAID_BUDGET_FALLBACKS, maxOutputTokens, modelRouting } from "../server/ai-providers";
 import { BUDGET_FALLBACK_MODEL, BUDGET_FALLBACK_MODEL_FALLBACK } from "../server/usage-caps";
 
 describe("model routing and output cap", () => {
   afterEach(() => { delete process.env.OPENROUTER_MAX_OUTPUT_TOKENS; });
-  it("adds free fallbacks only for :free models, primary first, max 3", () => {
-    const r = modelRouting("google/gemma-4-31b-it:free");
-    expect(r.models?.[0]).toBe("google/gemma-4-31b-it:free");
-    expect(r.models).toHaveLength(2);
-    expect(new Set(r.models).size).toBe(2);
-    expect(r.models!.every(m => m.endsWith(":free"))).toBe(true);
-    expect(modelRouting("openai/gpt-4o")).toEqual({ model: "openai/gpt-4o" });
-    expect(FREE_MODEL_FALLBACKS).toEqual(["dots-studio/dots-3-note-preview:free"]);
+  it("has no free fallback chain: a paid model is routed alone", () => {
+    expect(modelRouting("openai/gpt-6-luna")).toEqual({ model: "openai/gpt-6-luna" });
+    expect(modelRouting("z-ai/glm-5.3-flash")).toEqual({ model: "z-ai/glm-5.3-flash" });
   });
-  it("uses the current reliable free-model primary and fallback chain", () => {
-    expect(modelRouting("nvidia/nemotron-3-super-120b-a12b:free").models).toEqual([
-      "nvidia/nemotron-3-super-120b-a12b:free",
-      "dots-studio/dots-3-note-preview:free",
-    ]);
-    expect(modelRouting("dots-studio/dots-3-note-preview:free").models).toEqual([
-      "dots-studio/dots-3-note-preview:free",
-    ]);
+  it("never adds a ':free' fallback even for a legacy free-looking slug", () => {
+    const r = modelRouting("google/gemma-4-31b-it:free");
+    expect(r).toEqual({ model: "google/gemma-4-31b-it:free" });
+    expect(r.models).toBeUndefined();
   });
   it("routes a failed paid budget fallback to the second paid slug", () => {
     expect(PAID_BUDGET_FALLBACKS).toEqual([BUDGET_FALLBACK_MODEL, BUDGET_FALLBACK_MODEL_FALLBACK]);

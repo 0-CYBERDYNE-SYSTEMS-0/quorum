@@ -12,6 +12,7 @@ import { PLAN_PRICING, type PlanKey } from "@shared/pricing";
 export type TierStatus = {
   tier: string;
   planName?: string;
+  hasPlan?: boolean;
   limits: { name: string; maxExperts: number; maxMessages: number };
   usage: { period: string; messages: number; aiSpendUsd?: number };
   aiBudgetUsd: number | null;
@@ -21,7 +22,7 @@ export type TierStatus = {
 function planLabel(tier: string, fallback?: string): string {
   if (tier === "enterprise") return "Enterprise";
   const plan = PLAN_PRICING[tier as PlanKey];
-  return plan?.name ?? fallback ?? "Associate";
+  return plan?.name ?? fallback ?? "No plan";
 }
 
 export function PlanCard() {
@@ -39,7 +40,11 @@ export function PlanCard() {
   }
 
   const credits = data.sessionCredits;
+  // Pro sees only the $15 Boardroom Session; Boardroom/Enterprise see none.
+  const visibleFast = data.tier === "pro" ? 0 : credits.fast;
+  const visibleCredits = visibleFast + credits.boardroom;
   const planName = planLabel(data.tier, data.planName);
+  const showsCredits = data.tier !== "boardroom" && data.tier !== "enterprise";
 
   return (
     <Link
@@ -48,24 +53,28 @@ export function PlanCard() {
       title="Plans and session credits"
     >
       <div className="flex items-center justify-between gap-2">
-        <span className="truncate text-[11px] font-medium text-ink">{planName} plan</span>
-        {data.tier === "free" && <span className="text-[9.5px] uppercase tracking-[0.1em] text-bronze">Upgrade</span>}
+        <span className="truncate text-[11px] font-medium text-ink">
+          {data.tier === "pro" || data.tier === "boardroom" || data.tier === "enterprise" ? `${planName} plan` : planName}
+        </span>
+        {!data.hasPlan && <span className="text-[9.5px] uppercase tracking-[0.1em] text-bronze">Upgrade</span>}
       </div>
-      <div className="mt-0.5 flex items-center gap-1.5 text-[10px] text-faint-ink">
-        <Ticket className="h-3 w-3 shrink-0 text-bronze" />
-        {credits.available > 0 ? (
-          <span>
-            {credits.available} session credit{credits.available === 1 ? "" : "s"} ready
-            {credits.fast > 0 && credits.boardroom > 0
-              ? ` (${credits.fast} fast · ${credits.boardroom} boardroom)`
-              : ""}
-          </span>
-        ) : (
-          <span>No session credits</span>
-        )}
-      </div>
+      {showsCredits && (
+        <div className="mt-0.5 flex items-center gap-1.5 text-[10px] text-faint-ink">
+          <Ticket className="h-3 w-3 shrink-0 text-bronze" />
+          {visibleCredits > 0 ? (
+            <span>
+              {visibleCredits} session credit{visibleCredits === 1 ? "" : "s"} ready
+              {visibleFast > 0 && credits.boardroom > 0
+                ? ` (${visibleFast} fast · ${credits.boardroom} boardroom)`
+                : ""}
+            </span>
+          ) : (
+            <span>No session credits</span>
+          )}
+        </div>
+      )}
       <div className="mt-0.5 text-[9.5px] text-faint-ink">
-        {data.usage.messages}/{data.limits.maxMessages} briefs this month
+        {data.hasPlan ? `${data.usage.messages}/${data.limits.maxMessages} briefs this month` : "Open a board with a plan or a session"}
         {data.aiBudgetUsd ? ` · $${data.aiBudgetUsd} AI budget` : ""}
       </div>
     </Link>

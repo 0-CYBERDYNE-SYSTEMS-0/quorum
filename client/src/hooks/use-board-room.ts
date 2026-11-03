@@ -619,7 +619,7 @@ export function useBoardRoom() {
     await removeExpertMutation.mutateAsync({ conversationId: activeConversation, expertId });
   }, [activeConversation, removeExpertMutation]);
 
-  const updateSeat = useCallback(async (expertId: number, patchBody: { customInstructions?: string; name?: string }) => {
+  const updateSeat = useCallback(async (expertId: number, patchBody: { customInstructions?: string; name?: string; model?: string }) => {
     await apiRequest("PATCH", `/api/experts/${expertId}`, patchBody);
     if (activeConversation) {
       await queryClient.invalidateQueries({ queryKey: [`/api/protected/conversations/${activeConversation}/experts`] });

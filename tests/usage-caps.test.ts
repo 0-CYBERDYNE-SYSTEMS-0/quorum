@@ -30,11 +30,10 @@ import {
   UsageCapError,
   BUDGET_FALLBACK_MODEL,
   BUDGET_FALLBACK_MODEL_FALLBACK,
-  FREE_TIER_BUDGET_MODEL,
   EXPERT_REPLY_MAX_TOKENS,
 } from "../server/usage-caps";
 import { SESSION_CREDIT_LIMITS } from "../server/tiers";
-import { OpenRouterProvider, FREE_MODEL_FALLBACKS } from "../server/ai-providers";
+import { OpenRouterProvider } from "../server/ai-providers";
 
 const okResponse = (cost: number) => ({
   ok: true,
@@ -49,18 +48,14 @@ describe("usage caps: pure rules", () => {
     expect(currentUsagePeriod(new Date("2026-11-01T00:00:00Z"))).toBe("2026-11");
   });
 
-  it("allows Free 100 and Pro 1000 messages a month, then denies with upgrade hints", () => {
-    expect(checkMessageAllowance("free", 99)).toBeNull();
-    expect(checkMessageAllowance("free", 100)).toMatchObject({ status: 402, code: "message_limit_reached", upgradeUrl: "/subscribe" });
-    expect(checkMessageAllowance(null, 100)?.status).toBe(402);
+  it("allows Pro 1000 messages a month and refuses a no-plan account", () => {
+    expect(checkMessageAllowance("free", 0)).toMatchObject({ status: 402, code: "plan_required", upgradeUrl: "/subscribe" });
+    expect(checkMessageAllowance(null, 0)?.code).toBe("plan_required");
     expect(checkMessageAllowance("pro", 999)).toBeNull();
     expect(checkMessageAllowance("pro", 1000)).toMatchObject({ status: 429, code: "message_limit_reached" });
   });
 
-  it("keeps the free tier's existing free budget model and gives paid tiers a paid fallback", () => {
-    expect(FREE_MODEL_FALLBACKS).toContain(FREE_TIER_BUDGET_MODEL);
-    expect(FREE_TIER_BUDGET_MODEL.endsWith(":free")).toBe(true);
-    expect(FREE_MODEL_FALLBACKS).not.toContain(BUDGET_FALLBACK_MODEL);
+  it("uses only paid fallback models for every tier, including a legacy no-plan row", () => {
     expect(BUDGET_FALLBACK_MODEL).toBe("deepseek/deepseek-v4.1-flash");
     expect(BUDGET_FALLBACK_MODEL.endsWith(":free")).toBe(false);
     expect(BUDGET_FALLBACK_MODEL_FALLBACK).toBe("openai/gpt-6-luna");
@@ -68,13 +63,13 @@ describe("usage caps: pure rules", () => {
     expect(isHouseKeyAllowedModel(BUDGET_FALLBACK_MODEL_FALLBACK)).toBe(true);
     expect(budgetFallbackModelForTier("pro")).toBe(BUDGET_FALLBACK_MODEL);
     expect(budgetFallbackModelForTier("boardroom")).toBe(BUDGET_FALLBACK_MODEL);
-    expect(budgetFallbackModelForTier("free")).toBe(FREE_TIER_BUDGET_MODEL);
+    expect(budgetFallbackModelForTier("free")).toBe(BUDGET_FALLBACK_MODEL);
   });
 
-  it("admits included paid models and free models only on the Free tier", () => {
+  it("admits included paid models and refuses every ':free' slug", () => {
     expect(isHouseKeyAllowedModel("z-ai/glm-5.3-flash")).toBe(true);
     expect(isHouseKeyAllowedModel("openai/gpt-6-luna")).toBe(true);
-    expect(isHouseKeyAllowedModel("google/gemma-4-31b-it:free", "free")).toBe(true);
+    expect(isHouseKeyAllowedModel("google/gemma-4-31b-it:free", "free")).toBe(false);
     expect(isHouseKeyAllowedModel("google/gemma-4-31b-it:free", "pro")).toBe(false);
     expect(isHouseKeyAllowedModel("google/gemma-4-31b-it:free", "boardroom")).toBe(false);
     expect(isHouseKeyAllowedModel("openai/o1-pro")).toBe(false);
@@ -97,8 +92,8 @@ describe("usage caps: pure rules", () => {
   });
 
   it("gates house-key calls by tier, allowlist and budget", () => {
-    expect(checkHouseKeyCall("free", "nvidia/nemotron-3-super-120b-a12b:free", 0)).toBeNull();
-    expect(checkHouseKeyCall("free", "z-ai/glm-5.3-flash", 0)?.code).toBe("paid_model_requires_pro");
+    expect(checkHouseKeyCall("free", "z-ai/glm-5.3-flash", 0)?.code).toBe("plan_required");
+    expect(checkHouseKeyCall("free", "google/gemma-4-31b-it:free", 0)?.code).toBe("plan_required");
     expect(checkHouseKeyCall("pro", "z-ai/glm-5.3-flash", 7.99)).toBeNull();
     expect(checkHouseKeyCall("pro", "openai/o1-pro", 0)?.code).toBe("model_requires_own_key");
     // Graceful overage: the tier budget is spent but the 25% ceiling is not.
@@ -150,8 +145,8 @@ describe("usage caps: pure rules", () => {
     expect(proDenial?.message).toMatch(/Boardroom model.*Boardroom Session/i);
     expect(checkHouseKeyCall("boardroom", frontier, 0)).toBeNull();
     expect(checkHouseKeyCall("enterprise", frontier, 0)).toBeNull();
-    // A free account must not reach frontier models either.
-    expect(checkHouseKeyCall("free", frontier, 0)?.code).toBe("paid_model_requires_pro");
+    // A no-plan account must not reach frontier models either.
+    expect(checkHouseKeyCall("free", frontier, 0)?.code).toBe("plan_required");
   });
 
   it("applies the fast session credit's limits for its conversation", () => {
@@ -178,11 +173,19 @@ describe("usage caps: pure rules", () => {
     expect(denial?.message).toContain("25");
   });
 
-  it("mentions the pricing v1 amounts, not the retired $10 plan", () => {
-    const message = checkMessageAllowance("free", 100)?.message ?? "";
-    expect(message).toContain("$29");
-    expect(message).toContain("$99");
+  it("tells a no-plan account to choose a plan or a session, not a retired price", () => {
+    const message = checkMessageAllowance("free", 0)?.message ?? "";
+    expect(message).toMatch(/Pro or Boardroom/);
+    expect(message).toMatch(/\$5 or \$15 session/);
     expect(message).not.toContain("$10");
+  });
+
+  it("rewrites the paid ceiling message: budget used up, upgrade or session", () => {
+    const message = checkHouseKeyCall("pro", "z-ai/glm-5.3-flash", 10)?.message ?? "";
+    expect(message).toContain("included AI budget");
+    expect(message).toMatch(/Upgrade your plan/);
+    expect(message).toMatch(/buy a session/);
+    expect(message).not.toMatch(/switch experts to free models/i);
   });
 });
 

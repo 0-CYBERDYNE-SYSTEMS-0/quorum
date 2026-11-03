@@ -138,6 +138,9 @@ async function registerUser(baseUrl: string, username: string): Promise<string> 
     body: { username, password: "testpass123", email: `${username}@example.com` },
   });
   expect(res.status).toBe(201);
+  const registered = await res.json();
+  // Quorum has no free plan: a registered account needs a plan to open a board.
+  await storage.updateUserTier(registered.id, "pro");
   const setCookie = res.headers.getSetCookie();
   const sid = setCookie.find((c) => c.startsWith("connect.sid="));
   expect(sid).toBeTruthy();

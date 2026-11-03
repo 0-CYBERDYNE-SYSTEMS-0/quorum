@@ -132,6 +132,8 @@ async function registerAndLogin(
     .post("/api/register")
     .send({ username, password, email });
   expect(res.status).toBe(201);
+  // Quorum has no free plan: a registered account needs a plan to open a board.
+  await storage.updateUserTier(res.body.id, "pro");
   return agent;
 }
 
