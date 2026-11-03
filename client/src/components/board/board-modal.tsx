@@ -4,6 +4,7 @@ import type { Expert } from "@shared/schema";
 import { EXPERT_CATALOG, TIER_EXPERT_LIMITS, type CatalogExpert } from "@shared/expert-catalog";
 import { Btn, Chip, Field, Input, Modal, Monogram, TextArea } from "@/components/design";
 import { BOARD_PRESETS } from "@/lib/board";
+import { isBoardroomOnlyModel, modelLabel } from "@/lib/model-options";
 import { cn } from "@/lib/utils";
 
 type SeatDraft = {
@@ -44,6 +45,7 @@ export function BoardModal({
   onOpenChange,
   experts,
   tier,
+  seatLimit,
   onApply,
   onUpdateSeat,
 }: {
@@ -51,10 +53,12 @@ export function BoardModal({
   onOpenChange: (open: boolean) => void;
   experts: Expert[];
   tier: string;
+  /** Overrides the plan cap for a conversation running on a session credit. */
+  seatLimit?: number;
   onApply: (adds: SeatDraft[], removes: number[]) => Promise<void>;
   onUpdateSeat: (expertId: number, body: { customInstructions?: string }) => Promise<void>;
 }) {
-  const limit = TIER_EXPERT_LIMITS[(tier as keyof typeof TIER_EXPERT_LIMITS)] ?? TIER_EXPERT_LIMITS.free;
+  const limit = seatLimit ?? TIER_EXPERT_LIMITS[(tier as keyof typeof TIER_EXPERT_LIMITS)] ?? TIER_EXPERT_LIMITS.free;
   const [drafts, setDrafts] = useState<SeatDraft[]>([]);
   const [saving, setSaving] = useState(false);
   const [category, setCategory] = useState<string>("All");
@@ -295,7 +299,10 @@ export function BoardModal({
                       <div className="min-w-0 flex-1">
                         <p className="truncate text-[12px] font-medium text-ink">{draft.role}</p>
                         <p className="truncate text-[10.5px] text-faint-ink">
-                          {entry?.category ?? "Custom"} · {draft.model.split("/").pop()}
+                          {entry?.category ?? "Custom"} · {modelLabel(draft.model)}
+                          {isBoardroomOnlyModel(draft.model) && (
+                            <span className="ml-1 text-bronze">· Boardroom only</span>
+                          )}
                         </p>
                       </div>
                       <button

@@ -62,7 +62,7 @@ describe("Tier System", () => {
       expect(limits.maxExperts).toBe(3);
       expect(limits.maxMessages).toBe(100);
       expect(limits.allowPaidModels).toBe(false);
-      expect(limits.name).toBe("Free");
+      expect(limits.name).toBe("Associate");
     });
 
     it("returns correct limits for pro tier", () => {
@@ -70,7 +70,17 @@ describe("Tier System", () => {
       expect(limits.maxExperts).toBe(8);
       expect(limits.maxMessages).toBe(1000);
       expect(limits.allowPaidModels).toBe(true);
-      expect(limits.name).toBe("Pro");
+      expect(limits.allowFrontierModels).toBe(false);
+      expect(limits.name).toBe("Executive");
+    });
+
+    it("returns correct limits for boardroom tier", () => {
+      const limits = getTierLimits("boardroom");
+      expect(limits.maxExperts).toBe(12);
+      expect(limits.maxMessages).toBe(3000);
+      expect(limits.allowPaidModels).toBe(true);
+      expect(limits.allowFrontierModels).toBe(true);
+      expect(limits.name).toBe("Boardroom");
     });
 
     it("returns correct limits for enterprise tier", () => {
@@ -85,7 +95,7 @@ describe("Tier System", () => {
       const limits = getTierLimits("nonexistent");
       expect(limits.maxExperts).toBe(3);
       expect(limits.allowPaidModels).toBe(false);
-      expect(limits.name).toBe("Free");
+      expect(limits.name).toBe("Associate");
     });
 
     it("returns a copy (mutation-safe)", () => {
@@ -101,10 +111,11 @@ describe("Tier System", () => {
   // ─────────────────────────────────────────────────────────────────
 
   describe("TIERS constant", () => {
-    it("has exactly three tiers", () => {
-      expect(Object.keys(TIERS)).toHaveLength(3);
+    it("has exactly four tiers", () => {
+      expect(Object.keys(TIERS)).toHaveLength(4);
       expect(TIERS).toHaveProperty("free");
       expect(TIERS).toHaveProperty("pro");
+      expect(TIERS).toHaveProperty("boardroom");
       expect(TIERS).toHaveProperty("enterprise");
     });
 
@@ -113,6 +124,13 @@ describe("Tier System", () => {
       expect(TIERS.free.maxMessages).toBeLessThan(TIERS.pro.maxMessages);
       expect(TIERS.free.allowPaidModels).toBe(false);
       expect(TIERS.pro.allowPaidModels).toBe(true);
+    });
+
+    it("boardroom has more seats and messages than pro, and frontier access", () => {
+      expect(TIERS.boardroom.maxExperts).toBeGreaterThan(TIERS.pro.maxExperts);
+      expect(TIERS.boardroom.maxMessages).toBeGreaterThan(TIERS.pro.maxMessages);
+      expect(TIERS.pro.allowFrontierModels).toBe(false);
+      expect(TIERS.boardroom.allowFrontierModels).toBe(true);
     });
   });
 

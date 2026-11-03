@@ -24,10 +24,12 @@ import {
   monthlyAiBudgetUsd,
   isHouseKeyAllowedModel,
   HOUSE_KEY_PAID_MODEL_ALLOWLIST,
+  BOARDROOM_FRONTIER_MODEL_ALLOWLIST,
   UsageCapError,
   BUDGET_FALLBACK_MODEL,
   EXPERT_REPLY_MAX_TOKENS,
 } from "../server/usage-caps";
+import { SESSION_CREDIT_LIMITS } from "../server/tiers";
 import { OpenRouterProvider, FREE_MODEL_FALLBACKS } from "../server/ai-providers";
 
 const okResponse = (cost: number) => ({
@@ -63,21 +65,76 @@ describe("usage caps: pure rules", () => {
     expect(HOUSE_KEY_PAID_MODEL_ALLOWLIST.every((model) => !model.endsWith(":free"))).toBe(true);
   });
 
-  it("budgets Pro at $4 by default, overridable by env; Free has no paid budget", () => {
-    expect(monthlyAiBudgetUsd("pro")).toBe(4);
+  it("budgets Pro at $8 by default, overridable by env; Free has no paid budget", () => {
+    expect(monthlyAiBudgetUsd("pro")).toBe(8);
     process.env.PRO_MONTHLY_AI_BUDGET_USD = "5";
     expect(monthlyAiBudgetUsd("pro")).toBe(5);
     expect(monthlyAiBudgetUsd("free")).toBe(0);
   });
 
+  it("budgets Boardroom at $35 by default, overridable by env", () => {
+    delete process.env.BOARDROOM_MONTHLY_AI_BUDGET_USD;
+    expect(monthlyAiBudgetUsd("boardroom")).toBe(35);
+    process.env.BOARDROOM_MONTHLY_AI_BUDGET_USD = "40";
+    expect(monthlyAiBudgetUsd("boardroom")).toBe(40);
+    delete process.env.BOARDROOM_MONTHLY_AI_BUDGET_USD;
+  });
+
   it("gates house-key calls by tier, allowlist and budget", () => {
     expect(checkHouseKeyCall("free", "nvidia/nemotron-3-super-120b-a12b:free", 0)).toBeNull();
     expect(checkHouseKeyCall("free", "z-ai/glm-5.3-flash", 0)?.code).toBe("paid_model_requires_pro");
-    expect(checkHouseKeyCall("pro", "z-ai/glm-5.3-flash", 3.99)).toBeNull();
+    expect(checkHouseKeyCall("pro", "z-ai/glm-5.3-flash", 7.99)).toBeNull();
     expect(checkHouseKeyCall("pro", "openai/o1-pro", 0)?.code).toBe("model_requires_own_key");
-    expect(checkHouseKeyCall("pro", "z-ai/glm-5.3-flash", 4)?.code).toBe("ai_budget_exhausted");
+    expect(checkHouseKeyCall("pro", "z-ai/glm-5.3-flash", 8)?.code).toBe("ai_budget_exhausted");
     expect(checkHouseKeyCall("pro", "google/gemma-4-31b-it:free", 100)).toBeNull();
     expect(checkHouseKeyCall("enterprise", "openai/o1-pro", 1e6)).toBeNull();
+  });
+
+  it("gates boardroom-only frontier models (Pro gets a 402 upgrade message)", () => {
+    const frontier = BOARDROOM_FRONTIER_MODEL_ALLOWLIST[0];
+    expect(BOARDROOM_FRONTIER_MODEL_ALLOWLIST).toHaveLength(6);
+    expect(isHouseKeyAllowedModel(frontier, "pro")).toBe(false);
+    expect(isHouseKeyAllowedModel(frontier, "boardroom")).toBe(true);
+    expect(isHouseKeyAllowedModel(frontier)).toBe(false);
+
+    const proDenial = checkHouseKeyCall("pro", frontier, 0);
+    expect(proDenial).toMatchObject({ status: 402, code: "boardroom_model_required" });
+    expect(proDenial?.message).toMatch(/Boardroom model.*Boardroom Session/i);
+    expect(checkHouseKeyCall("boardroom", frontier, 0)).toBeNull();
+    expect(checkHouseKeyCall("enterprise", frontier, 0)).toBeNull();
+    // A free account must not reach frontier models either.
+    expect(checkHouseKeyCall("free", frontier, 0)?.code).toBe("paid_model_requires_pro");
+  });
+
+  it("applies the fast session credit's limits for its conversation", () => {
+    const credit = { kind: "fast" as const, usedMessages: 0, spentUsd: 0 };
+    expect(SESSION_CREDIT_LIMITS.fast).toMatchObject({ maxExperts: 5, maxMessages: 25, aiCapUsd: 1 });
+    expect(SESSION_CREDIT_LIMITS.boardroom).toMatchObject({ maxExperts: 8, maxMessages: 25, aiCapUsd: 4 });
+
+    // A free Chair on a fast credit may run fast paid models, not frontier.
+    expect(checkHouseKeyCall("free", "z-ai/glm-5.3-flash", 0, credit)).toBeNull();
+    expect(checkHouseKeyCall("free", BOARDROOM_FRONTIER_MODEL_ALLOWLIST[0], 0, credit)?.code).toBe("boardroom_model_required");
+    // The credit's own $1 AI cap applies instead of a monthly budget.
+    expect(checkHouseKeyCall("free", "z-ai/glm-5.3-flash", 0, { ...credit, spentUsd: 1 })?.code).toBe("ai_budget_exhausted");
+    // A boardroom credit unlocks frontier models and has a $4 cap.
+    const boardroomCredit = { kind: "boardroom" as const, spentUsd: 0 };
+    expect(checkHouseKeyCall("free", BOARDROOM_FRONTIER_MODEL_ALLOWLIST[0], 0, boardroomCredit)).toBeNull();
+    expect(checkHouseKeyCall("free", BOARDROOM_FRONTIER_MODEL_ALLOWLIST[0], 0, { ...boardroomCredit, spentUsd: 4 })?.code).toBe("ai_budget_exhausted");
+  });
+
+  it("caps a session-credit conversation at 25 chair messages, not the monthly cap", () => {
+    const credit = { kind: "boardroom" as const, usedMessages: 24 };
+    expect(checkMessageAllowance("free", 999, credit)).toBeNull();
+    const denial = checkMessageAllowance("free", 999, { ...credit, usedMessages: 25 });
+    expect(denial).toMatchObject({ status: 429, code: "session_credit_message_limit_reached" });
+    expect(denial?.message).toContain("25");
+  });
+
+  it("mentions the pricing v1 amounts, not the retired $10 plan", () => {
+    const message = checkMessageAllowance("free", 100)?.message ?? "";
+    expect(message).toContain("$29");
+    expect(message).toContain("$99");
+    expect(message).not.toContain("$10");
   });
 });
 
@@ -99,7 +156,7 @@ describe("usage caps: OpenRouterProvider enforcement", () => {
 
   it("falls back to a free model (not an error) once the Pro budget is spent", async () => {
     store.getUser.mockResolvedValue({ id: 1, tier: "pro" });
-    store.getMonthlyUsage.mockResolvedValue({ messageCount: 3, aiSpendUsd: 4.01 });
+    store.getMonthlyUsage.mockResolvedValue({ messageCount: 3, aiSpendUsd: 8.01 });
     mockFetch.mockResolvedValue(okResponse(0));
     const res = await new OpenRouterProvider(null).chat(messages, "z-ai/glm-5.3-flash", 1);
     expect(res.message.content).toBe("hi");

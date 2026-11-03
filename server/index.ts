@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express, { type Request, Response, NextFunction } from "express";
 import { registerRoutes } from "./routes";
+import { isAllowedOrigin } from "./billing-plans";
 import { setupVite, serveStatic, log } from "./vite";
 import helmet from "helmet";
 import cors from "cors";
@@ -20,9 +21,15 @@ app.use(express.urlencoded({ extended: false }));
 // react-refresh preamble and HMR websocket are blocked by script-src 'self'.
 app.use(helmet(app.get("env") === "development" ? { contentSecurityPolicy: false } : {}));
 
-// CORS - allow only the configured origin
+// CORS — ALLOWED_ORIGIN is a comma-separated list so the same deployment can
+// serve the Replit host and a custom domain (e.g.
+// "https://quorum.desmond-digital.com,https://quorum-scrimwiggins.replit.app").
+// Requests without an Origin (curl, health checks, same-origin navigations in
+// some clients) are allowed through without CORS headers.
 app.use(cors({
-  origin: process.env.ALLOWED_ORIGIN || "http://localhost:5173",
+  origin(origin, callback) {
+    callback(null, !origin || isAllowedOrigin(origin));
+  },
   credentials: true,
 }));
 

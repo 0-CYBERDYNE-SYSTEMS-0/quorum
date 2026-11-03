@@ -17,6 +17,7 @@ import {
 import { QuorumLogo, QuorumMark } from "@/components/brand";
 import { Btn, Chip, SectionLabel } from "@/components/design";
 import { EXPERT_CATALOG } from "@shared/expert-catalog";
+import { PLAN_PRICING, SESSION_PRICING, YEARLY_MONTHS_FREE } from "@shared/pricing";
 import { cn } from "@/lib/utils";
 
 /* ------------------------------------------------------------------ */
@@ -471,24 +472,37 @@ function ShieldIcon({ className, strokeWidth }: { className?: string; strokeWidt
 function Pricing() {
   const plans = [
     {
-      name: "Associate",
-      price: "$0",
+      name: PLAN_PRICING.free.name,
+      price: `$${PLAN_PRICING.free.monthlyUsd}`,
       cadence: "forever",
-      line: "For the first decision.",
-      features: ["3 board seats", "100 chair briefs / month", "House models", "Decision memos & exports"],
+      line: PLAN_PRICING.free.tagline,
+      features: PLAN_PRICING.free.features.slice(0, 4),
       cta: "Start free",
       href: "/auth?mode=register",
       featured: false,
+      badge: null as string | null,
     },
     {
-      name: "Executive",
-      price: "$10",
+      name: PLAN_PRICING.pro.name,
+      price: `$${PLAN_PRICING.pro.monthlyUsd}`,
       cadence: "per month",
-      line: "For operators in the chair weekly.",
-      features: ["8 board seats", "1,000 chair briefs / month", "Bring your own model key", "Artifacts, charts, and deliverable versioning"],
+      line: PLAN_PRICING.pro.tagline,
+      features: PLAN_PRICING.pro.features.slice(0, 4),
       cta: "Convene a board",
-      href: "/auth?mode=register",
+      href: "/subscribe",
+      featured: false,
+      badge: null as string | null,
+    },
+    {
+      name: PLAN_PRICING.boardroom.name,
+      price: `$${PLAN_PRICING.boardroom.monthlyUsd}`,
+      cadence: "per month",
+      line: PLAN_PRICING.boardroom.tagline,
+      features: PLAN_PRICING.boardroom.features.slice(0, 4),
+      cta: "Seat the full table",
+      href: "/subscribe",
       featured: true,
+      badge: "Best models",
     },
     {
       name: "Enterprise",
@@ -499,6 +513,7 @@ function Pricing() {
       cta: "Talk to us",
       href: "mailto:admin@desmond-digital.com?subject=Quorum%20Enterprise",
       featured: false,
+      badge: null as string | null,
     },
   ];
   return (
@@ -511,10 +526,13 @@ function Pricing() {
               Cheaper than one bad decision.
             </h2>
           </div>
-          <p className="text-[12px] text-faint-ink">USD. Monthly or $96/year. Cancel any time.</p>
+          <p className="text-[12px] text-faint-ink">
+            USD. Monthly, or yearly with {YEARLY_MONTHS_FREE} months free. One roundtable from $
+            {SESSION_PRICING.fast.priceUsd}. Cancel any time.
+          </p>
         </div>
 
-        <div className="mt-10 grid gap-5 md:grid-cols-3">
+        <div className="mt-10 grid gap-5 md:grid-cols-2 xl:grid-cols-4">
           {plans.map((plan) => (
             <div
               key={plan.name}
@@ -525,7 +543,7 @@ function Pricing() {
             >
               {plan.featured && (
                 <span className="absolute -top-2.5 left-6 rounded-full border border-bronze/30 bg-bronze-wash px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.1em] text-bronze-ink">
-                  Most convened
+                  {plan.badge ?? "Most convened"}
                 </span>
               )}
               <p className="text-[13px] font-semibold text-ink">{plan.name}</p>

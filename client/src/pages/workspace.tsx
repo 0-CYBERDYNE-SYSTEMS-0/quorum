@@ -22,6 +22,7 @@ import { useBoardRoom } from "@/hooks/use-board-room";
 import { useTheme } from "@/lib/theme";
 import { apiRequest } from "@/lib/queryClient";
 import { EXPERT_CATALOG, TIER_EXPERT_LIMITS } from "@shared/expert-catalog";
+import { SESSION_PRICING } from "@shared/pricing";
 import { BoardModal } from "@/components/board/board-modal";
 import { CharterModal } from "@/components/board/charter-modal";
 import { CompanyModal } from "@/components/board/company-modal";
@@ -365,7 +366,12 @@ export default function WorkspacePage() {
       const preset = BOARD_PRESETS.find((item) => item.id === presetId);
       // A preset can list more seats than the plan allows. Seat the first N
       // that fit; the Chair can swap seats in Board settings afterwards.
-      const seatLimit = TIER_EXPERT_LIMITS[(user?.tier as keyof typeof TIER_EXPERT_LIMITS) ?? "free"] ?? TIER_EXPERT_LIMITS.free;
+      // A one-time session credit sizes the board by the credit's own cap.
+      const creditKind = (conversation as { sessionCreditKind?: "fast" | "boardroom" | null }).sessionCreditKind;
+      const creditSeatLimit = creditKind ? SESSION_PRICING[creditKind].maxExperts : undefined;
+      const seatLimit = creditSeatLimit
+        ?? TIER_EXPERT_LIMITS[(user?.tier as keyof typeof TIER_EXPERT_LIMITS) ?? "free"]
+        ?? TIER_EXPERT_LIMITS.free;
       const seats = (preset?.roles ?? [])
         .map((role) => EXPERT_CATALOG.find((entry) => entry.role === role))
         .filter((entry): entry is (typeof EXPERT_CATALOG)[number] => !!entry)
@@ -476,6 +482,7 @@ export default function WorkspacePage() {
   if (!user) return <Redirect to="/auth" />;
 
   const seats = board.experts.map((expert) => ({ role: expert.role, color: expert.avatarUrl || roleColor(expert.role) }));
+  const activeCreditKind = (active as (SessionSummary & { sessionCreditKind?: "fast" | "boardroom" | null }) | null)?.sessionCreditKind ?? null;
 
   return (
     <div className="flex h-[100dvh] overflow-hidden bg-paper text-ink">
@@ -671,6 +678,9 @@ export default function WorkspacePage() {
         onOpenChange={setBoardOpen}
         experts={board.experts}
         tier={user.tier ?? "free"}
+        seatLimit={
+          activeCreditKind ? SESSION_PRICING[activeCreditKind].maxExperts : undefined
+        }
         onApply={applyBoard}
         onUpdateSeat={board.updateSeat}
       />

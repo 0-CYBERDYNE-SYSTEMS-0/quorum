@@ -1,5 +1,6 @@
 import { useMemo, useRef, useState } from "react";
 import { Link } from "wouter";
+import { PlanCard } from "@/components/board/plan-card";
 import {
   Building2,
   Check,
@@ -273,6 +274,7 @@ export function SessionList({
       </nav>
 
       <div className="border-t border-line/70 px-3 py-3">
+        <PlanCard />
         <button
           type="button"
           onClick={onOpenCompany}

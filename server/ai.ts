@@ -57,7 +57,7 @@ export const PLANNING_MAX_TOKENS = 4096;
 const EXPERT_HISTORY_MESSAGES = 8;
 
 function isPaidTier(tier: string | null | undefined): boolean {
-  return tier === "pro" || tier === "enterprise";
+  return tier === "pro" || tier === "boardroom" || tier === "enterprise";
 }
 
 /**
@@ -1384,9 +1384,9 @@ export async function getExpertResponseStream(
     providerRetry
       ? callExpertStreamWithResilience(
           messages, model, onStreamToken, conversation?.userId, webSearch,
-          { maxTokens: EXPERT_REPLY_MAX_TOKENS }, undefined, providerRetry,
+          { maxTokens: EXPERT_REPLY_MAX_TOKENS, conversationId: expert.conversationId }, undefined, providerRetry,
         )
-      : callOpenRouterAPIStream(messages, model, onStreamToken, conversation?.userId, webSearch, { maxTokens: EXPERT_REPLY_MAX_TOKENS });
+      : callOpenRouterAPIStream(messages, model, onStreamToken, conversation?.userId, webSearch, { maxTokens: EXPERT_REPLY_MAX_TOKENS, conversationId: expert.conversationId });
   try {
     let response: AIModelResponse;
     let stance: MessageStance | null = null;
@@ -1412,7 +1412,7 @@ export async function getExpertResponseStream(
     else if (expert.role === "File Creator") {
       // File Creator needs full response to parse JSON — use non-streaming
       const request = await prepareFileCreatorRequest(expert, messages, deliverableRequest);
-      response = await callOpenRouterAPI(messages, expert.model, conversation?.userId);
+      response = await callOpenRouterAPI(messages, expert.model, conversation?.userId, false, { conversationId: expert.conversationId });
       requireNonEmptyAssistantContent(response);
       stance = stripExpertStance(response, expert.role);
       const saved = await saveGeneratedDeliverable(response.message.content, expert, request);
@@ -1583,19 +1583,19 @@ export async function getExpertResponse(
       if (process.env.PERPLEXITY_API_KEY) {
         response = await callPerplexityAPI(referenceMessageContent, messages);
       } else {
-        response = await callOpenRouterAPI(messages, expert.model, conversation?.userId, paidWebPluginEnabled(), { maxTokens: EXPERT_REPLY_MAX_TOKENS });
+        response = await callOpenRouterAPI(messages, expert.model, conversation?.userId, paidWebPluginEnabled(), { maxTokens: EXPERT_REPLY_MAX_TOKENS, conversationId: expert.conversationId });
       }
     } 
     else if (expert.role === "File Creator") {
        const request = await prepareFileCreatorRequest(expert, messages, deliverableRequest);
-       response = await callOpenRouterAPI(messages, expert.model, conversation?.userId);
+       response = await callOpenRouterAPI(messages, expert.model, conversation?.userId, false, { conversationId: expert.conversationId });
        requireNonEmptyAssistantContent(response);
        stance = stripExpertStance(response, expert.role);
        const saved = await saveGeneratedDeliverable(response.message.content, expert, request);
        response.message.content = deliverableSuccessMessage(saved, request);
     }
     else {
-      response = await callOpenRouterAPI(messages, expert.model, conversation?.userId, false, { maxTokens: EXPERT_REPLY_MAX_TOKENS });
+      response = await callOpenRouterAPI(messages, expert.model, conversation?.userId, false, { maxTokens: EXPERT_REPLY_MAX_TOKENS, conversationId: expert.conversationId });
     }
 
     if (expert.role !== "File Creator") {
@@ -1679,7 +1679,7 @@ export async function resolveAuxModelForUser(
   if (!model || model.endsWith(":free") || !userId) return model;
   try {
     const user = await storage.getUser(userId);
-    if (user && user.tier !== "pro" && user.tier !== "enterprise") return BUDGET_FALLBACK_MODEL;
+    if (user && user.tier !== "pro" && user.tier !== "boardroom" && user.tier !== "enterprise") return BUDGET_FALLBACK_MODEL;
   } catch (error) {
     console.warn("[AUX] could not resolve user tier; keeping configured aux model:", (error as Error).message);
   }
@@ -1884,7 +1884,7 @@ export async function generateInsights(conversationId: number, broadcastFn?: (co
     const response = await callOpenRouterAPI([
       { role: "system", content: "You extract key insights from business board discussions. Respond only with the requested JSON format." },
       { role: "user", content: insightPrompt }
-    ], auxModel, conversation?.userId);
+    ], auxModel, conversation?.userId, false, { conversationId });
     
     try {
       const insightData = JSON.parse(response.message.content);
@@ -1996,7 +1996,7 @@ export async function getModeratorNextSpeakerSuggestion(
             return null;
         }
 
-        const response = await callOpenRouterAPI(messages, auxModel, conversation?.userId);
+        const response = await callOpenRouterAPI(messages, auxModel, conversation?.userId, false, { conversationId: moderatorExpert.conversationId });
         const responseContent = response?.message?.content;
         if (typeof responseContent !== "string" || !responseContent.trim()) {
             console.warn("Moderator returned no next-speaker text. Falling back to round-robin.");
@@ -2166,7 +2166,7 @@ export async function generateClosingSynthesis(
         }
         response = await callOpenRouterAPIStream(
           messages, attempt.model, onClosingToken, conversation?.userId, false,
-          { maxTokens: attempt.maxTokens },
+          { maxTokens: attempt.maxTokens, conversationId },
         );
         break;
       } catch (error) {

@@ -77,11 +77,14 @@ out of production builds.
 | --- | --- | --- |
 | `DATABASE_URL` | yes | PostgreSQL connection string. Unset = in-memory storage (dev only). |
 | `SESSION_SECRET` | yes | Express session signing key. |
+| `ALLOWED_ORIGIN` | recommended | Comma-separated public origins. Checkout return URLs use the request origin when it is listed. |
 | `OPENROUTER_API_KEY` | yes | House model key for directors. Directors can also use a user-supplied key. |
 | `ENCRYPTION_KEY` | recommended | Encrypts stored user API keys. |
+| `PRO_MONTHLY_AI_BUDGET_USD` / `BOARDROOM_MONTHLY_AI_BUDGET_USD` | optional | Monthly house-key AI budgets. Defaults: `8` (Pro) and `35` (Boardroom). |
 | `DEFAULT_AUX_MODEL` | optional | Model for routing, insights, and closing synthesis. Use a paid slug on paid tiers. |
 | `OPENROUTER_PROVIDER_IGNORE` | optional | Comma-separated providers excluded from OpenRouter routing. Defaults to `Relace`. |
-| `STRIPE_SECRET_KEY` / `STRIPE_PRICE_ID_PRO` / `STRIPE_PRICE_ID_PRO_ANNUAL` | optional | Executive subscriptions. Without them every account stays on Associate and billing fails closed. |
+| `STRIPE_SECRET_KEY` + `STRIPE_PRICE_ID_PRO`, `STRIPE_PRICE_ID_PRO_ANNUAL`, `STRIPE_PRICE_ID_BOARDROOM`, `STRIPE_PRICE_ID_BOARDROOM_ANNUAL`, `STRIPE_PRICE_ID_SESSION_FAST`, `STRIPE_PRICE_ID_SESSION_BOARDROOM` | optional | Pro/Boardroom subscriptions and one-time session credits. Without them every account stays on Associate and billing fails closed. |
+| `STRIPE_WEBHOOK_SECRET` | optional | Verifies `/api/webhook`. |
 | `LOCAL_AI_BASE_URL` / `LOCAL_AI_MODEL` | optional | Route director calls to a local OpenAI-compatible endpoint. |
 | `PORT` | optional | Defaults to `5001`. |
 

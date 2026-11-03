@@ -19,7 +19,11 @@ The repository ships `.replit` with the build and run commands pre-wired.
    Optional:
    - `DEFAULT_AUX_MODEL` (must be a paid slug on paid tiers), `OPENROUTER_REASONING_EFFORT`
    - `OPENROUTER_PROVIDER_IGNORE` (comma-separated; defaults to `Relace`)
-   - `STRIPE_SECRET_KEY`, `STRIPE_PRICE_ID_PRO`, `STRIPE_PRICE_ID_PRO_ANNUAL`, `STRIPE_WEBHOOK_SECRET`
+   - `PRO_MONTHLY_AI_BUDGET_USD` (default 8), `BOARDROOM_MONTHLY_AI_BUDGET_USD` (default 35)
+   - Stripe: `STRIPE_SECRET_KEY`, `STRIPE_PRICE_ID_PRO`, `STRIPE_PRICE_ID_PRO_ANNUAL`,
+     `STRIPE_PRICE_ID_BOARDROOM`, `STRIPE_PRICE_ID_BOARDROOM_ANNUAL`,
+     `STRIPE_PRICE_ID_SESSION_FAST`, `STRIPE_PRICE_ID_SESSION_BOARDROOM`,
+     `STRIPE_WEBHOOK_SECRET`
    - `PERPLEXITY_API_KEY`
 4. **Deploy.** The deployment run command is:
    ```
@@ -69,18 +73,76 @@ NODE_ENV=production node dist/index.js
 Behind a reverse proxy, forward WebSocket upgrades on `/ws`. The client reconnects automatically
 and replays the session state, but deliberating turns need a stable connection.
 
+## Custom domain (two hosts, one deployment)
+
+The same deployment can answer on the Replit host and on a custom domain.
+
+1. Add the domain in Replit (or your reverse proxy / Node host) and point DNS at it. TLS is
+   terminated by the platform; the app trusts one proxy hop (`trust proxy`).
+2. Set `ALLOWED_ORIGIN` to a **comma-separated list** with every public origin, no trailing
+   slashes:
+   ```
+   ALLOWED_ORIGIN=https://quorum.desmond-digital.com,https://quorum-scrimwiggins.replit.app
+   ```
+   The first entry is the fallback for Stripe return URLs when a request carries no Origin.
+3. CORS accepts requests from either origin (and same-origin/no-Origin requests). The session
+   cookie is host-only (`SameSite=Lax`, no `Domain` attribute), so signing in on one host does not
+   leak the cookie to the other; sign in on each host you use.
+4. Checkout success/cancel URLs are derived from the request origin only when it is in
+   `ALLOWED_ORIGIN`. An unknown origin falls back to the first allowed origin, so an attacker
+   cannot redirect a Stripe return to their own site.
+5. Smoke test both hosts: `/api/health`, register, open a session, and start a checkout (the
+   Stripe return must land on the host you started from).
+
 ## Stripe (optional)
 
-Billing fails closed: with no price IDs, accounts remain on Associate and checkout returns a
-readable "billing is not configured" message.
+Billing fails closed: with no price IDs, accounts remain on Associate and only the affected
+checkout option returns the readable "billing is not configured" message.
 
-To enable Executive:
+### Prices to create
 
-1. Create two recurring prices on the same product: $10/month and $96/year.
-2. Put their IDs in `STRIPE_PRICE_ID_PRO` and `STRIPE_PRICE_ID_PRO_ANNUAL`.
-3. Add the webhook endpoint `https://<host>/api/webhook` for
-   `checkout.session.completed`, `customer.subscription.updated`, `customer.subscription.deleted`.
-4. Put the signing secret in `STRIPE_WEBHOOK_SECRET`.
+Create one product per plan (or one product with several prices) in Stripe:
+
+| Option | Amount | Env var |
+|---|---|---|
+| Pro monthly | $29 / month recurring | `STRIPE_PRICE_ID_PRO` |
+| Pro yearly | $290 / year recurring | `STRIPE_PRICE_ID_PRO_ANNUAL` |
+| Boardroom monthly | $99 / month recurring | `STRIPE_PRICE_ID_BOARDROOM` |
+| Boardroom yearly | $990 / year recurring | `STRIPE_PRICE_ID_BOARDROOM_ANNUAL` |
+| Single Session | $5 one-time | `STRIPE_PRICE_ID_SESSION_FAST` |
+| Boardroom Session | $15 one-time | `STRIPE_PRICE_ID_SESSION_BOARDROOM` |
+
+Display amounts live in `shared/pricing.ts` (one module, for A/B tests later). Stripe ids are
+never hardcoded — only read from these env vars.
+
+### Webhook
+
+Add `https://<host>/api/webhook` and subscribe to:
+
+- `checkout.session.completed` — sets the plan from metadata, or grants one session credit
+  (idempotent on the Checkout Session id)
+- `customer.subscription.updated` — maps the price id back to Pro/Boardroom; `past_due` keeps the
+  plan while Stripe retries, `canceled`/`unpaid`/`incomplete_expired` downgrade to Free
+- `customer.subscription.deleted` — downgrades to Free
+- `invoice.payment_succeeded` — keeps the plan active
+- `invoice.payment_failed` — marks the subscription `past_due`
+
+Put the signing secret in `STRIPE_WEBHOOK_SECRET`.
+
+### Plan changes and the customer portal
+
+- An active subscriber who chooses the other plan is switched in place
+  (`subscriptions.update` with proration). No second Checkout session is created, so a user can
+  never hold two live subscriptions.
+- `POST /api/billing-portal` opens Stripe's customer portal (cards, invoices, cancellation).
+  Enable the portal in the Stripe Dashboard → Settings → Billing → Customer portal; the default
+  configuration is enough.
+
+### Migration
+
+`migrations/20261103_001_pricing_session_credits.sql` adds the `session_credits` table and
+`conversations.session_credit_id`. It is additive and idempotent; run it with
+`node scripts/migrate.mjs` before deploying the new build.
 
 ## Release checklist
 

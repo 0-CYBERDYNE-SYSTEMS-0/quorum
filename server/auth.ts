@@ -65,7 +65,14 @@ export function setupAuth(app: Express) {
     store: storage.sessionStore,
     cookie: {
       maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+      // Both the Replit host and the custom domain are HTTPS in production.
+      // No `domain` is set on purpose: the cookie stays host-only, so one
+      // deployment can serve quorum.desmond-digital.com and
+      // quorum-<name>.replit.app without cross-host leakage. `lax` still
+      // sends the cookie on top-level checkout returns from Stripe.
       secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      httpOnly: true,
     }
   };
 
