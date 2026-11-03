@@ -20,10 +20,16 @@ export const HOUSE_KEY_PAID_MODEL_ALLOWLIST = [
   "openai/gpt-6-luna",
 ] as const;
 
-/** Output cap for ordinary expert replies (documents keep maxOutputTokens()). */
-export const EXPERT_REPLY_MAX_TOKENS = 1200;
+/**
+ * Output cap for ordinary expert replies. Reasoning tokens count against this
+ * same budget, and mandatory-reasoning models (z-ai/glm-5.3-flash) spend a
+ * large share of it before writing. 1200 produced finish_reason=length with
+ * empty or truncated answers in the 2026-11-02 live run; 8192 leaves room for
+ * both reasoning and a full reply.
+ */
+export const EXPERT_REPLY_MAX_TOKENS = 8192;
 /** Output cap for the Moderator's closing decision memo (seven short sections). */
-export const CLOSING_MEMO_MAX_TOKENS = 2000;
+export const CLOSING_MEMO_MAX_TOKENS = 8192;
 
 /**
  * Default model for the pre-answer tool-planning call on paid tiers. The

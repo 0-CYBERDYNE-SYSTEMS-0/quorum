@@ -13,6 +13,11 @@ const { mockChatStream, mockCreateMessage, mockGetConversation, mockGetConversat
 
 vi.mock("../server/ai-providers", () => ({
   getProvider: vi.fn(() => ({ chat: vi.fn(), chatStream: mockChatStream })),
+  OUTPUT_LIMIT_ERROR: "Response reached the output limit. Please ask for a shorter response or split the request into smaller parts.",
+  escalatedOutputTokens: (current?: number) => {
+    const base = current && current > 0 ? current : 8192;
+    return Math.min(Math.max(base * 2, base + 2048), 32768);
+  },
 }));
 
 vi.mock("../server/storage", () => ({
@@ -440,5 +445,39 @@ describe("closing decision memo assumptions", () => {
       "## Open questions for the Chair",
       "## Assumptions awaiting confirmation",
     ]);
+  });
+
+  it("retries with a larger budget then falls back to the paid aux model instead of storing an error row", async () => {
+    const providerFailure = () => Object.assign(
+      new Error("OpenRouter could not complete this request (400). Retry or continue with available work."),
+      { statusCode: 400, isProviderError: true },
+    );
+    mockChatStream
+      .mockRejectedValueOnce(providerFailure())
+      .mockRejectedValueOnce(providerFailure());
+
+    await generateClosingSynthesis(61, {
+      id: null,
+      conversationId: 61,
+      name: "Moderator",
+      role: "Moderator",
+      model: "z-ai/glm-5.3-flash",
+      systemPrompt: "Facilitate the board.",
+    }, vi.fn(), {});
+
+    expect(mockChatStream.mock.calls.map(call => call[1])).toEqual([
+      "z-ai/glm-5.3-flash",
+      "z-ai/glm-5.3-flash",
+      "openai/gpt-6-luna",
+    ]);
+    expect(mockChatStream.mock.calls.map(call => (call[5] as { maxTokens?: number }).maxTokens)).toEqual([
+      8192,
+      16384,
+      8192,
+    ]);
+    const stored = mockCreateMessage.mock.calls[0][0] as { content: string; isSynthesis?: boolean };
+    expect(stored.isSynthesis).toBe(true);
+    expect(stored.content).toContain("## Decision");
+    expect(stored.content).not.toContain("Error generating response");
   });
 });

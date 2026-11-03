@@ -236,7 +236,7 @@ describe("AI Providers", () => {
       const body = JSON.parse(mockFetch.mock.calls[0][1].body);
 
       expect(body.usage).toEqual({ include: true });
-      expect(body.max_tokens).toBe(4096);
+      expect(body.max_tokens).toBe(8192);
       expect(body.provider.max_price).toEqual({ prompt: expect.any(Number), completion: expect.any(Number) });
       expect(result.usage).toEqual({ prompt_tokens: 20, completion_tokens: 10, total_tokens: 30, cost: "0.12" });
       expect(result.providerGenerationId).toBe("gen_123");
@@ -561,7 +561,7 @@ describe("AI Providers", () => {
       const body = JSON.parse(mockFetch.mock.calls[0][1].body);
 
       expect(body.usage).toEqual({ include: true });
-      expect(body.max_tokens).toBe(4096);
+      expect(body.max_tokens).toBe(8192);
       expect(result.providerGenerationId).toBe("gen_stream");
       expect(result.usage?.cost).toBe(0.07);
       expect(provider.getUsageSnapshot()).toMatchObject({
@@ -686,7 +686,7 @@ describe("AI Providers", () => {
       expect(body.max_tokens).toBe(2000);
     });
 
-    it("reasoningEffort none disables reasoning entirely on chatStream", async () => {
+    it("omits the reasoning field for reasoningEffort none so mandatory-reasoning models accept it", async () => {
       process.env.OPENROUTER_API_KEY = "or-key-123";
       process.env.OPENROUTER_REASONING_EFFORT = "high";
       mockFetch.mockResolvedValueOnce(mockSseResponse([
@@ -695,11 +695,56 @@ describe("AI Providers", () => {
       ]));
 
       const provider = new OpenRouterProvider();
-      await provider.chatStream([{ role: "user", content: "close" }], "dots-studio/dots-3-note-preview:free", () => {}, undefined, false, { maxTokens: 2000, reasoningEffort: "none" });
+      await provider.chatStream([{ role: "user", content: "close" }], "z-ai/glm-5.3-flash", () => {}, undefined, false, { maxTokens: 2000, reasoningEffort: "none" });
 
       const body = JSON.parse(mockFetch.mock.calls[0][1].body);
-      expect(body.reasoning).toEqual({ enabled: false });
+      expect(body).not.toHaveProperty("reasoning");
       expect(body.max_tokens).toBe(2000);
+    });
+
+    it.each(["chat", "chatStream"] as const)("retries once without reasoning after a mandatory-reasoning 400 on %s", async (method) => {
+      process.env.OPENROUTER_API_KEY = "or-key-123";
+      const mandatory = new Response(JSON.stringify({
+        error: { message: "Reasoning is mandatory for this endpoint and cannot be disabled.", code: 400 },
+      }), { status: 400, headers: { "Content-Type": "application/json" } });
+      mockFetch
+        .mockResolvedValueOnce(mandatory)
+        .mockResolvedValueOnce(method === "chat"
+          ? {
+              ok: true,
+              status: 200,
+              json: async () => ({ choices: [{ message: { role: "assistant", content: "planned" }, finish_reason: "stop" }] }),
+            }
+          : mockSseResponse([
+              { choices: [{ delta: { content: "planned" }, finish_reason: null }] },
+              { choices: [{ delta: {}, finish_reason: "stop" }] },
+            ]));
+
+      const provider = new OpenRouterProvider();
+      const result = method === "chat"
+        ? await provider.chat([{ role: "user", content: "plan" }], "z-ai/glm-5.3-flash", undefined, false, { reasoningEffort: "low" })
+        : await provider.chatStream([{ role: "user", content: "plan" }], "z-ai/glm-5.3-flash", () => {}, undefined, false, { reasoningEffort: "low" });
+
+      expect(result.message.content).toBe("planned");
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      expect(JSON.parse(mockFetch.mock.calls[0][1].body).reasoning).toEqual({ effort: "low" });
+      expect(JSON.parse(mockFetch.mock.calls[1][1].body)).not.toHaveProperty("reasoning");
+      expect(provider.getUsageSnapshot().attempts.at(-1)).toMatchObject({ result: "success", httpStatus: 200 });
+    });
+
+    it.each(["chat", "chatStream"] as const)("does not retry a 400 that is not a mandatory-reasoning rejection on %s", async (method) => {
+      process.env.OPENROUTER_API_KEY = "or-key-123";
+      mockFetch.mockResolvedValueOnce(new Response(JSON.stringify({
+        error: { message: "Invalid request", code: 400 },
+      }), { status: 400 }));
+
+      const provider = new OpenRouterProvider();
+      const call = method === "chat"
+        ? provider.chat([{ role: "user", content: "plan" }], "z-ai/glm-5.3-flash", undefined, false, { reasoningEffort: "low" })
+        : provider.chatStream([{ role: "user", content: "plan" }], "z-ai/glm-5.3-flash", () => {}, undefined, false, { reasoningEffort: "low" });
+
+      await expect(call).rejects.toMatchObject({ statusCode: 400 });
+      expect(mockFetch).toHaveBeenCalledTimes(1);
     });
 
     it("throws when an SSE frame contains a provider error", async () => {
@@ -773,7 +818,7 @@ describe("AI Providers", () => {
       expect(init.headers.Authorization).toBe("Bearer test-only-openrouter-key");
     });
 
-    it("sends provider preferences (ignore Relace, allow fallbacks) on expert calls", async () => {
+    it("sends lowercase provider slugs (ignore relace, allow fallbacks) on expert calls", async () => {
       process.env.OPENROUTER_API_KEY = "test-only-openrouter-key";
       mockFetch.mockResolvedValueOnce(mockSseResponse([
         { choices: [{ delta: { content: "Answer" }, finish_reason: "stop", native_finish_reason: "end_turn" }] },
@@ -784,7 +829,9 @@ describe("AI Providers", () => {
 
       const [, init] = mockFetch.mock.calls.at(-1)!;
       const body = JSON.parse(init.body);
-      expect(body.provider).toMatchObject({ ignore: ["Relace"], allow_fallbacks: true });
+      // OpenRouter provider preferences use slugs such as "relace", not the
+      // display name "Relace"; the wrong case left Relace routing enabled.
+      expect(body.provider).toMatchObject({ ignore: ["relace"], allow_fallbacks: true });
       expect(response.message.content).toBe("Answer");
       expect(provider.getUsageSnapshot().attempts.at(-1)).toMatchObject({
         result: "success",
@@ -804,7 +851,8 @@ describe("AI Providers", () => {
       mockFetch.mockResolvedValueOnce(reply());
       await provider.chat([{ role: "user", content: "hello" }], "z-ai/glm-5.3-flash");
       let body = JSON.parse(mockFetch.mock.calls.at(-1)![1].body);
-      expect(body.provider).toMatchObject({ ignore: ["Relace", "SlowCo"], allow_fallbacks: true });
+      // Slugs are lowercase; normalize overrides so a mixed-case name still matches.
+      expect(body.provider).toMatchObject({ ignore: ["relace", "slowco"], allow_fallbacks: true });
 
       process.env.OPENROUTER_PROVIDER_IGNORE = "";
       mockFetch.mockResolvedValueOnce(reply());

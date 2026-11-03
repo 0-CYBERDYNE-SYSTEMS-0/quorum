@@ -114,10 +114,10 @@ describe("usage caps: OpenRouterProvider enforcement", () => {
     store.getUser.mockResolvedValue({ id: 1, tier: "pro" });
     mockFetch.mockResolvedValue(okResponse(0.001));
     await new OpenRouterProvider(null).chat(messages, "z-ai/glm-5.3-flash", 1, false, { maxTokens: EXPERT_REPLY_MAX_TOKENS });
-    expect(JSON.parse(mockFetch.mock.calls[0][1].body).max_tokens).toBe(1200);
+    expect(JSON.parse(mockFetch.mock.calls[0][1].body).max_tokens).toBe(8192);
     mockFetch.mockClear();
     await new OpenRouterProvider(null).chat(messages, "z-ai/glm-5.3-flash", 1);
-    expect(JSON.parse(mockFetch.mock.calls[0][1].body).max_tokens).toBe(4096);
+    expect(JSON.parse(mockFetch.mock.calls[0][1].body).max_tokens).toBe(8192);
   });
 
   it("records house-key spend per user per month", async () => {

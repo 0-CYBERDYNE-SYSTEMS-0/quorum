@@ -10,9 +10,9 @@ import path from "path";
 import fs from "fs";
 import axios from "axios";
 import { randomBytes } from "crypto";
-import { getProvider, OUTPUT_LIMIT_ERROR, type ChatOptions } from "./ai-providers";
+import { getProvider, OUTPUT_LIMIT_ERROR, escalatedOutputTokens, type ChatOptions } from "./ai-providers";
 import { MAX_LOGGED_PROVIDER_TEXT, redactAndTruncateLogText } from "./log-redaction";
-import { BUDGET_FALLBACK_MODEL, CLOSING_MEMO_MAX_TOKENS, DEFAULT_AUX_MODEL_FALLBACK_SLUG, DEFAULT_AUX_MODEL_SLUG, EXPERT_REPLY_MAX_TOKENS } from "./usage-caps";
+import { BUDGET_FALLBACK_MODEL, CLOSING_MEMO_MAX_TOKENS, DEFAULT_AUX_MODEL_FALLBACK_SLUG, DEFAULT_AUX_MODEL_SLUG, EXPERT_REPLY_MAX_TOKENS, UsageCapError } from "./usage-caps";
 import { findCatalogExpert } from "@shared/expert-catalog";
 import { isDeferentialStancePosition } from "@shared/stance";
 import { DELIVERABLE_PLACEHOLDER, pendingDeliverableFor, pendingDeliverableByMessage } from "./pending-deliverables";
@@ -20,7 +20,7 @@ export { commitPendingDeliverable, discardPendingDeliverable } from "./pending-d
 import { enforceCitationIntegrity, removeUnsupportedCitedSentences, stripMetaLines, undecorate, mergeDuplicateFarmerQuestions, removeRepeatedExpertSentences } from "./response-hygiene";
 import {
   buildToolUsePrompt, buildToolPlanningPrompt, parseToolPlan, runToolCalls, formatToolResultsForPrompt,
-  toolCallLimitForTier, extractDeliverable, saveExpertDeliverable, filterChartArtifacts, type ChartArtifactRejectionReason, type ChartEvidence, type ToolRun,
+  toolCallLimitForTier, extractDeliverable, saveExpertDeliverable, filterChartArtifacts, type ChartArtifactRejection, type ChartEvidence, type ToolRun,
 } from "./expert-tools";
 
 /** Expert tools are on by default; EXPERT_TOOLS=off disables them. Unit tests never hit the network. */
@@ -30,13 +30,16 @@ export function expertToolsEnabled(): boolean {
 
 const CHART_REJECTION_NOTICE = "\n\nI couldn't render the chart because its data, source, or specification failed validation. Please provide or confirm the source data, and I'll try again.";
 
-function logRejectedCharts(role: string, reasons: ChartArtifactRejectionReason[]): void {
-  if (!reasons.length) return;
-  const counts = reasons.reduce<Record<string, number>>((totals, reason) => {
-    totals[reason] = (totals[reason] ?? 0) + 1;
+function logRejectedCharts(role: string, rejected: ChartArtifactRejection[]): void {
+  if (!rejected.length) return;
+  const counts = rejected.reduce<Record<string, number>>((totals, item) => {
+    totals[item.reason] = (totals[item.reason] ?? 0) + 1;
     return totals;
   }, {});
-  console.warn(`[CHARTS] rejected ${reasons.length} chart(s) from ${role}: ${JSON.stringify(counts)}`);
+  // One bounded excerpt of the first rejected spec so a live failure is
+  // diagnosable (truncated JSON vs. malformed chart) without exposing keys.
+  const first = rejected[0]?.excerpt;
+  console.warn(`[CHARTS] rejected ${rejected.length} chart(s) from ${role}: ${JSON.stringify(counts)}${first ? `; first rejected spec (${rejected[0].reason}): ${first}` : ""}`);
 }
 
 /** Paid OpenRouter web plugin only on explicit opt-in; free DuckDuckGo tools are the default. */
@@ -44,8 +47,11 @@ function paidWebPluginEnabled(): boolean {
   return process.env.OPENROUTER_WEB_PLUGIN === "true";
 }
 
-/** Planning output is at most one line per allowed tool call. */
-export const PLANNING_MAX_TOKENS = 2048;
+/**
+ * Planning output is at most one line per allowed tool call, but mandatory
+ * reasoning is billed against this same budget, so leave 4096 tokens.
+ */
+export const PLANNING_MAX_TOKENS = 4096;
 
 /** Expert reply calls see the last N transcript messages. */
 const EXPERT_HISTORY_MESSAGES = 8;
@@ -78,7 +84,7 @@ async function runExpertToolPhase(expert: Expert, question: string, userId?: num
       const planning = await callOpenRouterAPI([
         { role: "system", content: buildToolPlanningPrompt(expert.role, question, limit) },
         { role: "user", content: "List your tool calls now (or NONE)." },
-      ], model, userId, false, { maxTokens: PLANNING_MAX_TOKENS, reasoningEffort: "none" });
+      ], model, userId, false, { maxTokens: PLANNING_MAX_TOKENS });
       plan = planning.message.content ?? "NONE";
       planningFailed = false;
       break;
@@ -514,6 +520,12 @@ function isRetryableProviderError(error: unknown): boolean {
   return details.isProviderError === true || /(?:APIConnectionTimeoutError|TimeoutError|ETIMEDOUT|UND_ERR_CONNECT_TIMEOUT|ECONNRESET|ECONNREFUSED|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN)/i.test(description);
 }
 
+/** finish_reason=length surfaced by the provider (reasoning or output exhausted the budget). */
+function isOutputLimitFailure(error: unknown): boolean {
+  return typeof error === "object" && error !== null &&
+    (error as { message?: unknown }).message === OUTPUT_LIMIT_ERROR;
+}
+
 /**
  * Compact, log-only description of a provider failure: which provider served
  * the attempt, how the stream ended, and the upstream error text. Never
@@ -899,6 +911,10 @@ export async function callExpertStreamWithResilience(
   let bufferTokens = false;
   let streamedToClient = false;
   let lastError: unknown;
+  // A finish_reason=length retry asks for a larger output budget: mandatory
+  // reasoning consumes the same budget, so repeating the same cap only repeats
+  // the truncation. Options are copied so the caller's object is untouched.
+  let requestOptions: ChatOptions = { ...(options ?? {}) };
 
   for (let attemptIndex = 0; attemptIndex <= maxRetries; attemptIndex++) {
     const finalAttempt = attemptIndex === maxRetries;
@@ -907,7 +923,7 @@ export async function callExpertStreamWithResilience(
     const queued: string[] = [];
     try {
       if (finalAttempt) {
-        const response = await deps.chat(messages, model, userId, webSearch, options);
+        const response = await deps.chat(messages, model, userId, webSearch, requestOptions);
         onToken(response.message.content);
         return response;
       }
@@ -918,7 +934,7 @@ export async function callExpertStreamWithResilience(
           streamedToClient = true;
           onToken(token);
         }
-      }, userId, webSearch, options);
+      }, userId, webSearch, requestOptions);
       if (bufferTokens && queued.length) onToken(queued.join(""));
       return response;
     } catch (error) {
@@ -931,6 +947,17 @@ export async function callExpertStreamWithResilience(
         break;
       }
       if (attemptIndex === 0 && streamedToClient) break;
+      // A length retry must raise the budget: mandatory reasoning consumes the
+      // same tokens, so repeating the cap only repeats truncation. This runs
+      // only when the next attempt will actually start (no partial text was
+      // sent to the client).
+      if (isOutputLimitFailure(error)) {
+        const escalated = escalatedOutputTokens(requestOptions.maxTokens);
+        if (escalated > (requestOptions.maxTokens ?? 0)) {
+          console.warn(`[STREAM] ${model} hit the output limit; retrying with ${escalated} output tokens`);
+          requestOptions = { ...requestOptions, maxTokens: escalated };
+        }
+      }
       bufferTokens = true;
       const delayMs = expertRetryDelayMs(attemptIndex, baseDelayMs);
       console.warn(`[STREAM] provider attempt ${attemptIndex + 1}/${maxRetries + 1} failed for ${model}: ${(error as Error).message}; retrying in ${delayMs}ms`);
@@ -1416,8 +1443,8 @@ export async function getExpertResponseStream(
     const chartEvidence: ChartEvidence = {
       farmerText: history.filter(message => message.role === "user").map(message => message.content).join("\n"),
     };
-    const { kept: artifacts, dropped: droppedCharts, droppedReasons } = filterChartArtifacts(extracted.artifacts, allowedChartUrls, chartEvidence);
-    logRejectedCharts(expert.role, droppedReasons);
+    const { kept: artifacts, dropped: droppedCharts, rejected } = filterChartArtifacts(extracted.artifacts, allowedChartUrls, chartEvidence);
+    logRejectedCharts(expert.role, rejected);
     const finalized = expert.role === "File Creator" || expert.role === "Moderator"
       ? { content: extracted.cleanContent, addition: "" }
       : await finalizeExpertTools(expert, extracted.cleanContent, toolRun, deliverableSplit.deliverable, history);
@@ -1580,12 +1607,12 @@ export async function getExpertResponse(
     const chartEvidence: ChartEvidence = {
       farmerText: history.filter(message => message.role === "user").map(message => message.content).join("\n"),
     };
-    const { kept: artifacts, dropped: droppedCharts, droppedReasons } = filterChartArtifacts(
+    const { kept: artifacts, dropped: droppedCharts, rejected } = filterChartArtifacts(
       extractedNonStream.artifacts,
       allowedChartSourceUrls(null, response.citations),
       chartEvidence,
     );
-    logRejectedCharts(expert.role, droppedReasons);
+    logRejectedCharts(expert.role, rejected);
     const cleanContent = extractedNonStream.cleanContent + (droppedCharts ? CHART_REJECTION_NOTICE : "");
     const researchAnswer = isResearchAnalystRole(expert.role)
       ? appendRetrievedCitationUrls(cleanContent, response.citations)
@@ -2020,6 +2047,26 @@ export async function getModeratorNextSpeakerSuggestion(
 }
 
 /**
+ * The paid aux model used when the closing memo's own model fails. Free-tier
+ * calls already resolved to the free budget model (resolveAuxModelForUser), so
+ * they stay there: a paid fallback would be rejected by the tier cap.
+ */
+export function closingSynthesisFallbackModel(closingModel: string): string | null {
+  if (closingModel === BUDGET_FALLBACK_MODEL) return null;
+  if (closingModel === DEFAULT_AUX_MODEL_FALLBACK_SLUG) return null;
+  return DEFAULT_AUX_MODEL_FALLBACK_SLUG;
+}
+
+/** Auth and tier failures will fail the same way on another model; don't retry them. */
+function shouldRetryClosingSynthesis(error: unknown): boolean {
+  if (error instanceof UsageCapError) return false;
+  const status = typeof error === "object" && error !== null
+    ? Number((error as { statusCode?: unknown }).statusCode)
+    : NaN;
+  return Number.isInteger(status) && (status === 401 || status === 402) ? false : true;
+}
+
+/**
  * G5 semantic conclusion: after the Moderator answers 'Conclude', stream the
  * board's closing memo as one full Moderator turn. Broadcasts the same
  * lifecycle as a normal expert turn (expert_stream_start → tokens →
@@ -2092,24 +2139,43 @@ export async function generateClosingSynthesis(
         token,
       });
     };
-    // Free reasoning models can spend the whole output budget thinking and hit
-    // finish_reason=length before the memo is written. Keep reasoning low, cap
-    // the memo, and retry once on the budget model if the cap is still hit.
-    const closingOptions = { maxTokens: CLOSING_MEMO_MAX_TOKENS, reasoningEffort: "none" };
-    let response: AIModelResponse;
-    try {
-      response = await callOpenRouterAPIStream(messages, closingModel, onClosingToken, conversation?.userId, false, closingOptions);
-    } catch (error) {
-      if (!(error instanceof Error) || error.message !== OUTPUT_LIMIT_ERROR || closingModel === BUDGET_FALLBACK_MODEL) throw error;
-      console.warn(`[SYNTHESIS] ${closingModel} hit the output limit; retrying closing memo on ${BUDGET_FALLBACK_MODEL}`);
-      broadcastFn(conversationId, {
-        type: "expert_stream_start",
-        expertId: moderatorExpert.id,
-        expertName: moderatorExpert.name,
-        expertRole: "Moderator",
-      });
-      response = await callOpenRouterAPIStream(messages, BUDGET_FALLBACK_MODEL, onClosingToken, conversation?.userId, false, closingOptions);
+    // Reasoning tokens count against max_tokens, so a small memo cap plus a
+    // mandatory-reasoning model can end at finish_reason=length with no memo.
+    // Retry once with a larger budget, then fall back to the paid aux model so
+    // one provider failure cannot leave the memo as only an error row.
+    const closingFallback = closingSynthesisFallbackModel(closingModel);
+    const closingAttempts: Array<{ model: string; maxTokens: number }> = [
+      { model: closingModel, maxTokens: CLOSING_MEMO_MAX_TOKENS },
+      { model: closingModel, maxTokens: escalatedOutputTokens(CLOSING_MEMO_MAX_TOKENS) },
+      ...(closingFallback ? [{ model: closingFallback, maxTokens: CLOSING_MEMO_MAX_TOKENS }] : []),
+    ];
+    let response: AIModelResponse | undefined;
+    let closingError: unknown;
+    for (let index = 0; index < closingAttempts.length; index++) {
+      const attempt = closingAttempts[index];
+      try {
+        if (index > 0) {
+          console.warn(`[SYNTHESIS] closing memo retry ${index} on ${attempt.model} (${attempt.maxTokens} tokens)`);
+          // A fresh start clears any partial memo streamed by the failed attempt.
+          broadcastFn(conversationId, {
+            type: "expert_stream_start",
+            expertId: moderatorExpert.id,
+            expertName: moderatorExpert.name,
+            expertRole: "Moderator",
+          });
+        }
+        response = await callOpenRouterAPIStream(
+          messages, attempt.model, onClosingToken, conversation?.userId, false,
+          { maxTokens: attempt.maxTokens },
+        );
+        break;
+      } catch (error) {
+        closingError = error;
+        if (!shouldRetryClosingSynthesis(error)) throw error;
+        console.warn(`[SYNTHESIS] closing memo attempt ${index + 1} failed on ${attempt.model}:`, (error as Error).message);
+      }
     }
+    if (!response) throw closingError ?? new Error("The closing decision memo could not be generated.");
     const content = preserveOpenQuestionAssumptions(response.message.content, openQuestions, history);
 
     const storedMessage = await storage.createMessage({

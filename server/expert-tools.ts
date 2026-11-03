@@ -15,6 +15,7 @@ import { lookup } from "dns/promises";
 import net from "net";
 import { compile, type TopLevelSpec } from "vega-lite";
 import { parseVegaChart, themedVegaSpec } from "@shared/chart-artifact";
+import { redactAndTruncateLogText } from "./log-redaction";
 
 export const MAX_TOOL_CALLS_PER_TURN = 3;
 export const TOOL_TIMEOUT_MS = 10_000;
@@ -320,24 +321,75 @@ export async function saveExpertDeliverable(
 
 const GENERIC_TITLES = /^(chart( artifact)?|visual aid|data|trend|untitled|business metrics)$/i;
 
-/** Models often drop trailing closers from long JSON; add the missing ones before giving up. */
-function parseChartJson(text: string): unknown {
-  try { return JSON.parse(text); } catch (error) {
-    const closers: string[] = [];
-    let inString = false;
-    for (let i = 0; i < text.length; i++) {
-      const c = text[i];
-      if (inString) {
-        if (c === "\\") i++;
-        else if (c === '"') inString = false;
-      } else if (c === '"') inString = true;
-      else if (c === "{") closers.push("}");
-      else if (c === "[") closers.push("]");
-      else if (c === "}" || c === "]") { if (closers.pop() !== c) throw error; }
+/** Remove commas that sit directly before a closing brace/bracket (outside strings). */
+function stripTrailingCommas(text: string): string {
+  let result = "";
+  let inString = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      result += c;
+      if (c === "\\") {
+        if (i + 1 < text.length) result += text[++i];
+      } else if (c === '"') {
+        inString = false;
+      }
+      continue;
     }
-    if (inString || !closers.length) throw error;
-    return JSON.parse(text + closers.reverse().join(""));
+    if (c === '"') {
+      inString = true;
+      result += c;
+      continue;
+    }
+    if (c === ",") {
+      let next = i + 1;
+      while (next < text.length && /\s/.test(text[next])) next++;
+      if (text[next] === "}" || text[next] === "]") continue;
+    }
+    result += c;
   }
+  return result;
+}
+
+/**
+ * Replace missing trailing closers. Returns null when the text is truncated
+ * inside a string or its brackets do not nest: a partially written string would
+ * turn a cut-off chart into a plausible-looking but wrong one.
+ */
+function closeOpenJson(text: string): string | null {
+  const closers: string[] = [];
+  let inString = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      if (c === "\\") i++;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') inString = true;
+    else if (c === "{") closers.push("}");
+    else if (c === "[") closers.push("]");
+    else if (c === "}" || c === "]") {
+      if (closers.pop() !== c) return null;
+    }
+  }
+  if (inString || !closers.length) return null;
+  return text + closers.reverse().join("");
+}
+
+/**
+ * Models drop trailing closers and add trailing commas to long JSON specs.
+ * Repair only those two shapes; anything else stays invalid so the caller can
+ * log an excerpt instead of shipping a chart built from cut-off data.
+ */
+function parseChartJson(text: string): unknown {
+  const closed = closeOpenJson(text);
+  const candidates = [text, stripTrailingCommas(text)];
+  if (closed !== null) candidates.push(closed, stripTrailingCommas(closed));
+  for (const candidate of Array.from(new Set(candidates))) {
+    try { return JSON.parse(candidate); } catch { /* try the next repair */ }
+  }
+  throw new SyntaxError("chart JSON is not parseable");
 }
 
 export type ChartArtifactRejectionReason =
@@ -426,20 +478,33 @@ export function validateChartArtifact(
   return result.ok ? { json: result.json, title: result.title } : null;
 }
 
+export type ChartArtifactRejection = { reason: ChartArtifactRejectionReason; excerpt: string };
+
 /** Applies validateChartArtifact to extracted artifacts and reports why charts were rejected. */
 export function filterChartArtifacts<T extends { type: string; content: string; title?: string }>(
   artifacts: T[],
   allowedUrls: string[],
   evidence: ChartEvidence = {},
-): { kept: T[]; dropped: number; droppedReasons: ChartArtifactRejectionReason[] } {
+): { kept: T[]; dropped: number; droppedReasons: ChartArtifactRejectionReason[]; rejected: ChartArtifactRejection[] } {
   let dropped = 0;
   const kept: T[] = [];
   const droppedReasons: ChartArtifactRejectionReason[] = [];
+  const rejected: ChartArtifactRejection[] = [];
   for (const a of artifacts) {
     if (a.type !== "chart") { kept.push(a); continue; }
     const valid = validateChartArtifactDetailed(a.content, allowedUrls, evidence);
-    if (!valid.ok) { dropped++; droppedReasons.push(valid.reason); continue; }
+    if (!valid.ok) {
+      dropped++;
+      droppedReasons.push(valid.reason);
+      // First 300 characters of the rejected spec, redacted, so the next live
+      // run shows whether the model truncated it or emitted malformed JSON.
+      rejected.push({
+        reason: valid.reason,
+        excerpt: (redactAndTruncateLogText(a.content) ?? "").slice(0, 300),
+      });
+      continue;
+    }
     kept.push({ ...a, content: valid.json, title: valid.title });
   }
-  return { kept, dropped, droppedReasons };
+  return { kept, dropped, droppedReasons, rejected };
 }
