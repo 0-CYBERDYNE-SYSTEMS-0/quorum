@@ -60,6 +60,11 @@ vi.mock("../server/ai-providers", () => ({
     chat: mockProviderChat,
     chatStream: mockProviderChatStream,
   })),
+  OUTPUT_LIMIT_ERROR: "Response reached the output limit. Please ask for a shorter response or split the request into smaller parts.",
+  escalatedOutputTokens: (current?: number) => {
+    const base = current && current > 0 ? current : 8192;
+    return Math.min(Math.max(base * 2, base + 2048), 32768);
+  },
 }));
 
 import { registerRoutes } from "../server/routes";

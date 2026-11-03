@@ -21,10 +21,12 @@ describe("model routing and output cap", () => {
       "dots-studio/dots-3-note-preview:free",
     ]);
   });
-  it("defaults to 4096 and honours a sane override", () => {
+  it("defaults to 8192 and honours a sane override up to the ceiling", () => {
     expect(maxOutputTokens()).toBe(DEFAULT_MAX_OUTPUT_TOKENS);
+    expect(DEFAULT_MAX_OUTPUT_TOKENS).toBe(8192);
     process.env.OPENROUTER_MAX_OUTPUT_TOKENS = "2048"; expect(maxOutputTokens()).toBe(2048);
-    process.env.OPENROUTER_MAX_OUTPUT_TOKENS = "9999999"; expect(maxOutputTokens()).toBe(4096);
-    process.env.OPENROUTER_MAX_OUTPUT_TOKENS = "abc"; expect(maxOutputTokens()).toBe(4096);
+    process.env.OPENROUTER_MAX_OUTPUT_TOKENS = "16384"; expect(maxOutputTokens()).toBe(16384);
+    process.env.OPENROUTER_MAX_OUTPUT_TOKENS = "9999999"; expect(maxOutputTokens()).toBe(8192);
+    process.env.OPENROUTER_MAX_OUTPUT_TOKENS = "abc"; expect(maxOutputTokens()).toBe(8192);
   });
 });

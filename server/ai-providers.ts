@@ -6,23 +6,56 @@ import { randomUUID } from 'crypto';
 const AI_REQUEST_TIMEOUT_MS = 120_000;
 export const OUTPUT_LIMIT_ERROR = "Response reached the output limit. Please ask for a shorter response or split the request into smaller parts.";
 export { MAX_LOGGED_PROVIDER_TEXT };
-/** Providers excluded from OpenRouter routing by default; override with OPENROUTER_PROVIDER_IGNORE. */
-export const DEFAULT_PROVIDER_IGNORE = ["Relace"] as const;
-// Output ceiling per call. 1024 truncated File Creator SOPs mid-document;
-// 8192 let one runaway answer cost 8x a normal turn. 4096 (~3,000 words)
-// fits the longest documents we generate. Override with OPENROUTER_MAX_OUTPUT_TOKENS.
-export const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
-function reasoningParam(override?: string) {
-  // "none" turns reasoning off entirely. Some free models (dots-3-note) ignore
-  // effort:"low" and spend the whole max_tokens budget on hidden reasoning.
-  if (override === "none") return { reasoning: { enabled: false } };
-  const effort = override || process.env.OPENROUTER_REASONING_EFFORT;
-  return effort ? { reasoning: { effort } } : {};
+/**
+ * Providers excluded from OpenRouter routing by default; override with
+ * OPENROUTER_PROVIDER_IGNORE. OpenRouter matches provider *slugs*, which are
+ * lowercase (`relace`, not `Relace`), so the default is normalized.
+ */
+export const DEFAULT_PROVIDER_IGNORE = ["relace"] as const;
+// Output ceiling per call. 1024 truncated File Creator SOPs mid-document.
+// Reasoning models (z-ai/glm-5.3-flash, openai/gpt-6-luna) bill reasoning
+// against this same budget, so a small cap produced finish_reason=length with
+// little or no visible text. 8192 leaves room for ~1,000 reasoning tokens and
+// a full memo; 4096 planning replies are plenty. Override with
+// OPENROUTER_MAX_OUTPUT_TOKENS (a retry may escalate up to the ceiling).
+export const DEFAULT_MAX_OUTPUT_TOKENS = 8192;
+/** Hard ceiling for an explicitly escalated retry budget. */
+export const MAX_OUTPUT_TOKENS_CEILING = 32768;
+
+/**
+ * Reasoning request field. `none` means "do not ask for extra reasoning": the
+ * field is omitted entirely. Sending `{ enabled: false }` or `effort: "none"`
+ * is rejected by mandatory-reasoning endpoints — z-ai/glm-5.3-flash answers
+ * HTTP 400 "Reasoning is mandatory for this endpoint and cannot be disabled."
+ * Providers accept an omitted reasoning field, so omission is the safe form.
+ */
+function reasoningParam(override?: string): { reasoning?: { effort: string } } {
+  const effort = (override ?? process.env.OPENROUTER_REASONING_EFFORT ?? "").trim();
+  if (!effort || effort.toLowerCase() === "none") return {};
+  return { reasoning: { effort } };
 }
 
 export function maxOutputTokens(): number {
   const parsed = Number(process.env.OPENROUTER_MAX_OUTPUT_TOKENS);
-  return Number.isInteger(parsed) && parsed >= 256 && parsed <= 32768 ? parsed : DEFAULT_MAX_OUTPUT_TOKENS;
+  return Number.isInteger(parsed) && parsed >= 256 && parsed <= MAX_OUTPUT_TOKENS_CEILING
+    ? parsed
+    : DEFAULT_MAX_OUTPUT_TOKENS;
+}
+
+/**
+ * Next output budget for a finish_reason=length retry. Doubles the failed
+ * budget (at least +2048 tokens) without exceeding the hard ceiling.
+ */
+export function escalatedOutputTokens(current?: number): number {
+  const base = current && current > 0 ? current : maxOutputTokens();
+  return Math.min(Math.max(base * 2, base + 2048), MAX_OUTPUT_TOKENS_CEILING);
+}
+
+/** True for the OpenRouter 400 that rejects a disabled reasoning setting. */
+export const MANDATORY_REASONING_PATTERN = /reasoning is mandatory[\s\S]{0,120}(?:cannot be disabled|must be enabled)/i;
+
+export function isMandatoryReasoningError(status: number | undefined, body: string): boolean {
+  return status === 400 && MANDATORY_REASONING_PATTERN.test(body);
 }
 // Free OpenRouter models come and go; when a :free model is requested,
 // OpenRouter's `models` array lets it fall through to these (verified live 2026-10-16).
@@ -35,17 +68,19 @@ export function modelRouting(model: string): { model: string; models?: string[] 
 }
 
 /**
- * OpenRouter provider preferences for every house-key call. "Relace" routed
+ * OpenRouter provider preferences for every house-key call. "relace" routed
  * live expert streams that returned HTTP 200 and then failed before any token,
  * so it is ignored unless OPENROUTER_PROVIDER_IGNORE says otherwise (comma
- * separated; set it to an empty string to allow every provider).
+ * separated; set it to an empty string to allow every provider). Provider
+ * preferences are provider slugs and case-sensitive to OpenRouter's lowercase
+ * slug list, so every name is normalized here.
  */
 export function providerPreferences(env: NodeJS.ProcessEnv = process.env): { ignore?: string[]; allow_fallbacks: boolean } {
   const raw = env.OPENROUTER_PROVIDER_IGNORE;
-  const names = (raw === undefined ? DEFAULT_PROVIDER_IGNORE.join(",") : raw)
+  const names = Array.from(new Set((raw === undefined ? DEFAULT_PROVIDER_IGNORE.join(",") : raw)
     .split(",")
-    .map(name => name.trim())
-    .filter(Boolean);
+    .map(name => name.trim().toLowerCase())
+    .filter(Boolean)));
   return { ...(names.length ? { ignore: names } : {}), allow_fallbacks: true };
 }
 
@@ -273,7 +308,11 @@ export class OpenRouterProvider implements AIProvider {
   }
 
   private beginAttempt(model: string, messages: AIMessage[], maxTokensOverride?: number): OpenRouterAttempt {
-    const maxTokens = maxTokensOverride && maxTokensOverride > 0 ? Math.min(maxTokensOverride, maxOutputTokens()) : maxOutputTokens();
+    // An explicit per-call budget (expert turn, synthesis, or an escalated
+    // length retry) may exceed the env default; only the hard ceiling clamps it.
+    const maxTokens = maxTokensOverride && maxTokensOverride > 0
+      ? Math.min(maxTokensOverride, MAX_OUTPUT_TOKENS_CEILING)
+      : maxOutputTokens();
     const attempt: OpenRouterAttempt = {
       id: randomUUID(),
       model,
@@ -378,6 +417,67 @@ export class OpenRouterProvider implements AIProvider {
     };
   }
 
+  private requestPayload(args: {
+    routing: { model: string; models?: string[] };
+    messages: AIMessage[];
+    attempt: OpenRouterAttempt;
+    options: ChatOptions;
+    webSearch: boolean;
+    stream: boolean;
+    includeReasoning: boolean;
+  }): Record<string, unknown> {
+    return {
+      ...args.routing,
+      messages: args.messages,
+      temperature: 0.7,
+      ...this.requestBudget(args.attempt),
+      usage: { include: true },
+      ...(args.includeReasoning ? reasoningParam(args.options.reasoningEffort) : {}),
+      ...(args.webSearch ? { plugins: [{ id: "web", max_results: 3 }] } : {}),
+      ...(args.stream ? { stream: true } : {}),
+    };
+  }
+
+  /**
+   * POST one chat completion. When a reasoning-disable setting triggers the
+   * mandatory-reasoning 400, retry once with the reasoning field omitted. The
+   * error body is returned when it was consumed so the caller can still log it.
+   */
+  private async postChatCompletion(args: {
+    model: string;
+    routing: { model: string; models?: string[] };
+    messages: AIMessage[];
+    attempt: OpenRouterAttempt;
+    options: ChatOptions;
+    webSearch: boolean;
+    stream: boolean;
+    openRouterKey: string;
+  }): Promise<{ response: Response; errorBody?: string }> {
+    const url = "https://openrouter.ai/api/v1/chat/completions";
+    const send = (includeReasoning: boolean) => fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${args.openRouterKey}`,
+        "HTTP-Referer": "https://github.com/0-CYBERDYNE-SYSTEMS-0/quorum",
+        "X-Title": "Quorum"
+      },
+      body: JSON.stringify(this.requestPayload({ ...args, includeReasoning })),
+      signal: AbortSignal.timeout(AI_REQUEST_TIMEOUT_MS),
+    });
+    const sendsReasoning = Object.keys(reasoningParam(args.options.reasoningEffort)).length > 0;
+    let response = await send(sendsReasoning);
+    if (response.ok || response.status !== 400 || !sendsReasoning) return { response };
+
+    const body = await response.text().catch(() => "");
+    if (!isMandatoryReasoningError(response.status, body)) return { response, errorBody: body };
+
+    console.warn(`[OPENROUTER] ${args.model} requires reasoning; retrying ${args.stream ? "stream" : "call"} without the reasoning field`);
+    response = await send(false);
+    if (response.ok || response.status !== 400) return { response };
+    return { response, errorBody: await response.text().catch(() => "") };
+  }
+
   private async getApiKey(userId?: number): Promise<string> {
     return (await this.resolveKey(userId)).key;
   }
@@ -450,29 +550,20 @@ export class OpenRouterProvider implements AIProvider {
       attempt.routedModels = routing.models ?? [routing.model];
 
       requestStarted = true;
-      const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${openRouterKey}`,
-          "HTTP-Referer": "https://github.com/0-CYBERDYNE-SYSTEMS-0/quorum",
-          "X-Title": "Quorum"
-        },
-        body: JSON.stringify({
-          ...routing,
-          messages: messages,
-          temperature: 0.7,
-          ...this.requestBudget(attempt),
-          usage: { include: true },
-          ...reasoningParam(options.reasoningEffort),
-          ...(webSearch ? { plugins: [{ id: "web", max_results: 3 }] } : {}),
-        }),
-        signal: AbortSignal.timeout(AI_REQUEST_TIMEOUT_MS),
+      const { response, errorBody } = await this.postChatCompletion({
+        model,
+        routing,
+        messages,
+        attempt,
+        options,
+        webSearch,
+        stream: false,
+        openRouterKey,
       });
       httpStatus = response.status;
 
       if (!response.ok) {
-        const body = await response.text().catch(() => "");
+        const body = errorBody ?? await response.text().catch(() => "");
         throw safeOpenRouterError(response.status, body, providerErrorDiagnosticsFromBody(body));
       }
 
@@ -570,30 +661,20 @@ export class OpenRouterProvider implements AIProvider {
       attempt.routedModels = routing.models ?? [routing.model];
 
       requestStarted = true;
-      const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${openRouterKey}`,
-          "HTTP-Referer": "https://github.com/0-CYBERDYNE-SYSTEMS-0/quorum",
-          "X-Title": "Quorum"
-        },
-        body: JSON.stringify({
-          ...routing,
-          messages: messages,
-          temperature: 0.7,
-          ...this.requestBudget(attempt),
-          usage: { include: true },
-          ...reasoningParam(options.reasoningEffort),
-          ...(webSearch ? { plugins: [{ id: "web", max_results: 3 }] } : {}),
-          stream: true,
-        }),
-        signal: AbortSignal.timeout(AI_REQUEST_TIMEOUT_MS),
+      const { response, errorBody } = await this.postChatCompletion({
+        model,
+        routing,
+        messages,
+        attempt,
+        options,
+        webSearch,
+        stream: true,
+        openRouterKey,
       });
       httpStatus = response.status;
 
       if (!response.ok) {
-        const body = await response.text().catch(() => "");
+        const body = errorBody ?? await response.text().catch(() => "");
         throw safeOpenRouterError(response.status, body, providerErrorDiagnosticsFromBody(body));
       }
 

@@ -232,4 +232,33 @@ describe("themed Vega-Lite artifacts", () => {
     expect(validateChartArtifact(text.replace('"Corn"', '"Co}rn"').slice(0, -1), [])).not.toBeNull();
     expect(validateChartArtifact(text + "}", [])).toBeNull();
   });
+  it("accepts a valid Vega-Lite spec in a fenced block as a chart", () => {
+    const extracted = extractArtifacts(`Here is the comparison.\n\n\`\`\`vega-lite\n${JSON.stringify(chart)}\n\`\`\``);
+    expect(extracted.artifacts).toHaveLength(1);
+    expect(extracted.artifacts[0]).toMatchObject({ type: "chart", language: "json" });
+    const filtered = filterChartArtifacts(extracted.artifacts, []);
+    expect(filtered.dropped).toBe(0);
+    expect(filtered.rejected).toEqual([]);
+    expect(filtered.kept).toHaveLength(1);
+    expect(JSON.parse(filtered.kept[0].content)).toMatchObject({
+      type: "vega-lite",
+      title: "Monthly revenue · Q2",
+      sources: ["Chair"],
+    });
+  });
+  it("repairs trailing commas safely and reports an excerpt when a spec cannot be repaired", () => {
+    const trailingCommas = '{"type":"vega-lite","title":"Trailing comma repair","sources":["Chair"],"data":[{"x":"A","y":1},],"spec":{"mark":"bar","encoding":{"x":{"field":"x","type":"nominal"},"y":{"field":"y","type":"quantitative"}},}}';
+    const repaired = validateChartArtifact(trailingCommas, []);
+    expect(repaired).not.toBeNull();
+    expect(JSON.parse(repaired!.json).title).toBe("Trailing comma repair");
+
+    // Truncated inside a string: unsafe to complete, so reject and log an excerpt.
+    const truncated = '{"type":"vega-lite","title":"Cut off","sources":["Chair"],"data":[{"x":"A","y":1,"label":"Cust';
+    const filtered = filterChartArtifacts([{ type: "chart", content: truncated, title: "Cut off" }], []);
+    expect(filtered.dropped).toBe(1);
+    expect(filtered.rejected).toHaveLength(1);
+    expect(filtered.rejected[0].reason).toBe("invalid-json");
+    expect(filtered.rejected[0].excerpt).toContain('"title":"Cut off"');
+    expect(filtered.rejected[0].excerpt.length).toBeLessThanOrEqual(300);
+  });
 });

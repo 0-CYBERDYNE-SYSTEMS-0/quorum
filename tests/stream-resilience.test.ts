@@ -15,6 +15,7 @@ import {
   providerFailureLogDetail,
 } from "../server/ai";
 import { BUDGET_FALLBACK_MODEL, DEFAULT_AUX_MODEL_FALLBACK_SLUG, DEFAULT_AUX_MODEL_SLUG, isHouseKeyAllowedModel } from "../server/usage-caps";
+import { OUTPUT_LIMIT_ERROR } from "../server/ai-providers";
 import type { AIModelResponse } from "../server/ai";
 
 const reply = (content: string, model = "z-ai/glm-5.3-flash"): AIModelResponse => ({
@@ -96,6 +97,37 @@ describe("expert stream resilience", () => {
     expect(response.message.content).toBe("Buffered answer");
     expect(chat).not.toHaveBeenCalled();
     expect(tokens).toEqual(["Buffered answer"]);
+  });
+
+  it("retries an empty length failure with a larger output budget", async () => {
+    const lengthFailure = () =>
+      Object.assign(new Error(OUTPUT_LIMIT_ERROR), { isProviderError: true, finishReason: "length" });
+    const stream = vi.fn()
+      .mockRejectedValueOnce(lengthFailure())
+      .mockImplementationOnce(async (_messages: unknown, _model: string, onToken: (token: string) => void) => {
+        onToken("Full answer");
+        return reply("Full answer");
+      });
+    const chat = vi.fn();
+    const tokens: string[] = [];
+
+    const response = await callExpertStreamWithResilience(
+      [{ role: "user", content: "Assess the pilot" }],
+      "z-ai/glm-5.3-flash",
+      token => tokens.push(token),
+      undefined,
+      false,
+      { maxTokens: 8192 },
+      deps(stream, chat),
+      { sleep },
+    );
+
+    expect(response.message.content).toBe("Full answer");
+    expect(tokens).toEqual(["Full answer"]);
+    expect(stream.mock.calls[0][5]).toEqual({ maxTokens: 8192 });
+    // Mandatory reasoning shares the budget, so the retry asks for 16k tokens.
+    expect(stream.mock.calls[1][5]).toEqual({ maxTokens: 16384 });
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("retrying with 16384 output tokens"));
   });
 
   it("marks an exhausted seat so the orchestrator records exactly one error row", async () => {
@@ -200,7 +232,7 @@ describe("planning model defaults", () => {
     expect(planningModelsForTier("free")).toEqual(["z-ai/glm-5.3-flash"]);
   });
 
-  it("leaves headroom for the planning reply", () => {
-    expect(PLANNING_MAX_TOKENS).toBeGreaterThanOrEqual(1024);
+  it("leaves headroom for the planning reply plus mandatory reasoning", () => {
+    expect(PLANNING_MAX_TOKENS).toBeGreaterThanOrEqual(4096);
   });
 });
