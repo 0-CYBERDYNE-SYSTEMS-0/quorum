@@ -1,4 +1,4 @@
-import { checkHouseKeyCall, currentUsagePeriod, UsageCapError, BUDGET_FALLBACK_MODEL } from "./usage-caps";
+import { checkHouseKeyCall, currentUsagePeriod, UsageCapError, budgetFallbackModelForTier, FREE_TIER_BUDGET_MODEL } from "./usage-caps";
 import { MAX_LOGGED_PROVIDER_TEXT, redactAndTruncateLogText } from "./log-redaction";
 import type { AIMessage, AIModelResponse } from './ai';
 import { randomUUID } from 'crypto';
@@ -521,11 +521,28 @@ export class OpenRouterProvider implements AIProvider {
         }
       : undefined;
     const denial = checkHouseKeyCall(user?.tier, model, usage.aiSpendUsd, creditContext);
+    if (denial?.code === "ai_budget_overage") {
+      // Graceful paid overage: keep answering on the tier's PAID fallback model
+      // (never a ':free' slug for paying customers). Past the 25% ceiling
+      // checkHouseKeyCall returns ai_budget_exhausted instead and the call is
+      // refused with the existing message. The call still counts against the
+      // monthly spend, otherwise the ceiling could never be reached.
+      const fallback = budgetFallbackModelForTier(user?.tier);
+      console.info(`[CAPS] user ${userId} over AI budget — ${model} -> ${fallback}`);
+      attempt.houseKeyUserId = userId;
+      attempt.usagePeriod = period;
+      return { key, model: fallback };
+    }
     if (denial?.code === "ai_budget_exhausted") {
-      // Graceful fallback: keep answering on a free model; the client shows
-      // BUDGET_EXHAUSTED_NOTICE from /api/user/tier.
-      console.info(`[CAPS] user ${userId} AI budget spent — ${model} -> ${BUDGET_FALLBACK_MODEL}`);
-      return { key, model: BUDGET_FALLBACK_MODEL };
+      if (creditContext) throw new UsageCapError(denial);
+      if (user?.tier !== "pro" && user?.tier !== "boardroom" && user?.tier !== "enterprise") {
+        // Free tier keeps its existing behaviour: keep answering on the free
+        // budget model (free calls are never billed).
+        console.info(`[CAPS] user ${userId} AI budget spent — ${model} -> ${FREE_TIER_BUDGET_MODEL}`);
+        return { key, model: FREE_TIER_BUDGET_MODEL };
+      }
+      // Paid tiers are past the overage ceiling: surface ai_budget_exhausted.
+      throw new UsageCapError(denial);
     }
     if (denial) throw new UsageCapError(denial);
     attempt.houseKeyUserId = userId;

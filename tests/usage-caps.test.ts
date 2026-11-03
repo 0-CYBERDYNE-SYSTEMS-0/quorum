@@ -22,11 +22,15 @@ import {
   checkHouseKeyCall,
   currentUsagePeriod,
   monthlyAiBudgetUsd,
+  monthlyAiBudgetCeilingUsd,
+  budgetFallbackModelForTier,
   isHouseKeyAllowedModel,
   HOUSE_KEY_PAID_MODEL_ALLOWLIST,
   BOARDROOM_FRONTIER_MODEL_ALLOWLIST,
   UsageCapError,
   BUDGET_FALLBACK_MODEL,
+  BUDGET_FALLBACK_MODEL_FALLBACK,
+  FREE_TIER_BUDGET_MODEL,
   EXPERT_REPLY_MAX_TOKENS,
 } from "../server/usage-caps";
 import { SESSION_CREDIT_LIMITS } from "../server/tiers";
@@ -53,8 +57,18 @@ describe("usage caps: pure rules", () => {
     expect(checkMessageAllowance("pro", 1000)).toMatchObject({ status: 429, code: "message_limit_reached" });
   });
 
-  it("falls back to a free model the app already uses", () => {
-    expect(FREE_MODEL_FALLBACKS).toContain(BUDGET_FALLBACK_MODEL);
+  it("keeps the free tier's existing free budget model and gives paid tiers a paid fallback", () => {
+    expect(FREE_MODEL_FALLBACKS).toContain(FREE_TIER_BUDGET_MODEL);
+    expect(FREE_TIER_BUDGET_MODEL.endsWith(":free")).toBe(true);
+    expect(FREE_MODEL_FALLBACKS).not.toContain(BUDGET_FALLBACK_MODEL);
+    expect(BUDGET_FALLBACK_MODEL).toBe("deepseek/deepseek-v4.1-flash");
+    expect(BUDGET_FALLBACK_MODEL.endsWith(":free")).toBe(false);
+    expect(BUDGET_FALLBACK_MODEL_FALLBACK).toBe("openai/gpt-6-luna");
+    expect(isHouseKeyAllowedModel(BUDGET_FALLBACK_MODEL)).toBe(true);
+    expect(isHouseKeyAllowedModel(BUDGET_FALLBACK_MODEL_FALLBACK)).toBe(true);
+    expect(budgetFallbackModelForTier("pro")).toBe(BUDGET_FALLBACK_MODEL);
+    expect(budgetFallbackModelForTier("boardroom")).toBe(BUDGET_FALLBACK_MODEL);
+    expect(budgetFallbackModelForTier("free")).toBe(FREE_TIER_BUDGET_MODEL);
   });
 
   it("admits included paid models and every free model, and nothing else", () => {
@@ -85,9 +99,26 @@ describe("usage caps: pure rules", () => {
     expect(checkHouseKeyCall("free", "z-ai/glm-5.3-flash", 0)?.code).toBe("paid_model_requires_pro");
     expect(checkHouseKeyCall("pro", "z-ai/glm-5.3-flash", 7.99)).toBeNull();
     expect(checkHouseKeyCall("pro", "openai/o1-pro", 0)?.code).toBe("model_requires_own_key");
-    expect(checkHouseKeyCall("pro", "z-ai/glm-5.3-flash", 8)?.code).toBe("ai_budget_exhausted");
+    // Graceful overage: the tier budget is spent but the 25% ceiling is not.
+    expect(checkHouseKeyCall("pro", "z-ai/glm-5.3-flash", 8)?.code).toBe("ai_budget_overage");
+    expect(checkHouseKeyCall("pro", "z-ai/glm-5.3-flash", 9.99)?.code).toBe("ai_budget_overage");
+    // Past 25% overage the call is refused with the existing message.
+    expect(checkHouseKeyCall("pro", "z-ai/glm-5.3-flash", 10)?.code).toBe("ai_budget_exhausted");
+    expect(checkHouseKeyCall("pro", "z-ai/glm-5.3-flash", 10)?.message).toContain("included AI budget");
     expect(checkHouseKeyCall("pro", "google/gemma-4-31b-it:free", 100)).toBeNull();
     expect(checkHouseKeyCall("enterprise", "openai/o1-pro", 1e6)).toBeNull();
+  });
+
+  it("caps the paid overage at 25% of the tier budget", () => {
+    expect(monthlyAiBudgetCeilingUsd("pro")).toBe(10);
+    expect(monthlyAiBudgetCeilingUsd("boardroom")).toBe(43.75);
+    expect(monthlyAiBudgetCeilingUsd("enterprise")).toBe(Number.POSITIVE_INFINITY);
+    expect(monthlyAiBudgetCeilingUsd("free")).toBe(0);
+    expect(checkHouseKeyCall("boardroom", "z-ai/glm-5.3-flash", 43.74)?.code).toBe("ai_budget_overage");
+    expect(checkHouseKeyCall("boardroom", "z-ai/glm-5.3-flash", 43.75)?.code).toBe("ai_budget_exhausted");
+    // Overage never applies to a one-time session credit: its cap is hard.
+    const credit = { kind: "fast" as const, spentUsd: 1 };
+    expect(checkHouseKeyCall("free", "z-ai/glm-5.3-flash", 0, credit)?.code).toBe("ai_budget_exhausted");
   });
 
   it("gates boardroom-only frontier models (Pro gets a 402 upgrade message)", () => {
@@ -154,17 +185,26 @@ describe("usage caps: OpenRouterProvider enforcement", () => {
     expect(mockFetch).not.toHaveBeenCalled();
   });
 
-  it("falls back to a free model (not an error) once the Pro budget is spent", async () => {
+  it("falls back to the PAID fallback model (not a free model) once the Pro budget is spent", async () => {
     store.getUser.mockResolvedValue({ id: 1, tier: "pro" });
     store.getMonthlyUsage.mockResolvedValue({ messageCount: 3, aiSpendUsd: 8.01 });
-    mockFetch.mockResolvedValue(okResponse(0));
+    mockFetch.mockResolvedValue(okResponse(0.02));
     const res = await new OpenRouterProvider(null).chat(messages, "z-ai/glm-5.3-flash", 1);
     expect(res.message.content).toBe("hi");
     const body = JSON.parse(mockFetch.mock.calls[0][1].body);
     expect(body.model).toBe(BUDGET_FALLBACK_MODEL);
-    expect(body.model.endsWith(":free")).toBe(true);
-    await new Promise(r => setTimeout(r, 10));
-    expect(store.addMonthlyAiSpend).not.toHaveBeenCalled();
+    expect(body.model.endsWith(":free")).toBe(false);
+    // Overage spend is still counted, so the ceiling is reachable.
+    await vi.waitFor(() => expect(store.addMonthlyAiSpend).toHaveBeenCalledWith(1, currentUsagePeriod(), 0.02));
+  });
+
+  it("refuses paid-tier calls past the 25% overage ceiling with ai_budget_exhausted", async () => {
+    store.getUser.mockResolvedValue({ id: 1, tier: "pro" });
+    store.getMonthlyUsage.mockResolvedValue({ messageCount: 3, aiSpendUsd: 10.01 });
+    const error = await new OpenRouterProvider(null).chat(messages, "z-ai/glm-5.3-flash", 1).catch(e => e);
+    expect(error).toBeInstanceOf(UsageCapError);
+    expect(error.denial).toMatchObject({ status: 429, code: "ai_budget_exhausted" });
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it("caps expert replies at the requested max_tokens", async () => {

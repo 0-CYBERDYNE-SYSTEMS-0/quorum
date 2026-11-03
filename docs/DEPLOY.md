@@ -25,6 +25,13 @@ The repository ships `.replit` with the build and run commands pre-wired.
      `STRIPE_PRICE_ID_SESSION_FAST`, `STRIPE_PRICE_ID_SESSION_BOARDROOM`,
      `STRIPE_WEBHOOK_SECRET`
    - `PERPLEXITY_API_KEY`
+   AI budgets are graceful and paid-only above zero: once a paid tier's monthly
+   budget is spent, directors continue on the paid fallback model
+   (`deepseek/deepseek-v4.1-flash`, then `openai/gpt-6-luna`) up to 25% over
+   budget, then calls stop until the 1st with the `ai_budget_exhausted`
+   message. Paying customers are never downgraded to a `:free` model, and
+   `$5/$15` session credits run their helper calls on `z-ai/glm-5.3-flash`
+   (fallback `openai/gpt-6-luna`).
 4. **Deploy.** The deployment run command is:
    ```
    node scripts/migrate.mjs && npm start

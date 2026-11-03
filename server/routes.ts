@@ -183,9 +183,9 @@ async function effectiveLimits(userTier: string, conversationId?: number | null)
 /**
  * House-key model gate for a specific request. Frontier models are Boardroom
  * only; a Boardroom Session credit unlocks them for that conversation.
- * BYOK may pick anything. A budget denial here only covers the credit's own
- * cap — monthly budgets are checked at call time so the user gets the
- * graceful free-model fallback instead of a hard failure.
+ * BYOK may pick anything. Monthly budgets are checked at call time so a paid
+ * customer gets the graceful paid-fallback/overage path instead of a hard
+ * failure; only a credit's own hard cap is enforced here.
  */
 async function houseKeyModelDenial(userId: number, userTier: string, model: string, conversationId?: number | null) {
   if (await storage.getUserApiKey(userId)) return null;
@@ -196,7 +196,8 @@ async function houseKeyModelDenial(userId: number, userTier: string, model: stri
     0,
     credit ? { kind: credit.kind as "fast" | "boardroom", spentUsd: credit.aiSpendUsd } : undefined,
   );
-  return denial;
+  // Overage is not a rejection: the provider runs the paid fallback model.
+  return denial?.code === "ai_budget_overage" ? null : denial;
 }
 
 
@@ -1357,7 +1358,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         planName: PLAN_PRICING[tier as keyof typeof PLAN_PRICING]?.name ?? limits.name,
         limits,
         usage: { period: currentUsagePeriod(), messages: usage.messageCount, aiSpendUsd: usage.aiSpendUsd },
-        // True once house-key paid calls are falling back to free models.
+        // True once house-key paid calls are on the paid overage fallback.
         aiBudgetExhausted: (tier === "pro" || tier === "boardroom") && !user?.openRouterKey && usage.aiSpendUsd >= monthlyAiBudgetUsd(tier),
         aiBudgetNotice: BUDGET_EXHAUSTED_NOTICE,
         aiBudgetUsd: Number.isFinite(monthlyAiBudgetUsd(tier)) ? monthlyAiBudgetUsd(tier) : null,

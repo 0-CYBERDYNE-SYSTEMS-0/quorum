@@ -56,13 +56,42 @@ export const DEFAULT_AUX_MODEL_SLUG = "z-ai/glm-5.3-flash";
 export const DEFAULT_AUX_MODEL_FALLBACK_SLUG = "openai/gpt-6-luna";
 
 /**
- * Free model experts use once a paid tier's AI budget is spent. NOTE: this is
- * a ':free' slug used for PAID users as a graceful fallback; pricing v1 does
- * not change it (see the pricing-v1 PR notes for the suggested paid swap).
+ * Paid model experts use once a PAID tier's monthly AI budget is spent. Paying
+ * customers never fall back to a ':free' model (owner rule, 2026-11-03): the
+ * fallback is a small paid slug that is already in the fast allowlist.
  */
-export const BUDGET_FALLBACK_MODEL = "dots-studio/dots-3-note-preview:free";
+export const BUDGET_FALLBACK_MODEL = "deepseek/deepseek-v4.1-flash";
+/** Paid second choice if the primary budget-fallback model fails. */
+export const BUDGET_FALLBACK_MODEL_FALLBACK = "openai/gpt-6-luna";
 
-export const BUDGET_EXHAUSTED_NOTICE = "You've used this month's included models; experts are on free models until the 1st.";
+/**
+ * Free tier keeps its existing free budget model — pricing v1 behaviour is
+ * unchanged, and no new ':free' slug is introduced.
+ */
+export const FREE_TIER_BUDGET_MODEL = "dots-studio/dots-3-note-preview:free";
+
+/**
+ * How far past the monthly AI budget a paid tier may keep running on the paid
+ * fallback model before calls are refused. 25% of the tier budget.
+ */
+export const BUDGET_OVERAGE_RATIO = 0.25;
+
+export const BUDGET_EXHAUSTED_NOTICE = "You've used this month's included AI budget. Experts continue on the included fallback model up to 25% over budget, then pause until the 1st (or add your own OpenRouter key).";
+
+/** The model a tier falls back to when its budget is spent: paid for paid tiers. */
+export function budgetFallbackModelForTier(tier: string | null | undefined): string {
+  const t = tier || "free";
+  return t === "pro" || t === "boardroom" || t === "enterprise"
+    ? BUDGET_FALLBACK_MODEL
+    : FREE_TIER_BUDGET_MODEL;
+}
+
+/** Hard ceiling on monthly AI spend: the tier budget plus the overage allowance. */
+export function monthlyAiBudgetCeilingUsd(tier: string | null | undefined): number {
+  const budget = monthlyAiBudgetUsd(tier);
+  if (!Number.isFinite(budget)) return budget;
+  return budget * (1 + BUDGET_OVERAGE_RATIO);
+}
 
 /** Tier-aware house-key allowlist check (canonical logic in shared/models.ts). */
 export function isHouseKeyAllowedModel(model: string, tier?: string | null): boolean {
@@ -191,8 +220,10 @@ export function checkHouseKeyCall(
     };
   }
 
-  // Budget exhaustion is graceful: callers fall back to BUDGET_FALLBACK_MODEL
-  // (see OpenRouterProvider.authorizeCall) instead of erroring.
+  // Budget exhaustion is graceful: callers fall back to the tier's fallback
+  // model (see OpenRouterProvider.authorizeCall) instead of erroring, up to a
+  // hard 25% overage ceiling for paid tiers. A one-time session credit has a
+  // hard cap with no overage.
   if (creditLimits && credit) {
     const spent = credit.spentUsd ?? 0;
     if (spent >= creditLimits.aiCapUsd) {
@@ -207,11 +238,20 @@ export function checkHouseKeyCall(
   }
 
   const budget = monthlyAiBudgetUsd(t);
-  if (spentUsd >= budget) {
+  const ceiling = monthlyAiBudgetCeilingUsd(t);
+  if (spentUsd >= ceiling) {
     return {
       status: 429,
       code: "ai_budget_exhausted",
       message: "You've used this month's included AI budget. Switch experts to free models, add your own OpenRouter key, or wait for the reset on the 1st.",
+    };
+  }
+  if (spentUsd >= budget) {
+    // Graceful overage: keep answering on the tier's fallback model.
+    return {
+      status: 429,
+      code: "ai_budget_overage",
+      message: BUDGET_EXHAUSTED_NOTICE,
     };
   }
   return null;

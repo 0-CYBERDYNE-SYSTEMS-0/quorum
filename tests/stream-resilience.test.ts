@@ -14,7 +14,7 @@ import {
   planningModelsForTier,
   providerFailureLogDetail,
 } from "../server/ai";
-import { BUDGET_FALLBACK_MODEL, DEFAULT_AUX_MODEL_FALLBACK_SLUG, DEFAULT_AUX_MODEL_SLUG, isHouseKeyAllowedModel } from "../server/usage-caps";
+import { FREE_TIER_BUDGET_MODEL, DEFAULT_AUX_MODEL_FALLBACK_SLUG, DEFAULT_AUX_MODEL_SLUG, isHouseKeyAllowedModel } from "../server/usage-caps";
 import { OUTPUT_LIMIT_ERROR } from "../server/ai-providers";
 import type { AIModelResponse } from "../server/ai";
 
@@ -223,8 +223,23 @@ describe("planning model defaults", () => {
   });
 
   it("keeps free tiers on the free budget slug", () => {
-    expect(planningModelsForTier("free")).toEqual([BUDGET_FALLBACK_MODEL]);
-    expect(planningModelsForTier(undefined)).toEqual([BUDGET_FALLBACK_MODEL]);
+    expect(planningModelsForTier("free")).toEqual([FREE_TIER_BUDGET_MODEL]);
+    expect(planningModelsForTier(undefined)).toEqual([FREE_TIER_BUDGET_MODEL]);
+  });
+
+  it("gives session-credit conversations the paid aux chain, never a ':free' slug", () => {
+    for (const tier of ["free", "pro", "boardroom", "enterprise", undefined]) {
+      const models = planningModelsForTier(tier, true);
+      expect(models).toEqual([DEFAULT_AUX_MODEL_SLUG, DEFAULT_AUX_MODEL_FALLBACK_SLUG]);
+      expect(models.every(model => !model.endsWith(":free"))).toBe(true);
+    }
+  });
+
+  it("never accepts a ':free' TOOL_PLANNING_MODEL override for paid work", () => {
+    process.env.TOOL_PLANNING_MODEL = "google/gemma-4-31b-it:free";
+    expect(planningModelsForTier("free")).toEqual(["google/gemma-4-31b-it:free"]);
+    expect(planningModelsForTier("free", true)).toEqual([DEFAULT_AUX_MODEL_SLUG, DEFAULT_AUX_MODEL_FALLBACK_SLUG]);
+    expect(planningModelsForTier("pro")).toEqual([DEFAULT_AUX_MODEL_SLUG, DEFAULT_AUX_MODEL_FALLBACK_SLUG]);
   });
 
   it("honors TOOL_PLANNING_MODEL as a single override", () => {
