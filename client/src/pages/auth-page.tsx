@@ -142,7 +142,7 @@ export default function AuthPage() {
           <p className="mt-3 text-[13.5px] leading-relaxed text-muted-ink">
             {mode === "login"
               ? "Sign in to pick up the decision in progress."
-              : "Create a workspace, state a decision, and seat three directors on the house."}
+              : "Create a workspace, state a decision, and seat your first directors."}
           </p>
 
           <div className="mt-8 grid grid-cols-2 rounded-lg border border-line bg-surface p-1">

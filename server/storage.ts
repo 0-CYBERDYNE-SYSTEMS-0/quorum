@@ -34,7 +34,7 @@ export interface IStorage {
   createUser(user: InsertUser): Promise<User>;
   updateUserStripeInfo(userId: number, stripeInfo: { stripeCustomerId: string, stripeSubscriptionId: string }): Promise<User>;
   updateSubscriptionStatus(userId: number, status: string): Promise<User>;
-  /** Pricing v1: set the plan key (free | pro | boardroom | enterprise). */
+  /** Pricing v1: set the plan key ("free" means no plan; also pro, boardroom, enterprise). */
   updateUserTier(userId: number, tier: string): Promise<User>;
   /** Set plan and billing status together (webhook paths). */
   updateUserPlan(userId: number, plan: { tier?: string; status?: string }): Promise<User>;

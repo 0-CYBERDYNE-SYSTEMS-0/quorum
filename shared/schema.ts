@@ -68,7 +68,7 @@ export const conversations = pgTable("conversations", {
   // Nullable disables the cap; new conversations default to 25 turns.
   turnBudget: integer("turn_budget").default(25),
   // Pricing v1: the one-time session credit this conversation is running on.
-  // Set once when a Free account creates the conversation; the credit's
+  // Set once when a buyer creates the conversation; the credit's
   // limits (seats, 25 chair messages, AI cap) apply for its whole life.
   sessionCreditId: integer("session_credit_id"),
   createdAt: timestamp("created_at").defaultNow(),
