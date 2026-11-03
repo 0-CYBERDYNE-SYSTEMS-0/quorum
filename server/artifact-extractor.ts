@@ -60,6 +60,24 @@ function deriveTitle(
 }
 
 /**
+ * A chart envelope is a JSON object whose `type` is "vega-lite". Models emit it
+ * fenced as json (or with a vega/vega-lite fence) and, often, as bare JSON.
+ * Typing it "json" made the UI render "JSON Data 1" instead of a chart.
+ */
+function isVegaLiteEnvelope(value: unknown): boolean {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value) &&
+    (value as { type?: unknown }).type === "vega-lite";
+}
+
+function chartTitleFromEnvelope(value: unknown): string | undefined {
+  if (!isVegaLiteEnvelope(value)) return undefined;
+  const title = (value as { title?: unknown }).title;
+  return typeof title === "string" && title.trim()
+    ? truncateChars(collapseWhitespace(stripMarkdownToText(title)), DERIVED_TITLE_MAX_CHARS)
+    : undefined;
+}
+
+/**
  * Extracts artifacts from AI response text
  * Supports: code blocks, JSON, HTML, markdown tables
  */
@@ -70,7 +88,7 @@ export function extractArtifacts(content: string): { artifacts: Artifact[]; clea
   const consumedHeadings = new Set<string>();
   
   // Pattern 1: Explicit artifact blocks (```artifact-type ... ```)
-  const artifactBlockRegex = /```(html|json|chart|code|table|jsx|typescript|javascript|python)\n([\s\S]*?)```/gi;
+  const artifactBlockRegex = /```(html|json|chart|vega-lite|vega|code|table|jsx|typescript|javascript|python)\n([\s\S]*?)```/gi;
   let match;
   
   // Run regex on cleanContent and update it progressively
@@ -87,7 +105,7 @@ export function extractArtifacts(content: string): { artifacts: Artifact[]; clea
     } else if (type === "json") {
       // Models often fence charts as json; the vega-lite marker identifies them.
       artifactType = /"type"\s*:\s*"vega-lite"/.test(rawContent) ? "chart" : "json";
-    } else if (type === "chart") {
+    } else if (type === "chart" || type === "vega-lite" || type === "vega") {
       artifactType = "chart";
       language = "json";
     } else if (type === "table") {
@@ -101,6 +119,8 @@ export function extractArtifacts(content: string): { artifacts: Artifact[]; clea
     const titleMatch = rawContent.match(/\/\/\s*title:\s*(.+?)(?:\n|$)|#\s*title:\s*(.+?)(?:\n|$)/i);
     if (titleMatch) {
       title = titleMatch[1] || titleMatch[2];
+    } else if (artifactType === "chart") {
+      try { title = chartTitleFromEnvelope(JSON.parse(rawContent)) ?? title; } catch { /* keep default */ }
     }
     
     artifacts.push({
@@ -175,15 +195,20 @@ export function extractArtifacts(content: string): { artifacts: Artifact[]; clea
       // Only extract if it's valid JSON and reasonably sized
       if (potentialJson.length > 20) {
         try {
-          JSON.parse(potentialJson);
+          const parsedJson = JSON.parse(potentialJson);
+          const isChart = isVegaLiteEnvelope(parsedJson);
 
-          // Same title preference as tables: preceding heading, else generic.
+          // Same title preference as tables: the chart's own title or a
+          // preceding heading, else generic.
           const heading = nearestPrecedingHeading(cleanContent, startPos, consumedHeadings);
-          const title = deriveTitle(heading?.text, () => `JSON Data ${++jsonCount}`);
+          const title = deriveTitle(
+            (isChart ? chartTitleFromEnvelope(parsedJson) : undefined) ?? heading?.text,
+            () => isChart ? `Chart ${++jsonCount}` : `JSON Data ${++jsonCount}`,
+          );
           if (heading) consumedHeadings.add(heading.line);
 
           artifacts.push({
-            type: "json",
+            type: isChart ? "chart" : "json",
             title,
             content: potentialJson,
             language: "json"

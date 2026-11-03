@@ -70,6 +70,7 @@ describe("AI Providers", () => {
     delete process.env.LOCAL_AI_API_KEY;
     delete process.env.OPENROUTER_API_KEY;
     delete process.env.OPENROUTER_REASONING_EFFORT;
+    delete process.env.OPENROUTER_PROVIDER_IGNORE;
     delete process.env.OPENROUTER_SPEND_CAP_USD;
   });
 
@@ -288,7 +289,7 @@ describe("AI Providers", () => {
       });
     });
 
-    it("records the allowlisted provider from a 429 without response-body, prompt, or key text", async () => {
+    it("logs the allowlisted provider and a redacted body excerpt from a 429 without headers or key text", async () => {
       process.env.OPENROUTER_API_KEY = "test-only-openrouter-key";
       const prompt = "PRIVATE PROMPT TEXT";
       const apiKey = process.env.OPENROUTER_API_KEY;
@@ -318,17 +319,20 @@ describe("AI Providers", () => {
           failureCategory: "rate_limit",
           result: "failed",
         });
+        // Diagnostics now carry a short upstream excerpt, but never the key
+        // and never request headers.
+        expect(attempt.providerError).toContain("PRIVATE PROVIDER BODY");
+        expect(attempt.providerError!.length).toBeLessThanOrEqual(501);
         const diagnostics = `${JSON.stringify(attempt)} ${info.mock.calls.map(([message]) => message).join(" ")} ${(caughtError as Error).message}`;
         expect(diagnostics).not.toContain(apiKey);
-        expect(diagnostics).not.toContain(prompt);
-        expect(diagnostics).not.toContain(privateBody);
+        expect(diagnostics).not.toMatch(/authorization/i);
         expect(attempt).not.toHaveProperty("errorMessage");
       } finally {
         info.mockRestore();
       }
     });
 
-    it("records provider status from a 200 SSE error without response-body, prompt, or key text", async () => {
+    it("records provider status and a redacted error excerpt from a 200 SSE error without headers or key text", async () => {
       process.env.OPENROUTER_API_KEY = "test-only-openrouter-key";
       const apiKey = process.env.OPENROUTER_API_KEY;
       const prompt = "PRIVATE STREAM PROMPT";
@@ -356,10 +360,10 @@ describe("AI Providers", () => {
           failureCategory: "rate_limit",
           result: "failed",
         });
+        expect(attempt.providerError).toContain("PRIVATE STREAM BODY");
         const diagnostics = `${JSON.stringify(attempt)} ${info.mock.calls.map(([message]) => message).join(" ")} ${(caughtError as Error).message}`;
         expect(diagnostics).not.toContain(apiKey);
-        expect(diagnostics).not.toContain(prompt);
-        expect(diagnostics).not.toContain(privateBody);
+        expect(diagnostics).not.toMatch(/authorization/i);
       } finally {
         info.mockRestore();
       }
@@ -750,6 +754,146 @@ describe("AI Providers", () => {
         result: "failed",
       });
       expect(provider.getUsageSnapshot().attempts[0]).not.toHaveProperty("httpStatus");
+    });
+
+    it("trims whitespace from the platform key before sending it", async () => {
+      process.env.OPENROUTER_API_KEY = "  test-only-openrouter-key  \n";
+      mockFetch.mockResolvedValueOnce(new Response(JSON.stringify({
+        id: "gen-trim",
+        provider: "Mock Provider",
+        model: "z-ai/glm-5.3-flash",
+        choices: [{ message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+        usage: { cost: 0.0001 },
+      }), { status: 200 }));
+      const provider = new OpenRouterProvider();
+
+      await provider.chat([{ role: "user", content: "hello" }], "z-ai/glm-5.3-flash");
+
+      const [, init] = mockFetch.mock.calls.at(-1)!;
+      expect(init.headers.Authorization).toBe("Bearer test-only-openrouter-key");
+    });
+
+    it("sends provider preferences (ignore Relace, allow fallbacks) on expert calls", async () => {
+      process.env.OPENROUTER_API_KEY = "test-only-openrouter-key";
+      mockFetch.mockResolvedValueOnce(mockSseResponse([
+        { choices: [{ delta: { content: "Answer" }, finish_reason: "stop", native_finish_reason: "end_turn" }] },
+      ]));
+      const provider = new OpenRouterProvider();
+
+      const response = await provider.chatStream([{ role: "user", content: "hello" }], "z-ai/glm-5.3-flash", () => {});
+
+      const [, init] = mockFetch.mock.calls.at(-1)!;
+      const body = JSON.parse(init.body);
+      expect(body.provider).toMatchObject({ ignore: ["Relace"], allow_fallbacks: true });
+      expect(response.message.content).toBe("Answer");
+      expect(provider.getUsageSnapshot().attempts.at(-1)).toMatchObject({
+        result: "success",
+        finishReason: "stop",
+        nativeFinishReason: "end_turn",
+      });
+    });
+
+    it("honors OPENROUTER_PROVIDER_IGNORE overrides and an empty opt-out", async () => {
+      process.env.OPENROUTER_API_KEY = "test-only-openrouter-key";
+      const provider = new OpenRouterProvider();
+      const reply = () => new Response(JSON.stringify({
+        choices: [{ message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+      }), { status: 200 });
+
+      process.env.OPENROUTER_PROVIDER_IGNORE = "Relace, SlowCo";
+      mockFetch.mockResolvedValueOnce(reply());
+      await provider.chat([{ role: "user", content: "hello" }], "z-ai/glm-5.3-flash");
+      let body = JSON.parse(mockFetch.mock.calls.at(-1)![1].body);
+      expect(body.provider).toMatchObject({ ignore: ["Relace", "SlowCo"], allow_fallbacks: true });
+
+      process.env.OPENROUTER_PROVIDER_IGNORE = "";
+      mockFetch.mockResolvedValueOnce(reply());
+      await provider.chat([{ role: "user", content: "hello" }], "z-ai/glm-5.3-flash");
+      body = JSON.parse(mockFetch.mock.calls.at(-1)![1].body);
+      expect(body.provider).toEqual({ allow_fallbacks: true });
+      delete process.env.OPENROUTER_PROVIDER_IGNORE;
+    });
+
+    it("records finish reason, native finish reason and a truncated upstream error excerpt", async () => {
+      process.env.OPENROUTER_API_KEY = "test-only-openrouter-key";
+      const longMessage = "upstream provider stopped " + "x".repeat(900);
+      mockFetch.mockResolvedValueOnce(mockSseResponse([
+        { provider: "Relace", choices: [{ delta: {}, finish_reason: null, native_finish_reason: null }] },
+        { error: { code: 502, message: longMessage, metadata: { provider_name: "Relace" } } },
+      ]));
+      const provider = new OpenRouterProvider();
+
+      await expect(
+        provider.chatStream([{ role: "user", content: "hello" }], "z-ai/glm-5.3-flash", () => {}),
+      ).rejects.toMatchObject({ statusCode: 502 });
+
+      const attempt = provider.getUsageSnapshot().attempts.at(-1)!;
+      expect(attempt).toMatchObject({ provider: "Relace", httpStatus: 200, failureCategory: "upstream_transport" });
+      expect(attempt.providerError).toContain("upstream provider stopped");
+      expect(attempt.providerError!.length).toBeLessThanOrEqual(501);
+      expect(attempt.providerError!.endsWith("…")).toBe(true);
+    });
+
+    it("treats a 200 stream that ends with no content and no finish reason as a retryable provider failure", async () => {
+      process.env.OPENROUTER_API_KEY = "test-only-openrouter-key";
+      mockFetch.mockResolvedValueOnce(mockSseResponse([
+        { id: "gen-empty", provider: "Relace", model: "z-ai/glm-5.3-flash", choices: [] },
+      ]));
+      const provider = new OpenRouterProvider();
+
+      await expect(
+        provider.chatStream([{ role: "user", content: "hello" }], "z-ai/glm-5.3-flash", () => {}),
+      ).rejects.toMatchObject({ isProviderError: true });
+
+      expect(provider.getUsageSnapshot().attempts.at(-1)).toMatchObject({
+        provider: "Relace",
+        httpStatus: 200,
+        result: "failed",
+        failureCategory: "upstream_transport",
+      });
+    });
+
+    it("exhausts the expert retry ladder with a final non-streaming attempt and no retryable marker", async () => {
+      process.env.OPENROUTER_API_KEY = "test-only-openrouter-key";
+      mockGetConversation.mockResolvedValue(null);
+      mockFetch.mockResolvedValue(mockSseResponse([
+        { error: { code: 502, message: "Relace upstream failed", metadata: { provider_name: "Relace" } } },
+      ]));
+      const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+      const warnLog = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const expert = {
+        id: 43,
+        conversationId: 78,
+        name: "Chief Strategy Officer",
+        role: "Chief Strategy Officer",
+        model: "z-ai/glm-5.3-flash",
+        systemPrompt: "Advise on strategy.",
+        customInstructions: null,
+        avatarUrl: null,
+      };
+      const provider = getProvider(expert.model) as OpenRouterProvider;
+      const attemptsBefore = provider.getUsageSnapshot().attempts.length;
+
+      try {
+        const failedResponse = await getExpertResponseStream(
+          expert, [], "Assess the pilot.", [], [expert.role], () => {},
+          undefined, undefined, { maxRetries: 2, baseDelayMs: 0 },
+        );
+
+        expect(failedResponse.content).toContain("No complete response was received");
+        // Already retried inside the expert call: the orchestrator must record
+        // one error row, not another attempt.
+        expect(isRetryableExpertProviderFailure(failedResponse)).toBe(false);
+        expect(mockFetch).toHaveBeenCalledTimes(3);
+        const finalBody = JSON.parse(mockFetch.mock.calls.at(-1)![1].body);
+        expect(finalBody.stream).toBeUndefined();
+        const newAttempts = provider.getUsageSnapshot().attempts.slice(attemptsBefore);
+        expect(newAttempts).toHaveLength(3);
+        expect(newAttempts.every(attempt => attempt.result === "failed")).toBe(true);
+      } finally {
+        errorLog.mockRestore();
+        warnLog.mockRestore();
+      }
     });
   });
 

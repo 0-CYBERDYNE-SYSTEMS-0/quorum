@@ -2032,6 +2032,10 @@ export class InteractionOrchestrator {
                         },
                         deliverableRequest,
                         retryInstruction,
+                        // Two backoff retries, the last one non-streaming. When
+                        // those are exhausted the failure is not marked
+                        // retryable, so exactly one error row is recorded.
+                        { maxRetries: 2 },
                     );
                     repairExpertResponse = streamExpertResponse;
                     expertResponse = await streamExpertResponse();

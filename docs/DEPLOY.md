@@ -17,7 +17,8 @@ The repository ships `.replit` with the build and run commands pre-wired.
    - `OPENROUTER_API_KEY` — house key used by directors
    - `ENCRYPTION_KEY` — `openssl rand -base64 32` (encrypts BYOK keys at rest)
    Optional:
-   - `DEFAULT_AUX_MODEL`, `OPENROUTER_REASONING_EFFORT`
+   - `DEFAULT_AUX_MODEL` (must be a paid slug on paid tiers), `OPENROUTER_REASONING_EFFORT`
+   - `OPENROUTER_PROVIDER_IGNORE` (comma-separated; defaults to `Relace`)
    - `STRIPE_SECRET_KEY`, `STRIPE_PRICE_ID_PRO`, `STRIPE_PRICE_ID_PRO_ANNUAL`, `STRIPE_WEBHOOK_SECRET`
    - `PERPLEXITY_API_KEY`
 4. **Deploy.** The deployment run command is:

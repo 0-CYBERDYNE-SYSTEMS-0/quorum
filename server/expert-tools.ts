@@ -31,13 +31,13 @@ export function toolCallLimitForTier(tier: string | null | undefined): number {
 
 /** Prompt for the cheap pre-answer planning call. */
 export function buildToolPlanningPrompt(role: string, question: string, limit: number): string {
-  return `You are the ${role} on a business decision board advising a Chair. Before answering, decide whether you need current, citable information from the web for YOUR specialty only.
+  return `You are the ${role} on a business decision board advising a Chair. Decide whether YOUR specialty needs current, citable web information before you answer.
 Reply with at most ${limit} lines, each exactly one of:
 SEARCH: <short web search query within your specialty>
 FETCH: <https URL you already know is authoritative, e.g. a university extension page>
 or reply with the single word NONE if the Chair's facts and your expertise are enough.
-Prefer SEARCH when you need a source but are unsure the exact URL is reachable; search results are fetched before they can be cited. Use FETCH only for a stable URL you know is relevant.
-For material claims about markets, financial obligations, safety, employment, privacy, or regulation, do not reply NONE merely because you know the general advice: SEARCH for an authoritative primary source relevant to your specialty. Prefer filings, regulator data, official statistics, and reputable press for market research. Never contradict a company fact or price supplied by the Chair; use it as given. Use company data, periods, and assumptions exactly as supplied; never invent missing measurements or a source. If no source can be fetched, say that you could not verify the source-dependent claim and do not invent a citation.
+Prefer SEARCH unless you are sure the exact URL is reachable; search results are fetched before they can be cited. Use FETCH only for a stable URL you know is relevant.
+For material claims about markets, financial obligations, safety, employment, privacy, or regulation, do not reply NONE merely because you know the general advice: SEARCH for an authoritative primary source in your specialty. Prefer filings, regulator data, official statistics, and reputable press for market research. Never contradict a company fact or price supplied by the Chair; use it as given. Use company data, periods, and assumptions exactly as supplied; never invent a measurement or a source. If no source can be fetched, say you could not verify the claim and do not invent a citation.
 No other text.
 
 Chair's decision question / latest discussion:
