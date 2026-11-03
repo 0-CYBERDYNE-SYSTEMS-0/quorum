@@ -1,24 +1,38 @@
 /**
- * Pro pricing caps ($10/month or $96/year, $4 monthly AI budget). See PR "pricing-caps-pro20".
+ * Plan caps for pricing v1: Pro $29/mo ($290/yr, $8 AI budget) and Boardroom
+ * $99/mo ($990/yr, $35 AI budget), plus one-time session credits.
  *
  * Definitions:
  * - A "message" is ONE Chair (user) message stored in a conversation,
  *   including answers to open questions and explicit /restart topics.
  *   Expert replies, tool-planning calls, insights and autonomous turns do
- *   NOT count as messages. Limits reset each UTC calendar month.
+ *   NOT count as messages. Limits reset each UTC calendar month — except on
+ *   a one-time session credit, whose 25-chair-message cap belongs to that
+ *   single conversation and never resets.
  * - "AI spend" is the OpenRouter-reported cost (usage.cost) of calls made
  *   with the house OPENROUTER_API_KEY. Calls made with the user's own
  *   (BYOK) key never count and are never blocked by budget or allowlist.
  */
-import { getTierLimits } from "./tiers";
+import { getTierLimits, sessionCreditLimits, PLAN_REQUIRED_DENIAL, type SessionCreditLimits } from "./tiers";
+import { hasPaidPlan, type SessionKind } from "@shared/pricing";
+import {
+  HOUSE_KEY_PAID_MODEL_ALLOWLIST,
+  BOARDROOM_FRONTIER_MODEL_ALLOWLIST,
+  MODEL_LABELS as FRONTIER_MODEL_LABELS_MAP,
+  isFastHouseKeyModel,
+  isFrontierModel,
+  isHouseKeyAllowedModel as sharedIsHouseKeyAllowedModel,
+  houseKeyModelsForTier,
+} from "@shared/models";
 
-/** Exact ids pinned in client/src/lib/openrouter-model-options.ts. */
-export const HOUSE_KEY_PAID_MODEL_ALLOWLIST = [
-  "z-ai/glm-5.3-flash",
-  "deepseek/deepseek-v4.1-flash",
-  "xiaomi/mimo-v2.6-flash",
-  "openai/gpt-6-luna",
-] as const;
+// Re-exported so existing server imports (and tests) keep working while the
+// canonical catalog lives in shared/models.ts for the client too.
+export { HOUSE_KEY_PAID_MODEL_ALLOWLIST, BOARDROOM_FRONTIER_MODEL_ALLOWLIST, isFastHouseKeyModel, isFrontierModel, houseKeyModelsForTier };
+
+/** Display labels for the client's model picker (frontier subset kept for compatibility). */
+export const FRONTIER_MODEL_LABELS: Record<string, string> = Object.fromEntries(
+  BOARDROOM_FRONTIER_MODEL_ALLOWLIST.map((slug) => [slug, FRONTIER_MODEL_LABELS_MAP[slug] ?? slug]),
+);
 
 /**
  * Output cap for ordinary expert replies. Reasoning tokens count against this
@@ -41,43 +55,111 @@ export const DEFAULT_AUX_MODEL_SLUG = "z-ai/glm-5.3-flash";
 /** Second paid aux choice when the default aux model fails. */
 export const DEFAULT_AUX_MODEL_FALLBACK_SLUG = "openai/gpt-6-luna";
 
-/** Free model experts use once a Pro user's monthly AI budget is spent. */
-export const BUDGET_FALLBACK_MODEL = "dots-studio/dots-3-note-preview:free";
+/**
+ * Paid model experts use once a PAID tier's monthly AI budget is spent. Paying
+ * customers never fall back to a ':free' model (owner rule, 2026-11-03): the
+ * fallback is a small paid slug that is already in the fast allowlist.
+ */
+export const BUDGET_FALLBACK_MODEL = "deepseek/deepseek-v4.1-flash";
+/** Paid second choice if the primary budget-fallback model fails. */
+export const BUDGET_FALLBACK_MODEL_FALLBACK = "openai/gpt-6-luna";
 
-export const BUDGET_EXHAUSTED_NOTICE = "You've used this month's included fast models; experts are on free models until the 1st.";
+/** How far past the monthly AI budget a paid tier may keep running on the paid
+ * fallback model before calls are refused. 25% of the tier budget. */
+export const BUDGET_OVERAGE_RATIO = 0.25;
 
-export function isHouseKeyAllowedModel(model: string): boolean {
-  return model.endsWith(":free") || (HOUSE_KEY_PAID_MODEL_ALLOWLIST as readonly string[]).includes(model);
+export const BUDGET_EXHAUSTED_NOTICE = "You've used this month's included AI budget. Experts continue on the included fallback model up to 25% over budget, then pause until the 1st (or add your own OpenRouter key).";
+
+/** The model a tier falls back to when its budget is spent: paid for paid tiers. */
+export function budgetFallbackModelForTier(tier: string | null | undefined): string {
+  return budgetFallbackModelsForTier(tier)[0];
+}
+
+/**
+ * Ordered paid fallback chain once a tier's AI budget is spent. The provider
+ * routes a failed primary to the next paid slug instead of erroring (and never
+ * to a ':free' model). There is no free plan, so every caller is paid.
+ */
+export function budgetFallbackModelsForTier(_tier: string | null | undefined): string[] {
+  return [BUDGET_FALLBACK_MODEL, BUDGET_FALLBACK_MODEL_FALLBACK];
+}
+
+/** Hard ceiling on monthly AI spend: the tier budget plus the overage allowance. */
+export function monthlyAiBudgetCeilingUsd(tier: string | null | undefined): number {
+  const budget = monthlyAiBudgetUsd(tier);
+  if (!Number.isFinite(budget)) return budget;
+  return budget * (1 + BUDGET_OVERAGE_RATIO);
+}
+
+/** Tier-aware house-key allowlist check (canonical logic in shared/models.ts). */
+export function isHouseKeyAllowedModel(model: string, tier?: string | null): boolean {
+  return sharedIsHouseKeyAllowedModel(model, tier);
 }
 
 export function currentUsagePeriod(now: Date = new Date()): string {
   return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
 }
 
-/** Monthly house-key AI budget in USD by tier (Pro default $4). Free is $0 (free models only). */
+function envBudget(name: string, fallback: number): number {
+  const raw = process.env[name];
+  const parsed = Number(raw);
+  return raw?.trim() && Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+/**
+ * Monthly house-key AI budget in USD by tier. Pro defaults to $8
+ * (PRO_MONTHLY_AI_BUDGET_USD), Boardroom to $35
+ * (BOARDROOM_MONTHLY_AI_BUDGET_USD). A no-plan account has no house-key
+ * budget because it cannot open a board.
+ */
 export function monthlyAiBudgetUsd(tier: string | null | undefined): number {
   const t = tier || "free";
   if (t === "enterprise") return Number.POSITIVE_INFINITY;
-  if (t === "pro") {
-    const parsed = Number(process.env.PRO_MONTHLY_AI_BUDGET_USD);
-    return Number.isFinite(parsed) && parsed >= 0 && process.env.PRO_MONTHLY_AI_BUDGET_USD?.trim() ? parsed : 4;
-  }
+  if (t === "boardroom") return envBudget("BOARDROOM_MONTHLY_AI_BUDGET_USD", 35);
+  if (t === "pro") return envBudget("PRO_MONTHLY_AI_BUDGET_USD", 8);
   return 0;
 }
 
 export type CapDenial = { status: 402 | 429; code: string; message: string; upgradeUrl?: string };
 
-export function checkMessageAllowance(tier: string | null | undefined, usedThisMonth: number): CapDenial | null {
+/** Conversation context for a one-time session credit. */
+export type CreditCapsContext = {
+  kind: SessionKind;
+  /** Chair messages already sent inside this credit conversation. */
+  usedMessages?: number;
+  /** House-key spend inside this credit conversation. */
+  spentUsd?: number;
+};
+
+export function creditLimitsFor(kind: SessionKind): SessionCreditLimits {
+  return sessionCreditLimits(kind);
+}
+
+export function checkMessageAllowance(
+  tier: string | null | undefined,
+  usedThisMonth: number,
+  credit?: CreditCapsContext,
+): CapDenial | null {
+  if (credit) {
+    const limits = creditLimitsFor(credit.kind);
+    const used = credit.usedMessages ?? 0;
+    if (used < limits.maxMessages) return null;
+    return {
+      status: 429,
+      code: "session_credit_message_limit_reached",
+      message: `This one-time session includes ${limits.maxMessages} chair briefs, and all ${limits.maxMessages} are used. Subscribe to Pro ($${getTierLimits("pro").monthlyUsd}/month) for ${getTierLimits("pro").maxMessages} briefs a month.`,
+      upgradeUrl: "/subscribe",
+    };
+  }
+
   const limits = getTierLimits(tier || "free");
+  if (!hasPaidPlan(tier)) return { ...PLAN_REQUIRED_DENIAL };
   if (usedThisMonth < limits.maxMessages) return null;
-  const isFree = (tier || "free") === "free";
   return {
-    status: isFree ? 402 : 429,
+    status: 429,
     code: "message_limit_reached",
-    message: isFree
-      ? `You've used all ${limits.maxMessages} messages on the Free plan this month. Upgrade to Pro ($10/month) for ${getTierLimits("pro").maxMessages} messages a month.`
-      : `You've used all ${limits.maxMessages} ${limits.name} messages this month. Your limit resets on the 1st, or contact us about Enterprise.`,
-    upgradeUrl: isFree ? "/subscribe" : undefined,
+    message: `You've used all ${limits.maxMessages} ${limits.name} messages this month. Your limit resets on the 1st, or contact us about Enterprise.`,
+    upgradeUrl: undefined,
   };
 }
 
@@ -88,29 +170,92 @@ export class UsageCapError extends Error {
   }
 }
 
-/** Decide whether a house-key call to `model` may run. BYOK calls skip this. */
-export function checkHouseKeyCall(tier: string | null | undefined, model: string, spentUsd: number): CapDenial | null {
+/**
+ * Decide whether a house-key call to `model` may run. BYOK calls skip this.
+ * `credit` scopes the gate to a one-time session credit instead of a plan.
+ */
+export function checkHouseKeyCall(
+  tier: string | null | undefined,
+  model: string,
+  spentUsd: number,
+  credit?: CreditCapsContext,
+): CapDenial | null {
   const t = tier || "free";
-  if (model.endsWith(":free")) return null;
-  if (t === "enterprise") return null;
-  if (t === "free") {
-    return { status: 402, code: "paid_model_requires_pro", message: "Upgrade to Pro for paid models.", upgradeUrl: "/subscribe" };
+  const creditLimits = credit ? creditLimitsFor(credit.kind) : null;
+  // A session credit is a paid board. Without a credit, a no-plan account may
+  // not make any board call at all: Quorum has no free plan or free model.
+  if (!creditLimits && !hasPaidPlan(t)) return { ...PLAN_REQUIRED_DENIAL };
+  const tierLimits = creditLimits ? null : getTierLimits(t);
+
+  if (model.endsWith(":free")) {
+    const contextName = creditLimits ? creditLimits.name : getTierLimits(t).name;
+    const allowed = creditLimits
+      ? [...HOUSE_KEY_PAID_MODEL_ALLOWLIST, ...(creditLimits.allowFrontierModels ? BOARDROOM_FRONTIER_MODEL_ALLOWLIST : [])]
+      : houseKeyModelsForTier(t);
+    return {
+      status: 402,
+      code: "paid_model_required",
+      message: `${contextName} runs paid models. Pick an included model (${allowed.join(", ")}) or add your own OpenRouter key in Settings.`,
+    };
   }
-  if (!isHouseKeyAllowedModel(model)) {
+
+  if (!creditLimits && t === "enterprise") return null;
+
+  const allowFrontier = creditLimits ? creditLimits.allowFrontierModels : tierLimits!.allowFrontierModels;
+
+  if (isFrontierModel(model) && !allowFrontier) {
+    return {
+      status: 402,
+      code: "boardroom_model_required",
+      message: `Boardroom model. Upgrade to Boardroom or buy a Boardroom Session to run ${model}.`,
+      upgradeUrl: "/subscribe",
+    };
+  }
+
+  if (!isHouseKeyAllowedModel(model, allowFrontier ? "boardroom" : t)) {
+    const allowed = creditLimits
+      ? [...HOUSE_KEY_PAID_MODEL_ALLOWLIST, ...(allowFrontier ? BOARDROOM_FRONTIER_MODEL_ALLOWLIST : [])]
+      : houseKeyModelsForTier(t);
     return {
       status: 402,
       code: "model_requires_own_key",
-      message: `${model} isn't included in Pro. Pick an included model (${HOUSE_KEY_PAID_MODEL_ALLOWLIST.join(", ")}) or add your own OpenRouter key in Settings.`,
+      message: `${model} isn't included in ${creditLimits ? creditLimits.name : getTierLimits(t).name}. Pick an included model (${allowed.join(", ")}) or add your own OpenRouter key in Settings.`,
     };
   }
+
+  // Budget exhaustion is graceful: callers fall back to the tier's fallback
+  // model (see OpenRouterProvider.authorizeCall) instead of erroring, up to a
+  // hard 25% overage ceiling for paid tiers. A one-time session credit has a
+  // hard cap with no overage.
+  if (creditLimits && credit) {
+    const spent = credit.spentUsd ?? 0;
+    if (spent >= creditLimits.aiCapUsd) {
+      return {
+        status: 429,
+        code: "ai_budget_exhausted",
+        message: `This one-time session's $${creditLimits.aiCapUsd} AI allowance is spent. Subscribe to Pro for a monthly AI budget, or add your own OpenRouter key.`,
+        upgradeUrl: "/subscribe",
+      };
+    }
+    return null;
+  }
+
   const budget = monthlyAiBudgetUsd(t);
-  // Budget exhaustion is graceful: callers fall back to BUDGET_FALLBACK_MODEL
-  // (see OpenRouterProvider.authorizeCall) instead of erroring.
-  if (spentUsd >= budget) {
+  const ceiling = monthlyAiBudgetCeilingUsd(t);
+  if (spentUsd >= ceiling) {
     return {
       status: 429,
       code: "ai_budget_exhausted",
-      message: `You've used this month's included AI budget. Switch experts to free models, add your own OpenRouter key, or wait for the reset on the 1st.`,
+      message: "You've used this month's included AI budget. Upgrade your plan for a larger budget, buy a session, add your own OpenRouter key, or wait for the reset on the 1st.",
+      upgradeUrl: "/subscribe",
+    };
+  }
+  if (spentUsd >= budget) {
+    // Graceful overage: keep answering on the tier's fallback model.
+    return {
+      status: 429,
+      code: "ai_budget_overage",
+      message: BUDGET_EXHAUSTED_NOTICE,
     };
   }
   return null;

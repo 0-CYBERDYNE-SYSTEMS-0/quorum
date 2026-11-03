@@ -1,4 +1,5 @@
-import { checkHouseKeyCall, currentUsagePeriod, UsageCapError, BUDGET_FALLBACK_MODEL } from "./usage-caps";
+import { checkHouseKeyCall, currentUsagePeriod, UsageCapError, budgetFallbackModelForTier, BUDGET_FALLBACK_MODEL, BUDGET_FALLBACK_MODEL_FALLBACK } from "./usage-caps";
+import { defaultPaidExpertModel } from "@shared/expert-catalog";
 import { MAX_LOGGED_PROVIDER_TEXT, redactAndTruncateLogText } from "./log-redaction";
 import type { AIMessage, AIModelResponse } from './ai';
 import { randomUUID } from 'crypto';
@@ -57,14 +58,21 @@ export const MANDATORY_REASONING_PATTERN = /reasoning is mandatory[\s\S]{0,120}(
 export function isMandatoryReasoningError(status: number | undefined, body: string): boolean {
   return status === 400 && MANDATORY_REASONING_PATTERN.test(body);
 }
-// Free OpenRouter models come and go; when a :free model is requested,
-// OpenRouter's `models` array lets it fall through to these (verified live 2026-10-16).
-export const FREE_MODEL_FALLBACKS = [
-  "dots-studio/dots-3-note-preview:free",
+/**
+ * Paid overage has a second, still-paid hop. When the primary budget fallback
+ * (deepseek/deepseek-v4.1-flash) fails at the provider, OpenRouter's `models`
+ * array retries openai/gpt-6-luna rather than erroring the Chair's turn.
+ * Quorum has no free plan, so there is no ':free' fallback anywhere.
+ */
+export const PAID_BUDGET_FALLBACKS = [
+  BUDGET_FALLBACK_MODEL,
+  BUDGET_FALLBACK_MODEL_FALLBACK,
 ];
 export function modelRouting(model: string): { model: string; models?: string[] } {
-  if (!model.endsWith(":free")) return { model };
-  return { model, models: [model, ...FREE_MODEL_FALLBACKS.filter(m => m !== model)].slice(0, 3) };
+  if (model === BUDGET_FALLBACK_MODEL) {
+    return { model, models: [model, ...PAID_BUDGET_FALLBACKS.filter(m => m !== model)] };
+  }
+  return { model };
 }
 
 /**
@@ -107,6 +115,8 @@ type OpenRouterAttempt = {
   maxTokens: number;
   houseKeyUserId?: number;
   usagePeriod?: string;
+  /** One-time session credit funding this conversation, when any. */
+  sessionCreditId?: number;
   providerPriceLimit?: { prompt: number; completion: number };
   settled: boolean;
 };
@@ -272,6 +282,11 @@ export type ChatOptions = {
   maxTokens?: number;
   /** Per-call OpenRouter reasoning effort; overrides OPENROUTER_REASONING_EFFORT. */
   reasoningEffort?: string;
+  /**
+   * Conversation this call belongs to. Lets the caps layer apply a one-time
+   * session credit's own AI cap and model allowlist instead of the plan's.
+   */
+  conversationId?: number;
 };
 
 export interface AIProvider {
@@ -357,9 +372,12 @@ export class OpenRouterProvider implements AIProvider {
     attempt.settled = true;
     const costUsd = numericCost(usage);
     if (attempt.houseKeyUserId && attempt.usagePeriod && costUsd) {
-      const { houseKeyUserId, usagePeriod } = attempt;
+      const { houseKeyUserId, usagePeriod, sessionCreditId } = attempt;
       void import("./storage")
-        .then(({ storage }) => storage.addMonthlyAiSpend(houseKeyUserId, usagePeriod, costUsd))
+        .then(({ storage }) => Promise.all([
+          storage.addMonthlyAiSpend(houseKeyUserId, usagePeriod, costUsd),
+          sessionCreditId ? storage.addSessionCreditSpend(sessionCreditId, costUsd) : Promise.resolve(),
+        ]))
         .catch(err => console.error("[CAPS] failed to record AI spend:", (err as Error).message));
     }
     if (attempt.reservedUsd > 0) {
@@ -484,26 +502,64 @@ export class OpenRouterProvider implements AIProvider {
 
   /**
    * Resolve the key for a call and enforce pricing caps on house-key calls
-   * (server/usage-caps.ts): tier gate, Pro model allowlist, monthly budget.
-   * BYOK calls are never capped and never counted.
+   * (server/usage-caps.ts): tier gate, model allowlist (fast for Pro,
+   * fast + frontier for Boardroom), monthly budget — or, when the
+   * conversation runs on a one-time session credit, that credit's allowlist
+   * and AI cap. BYOK calls are never capped and never counted.
    */
-  private async authorizeCall(attempt: OpenRouterAttempt, model: string, userId?: number): Promise<{ key: string; model: string }> {
+  private async authorizeCall(
+    attempt: OpenRouterAttempt,
+    model: string,
+    userId?: number,
+    options: ChatOptions = {},
+  ): Promise<{ key: string; model: string }> {
     const { key, byok } = await this.resolveKey(userId);
-    if (byok || !userId) return { key, model };
+    if (!userId) return { key, model };
+    // Most BYOK calls need no billing context at all; only a ':free' model
+    // needs a tier/credit lookup so no path can dial one.
+    if (byok && !model.endsWith(":free")) return { key, model };
     const { storage } = await import("./storage");
     const user = await storage.getUser(userId);
+    const credit = options.conversationId
+      ? await storage.getSessionCreditByConversationId(options.conversationId)
+      : undefined;
+    const tier = user?.tier || "free";
+    const allowFrontier = credit
+      ? credit.kind === "boardroom"
+      : tier === "boardroom" || tier === "enterprise";
+
+    // No free model exists. A stale row or an old client that supplies a
+    // ':free' slug is rewritten to the paid default before any key path runs.
+    if (model.endsWith(":free")) {
+      const paidDefault = defaultPaidExpertModel(allowFrontier);
+      console.info(`[CAPS] user ${userId} — ${model} -> ${paidDefault}`);
+      model = paidDefault;
+    }
+    if (byok) return { key, model };
+
     const period = currentUsagePeriod();
     const usage = await storage.getMonthlyUsage(userId, period);
-    const denial = checkHouseKeyCall(user?.tier, model, usage.aiSpendUsd);
-    if (denial?.code === "ai_budget_exhausted") {
-      // Graceful fallback: keep answering on a free model; the client shows
-      // BUDGET_EXHAUSTED_NOTICE from /api/user/tier.
-      console.info(`[CAPS] user ${userId} AI budget spent — ${model} -> ${BUDGET_FALLBACK_MODEL}`);
-      return { key, model: BUDGET_FALLBACK_MODEL };
+    const creditContext = credit
+      ? {
+          kind: credit.kind as "fast" | "boardroom",
+          spentUsd: credit.aiSpendUsd,
+        }
+      : undefined;
+    const denial = checkHouseKeyCall(tier, model, usage.aiSpendUsd, creditContext);
+    if (denial?.code === "ai_budget_overage") {
+      // Graceful paid overage: keep answering on the tier's PAID fallback model
+      // (never a ':free' slug). Past the 25% ceiling checkHouseKeyCall returns
+      // ai_budget_exhausted instead and the call is refused.
+      const fallback = budgetFallbackModelForTier(user?.tier);
+      console.info(`[CAPS] user ${userId} over AI budget — ${model} -> ${fallback}`);
+      attempt.houseKeyUserId = userId;
+      attempt.usagePeriod = period;
+      return { key, model: fallback };
     }
     if (denial) throw new UsageCapError(denial);
     attempt.houseKeyUserId = userId;
     attempt.usagePeriod = period;
+    if (credit) attempt.sessionCreditId = credit.id;
     return { key, model };
   }
 
@@ -542,7 +598,7 @@ export class OpenRouterProvider implements AIProvider {
     let finishReason: string | undefined;
     let nativeFinishReason: string | undefined;
     try {
-      const authorized = await this.authorizeCall(attempt, model, userId);
+      const authorized = await this.authorizeCall(attempt, model, userId, options);
       const openRouterKey = authorized.key;
       model = authorized.model;
       const routing = modelRouting(model);
@@ -653,7 +709,7 @@ export class OpenRouterProvider implements AIProvider {
     let streamFinishReason: string | undefined;
     let nativeFinishReason: string | undefined;
     try {
-      const authorized = await this.authorizeCall(attempt, model, userId);
+      const authorized = await this.authorizeCall(attempt, model, userId, options);
       const openRouterKey = authorized.key;
       model = authorized.model;
       const routing = modelRouting(model);

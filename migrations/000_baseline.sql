@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS public.conversations (
     charter text,
     orchestrator_state jsonb,
     turn_budget integer DEFAULT 25,
+    session_credit_id integer,
     created_at timestamp without time zone DEFAULT now()
 );
 
@@ -309,6 +310,43 @@ CREATE TABLE IF NOT EXISTS public.session (
 
 
 --
+-- Name: session_credits; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE IF NOT EXISTS public.session_credits (
+    id integer NOT NULL,
+    user_id integer NOT NULL,
+    kind text NOT NULL,
+    status text DEFAULT 'available'::text NOT NULL,
+    stripe_checkout_session_id text NOT NULL,
+    conversation_id integer,
+    ai_spend_usd double precision DEFAULT 0 NOT NULL,
+    created_at timestamp without time zone DEFAULT now(),
+    used_at timestamp without time zone
+);
+
+
+--
+-- Name: session_credits_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.session_credits_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: session_credits_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.session_credits_id_seq OWNED BY public.session_credits.id;
+
+
+--
 -- Name: usage_monthly; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -415,6 +453,13 @@ ALTER TABLE ONLY public.users ALTER COLUMN id SET DEFAULT nextval('public.users_
 
 
 --
+-- Name: session_credits id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.session_credits ALTER COLUMN id SET DEFAULT nextval('public.session_credits_id_seq'::regclass);
+
+
+--
 -- Name: company_profiles company_profiles_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -436,6 +481,22 @@ ALTER TABLE ONLY public.company_profiles
 
 ALTER TABLE ONLY public.conversations
     ADD CONSTRAINT conversations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: session_credits session_credits_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.session_credits
+    ADD CONSTRAINT session_credits_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: session_credits session_credits_stripe_checkout_session_id_unique; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.session_credits
+    ADD CONSTRAINT session_credits_stripe_checkout_session_id_unique UNIQUE (stripe_checkout_session_id);
 
 
 --
@@ -559,6 +620,22 @@ ALTER TABLE ONLY public.company_profiles
 
 ALTER TABLE ONLY public.conversations
     ADD CONSTRAINT conversations_user_id_users_id_fk FOREIGN KEY (user_id) REFERENCES public.users(id);
+
+
+--
+-- Name: session_credits session_credits_user_id_users_id_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.session_credits
+    ADD CONSTRAINT session_credits_user_id_users_id_fk FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: session_credits session_credits_conversation_id_conversations_id_fk; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.session_credits
+    ADD CONSTRAINT session_credits_conversation_id_conversations_id_fk FOREIGN KEY (conversation_id) REFERENCES public.conversations(id) ON DELETE SET NULL;
 
 
 --

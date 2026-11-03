@@ -1,5 +1,6 @@
 import { useMemo, useRef, useState } from "react";
 import { Link } from "wouter";
+import { PlanCard } from "@/components/board/plan-card";
 import {
   Building2,
   Check,
@@ -273,6 +274,7 @@ export function SessionList({
       </nav>
 
       <div className="border-t border-line/70 px-3 py-3">
+        <PlanCard />
         <button
           type="button"
           onClick={onOpenCompany}
@@ -303,7 +305,7 @@ export function SessionList({
             </span>
             <span className="min-w-0 flex-1">
               <span className="block truncate text-[12px] font-medium capitalize text-ink">{user?.username}</span>
-              <span className="block truncate text-[10.5px] text-faint-ink">Chair · {user?.tier ?? "free"}</span>
+              <span className="block truncate text-[10.5px] text-faint-ink">Chair · {user?.tier || "No plan"}</span>
             </span>
             <MoreHorizontal className="h-3.5 w-3.5 text-faint-ink" />
           </button>

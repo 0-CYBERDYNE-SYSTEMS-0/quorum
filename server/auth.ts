@@ -65,7 +65,14 @@ export function setupAuth(app: Express) {
     store: storage.sessionStore,
     cookie: {
       maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+      // Both the Replit host and the custom domain are HTTPS in production.
+      // No `domain` is set on purpose: the cookie stays host-only, so one
+      // deployment can serve quorum.desmond-digital.com and
+      // quorum-<name>.replit.app without cross-host leakage. `lax` still
+      // sends the cookie on top-level checkout returns from Stripe.
       secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      httpOnly: true,
     }
   };
 
@@ -174,10 +181,9 @@ export function setupAuth(app: Express) {
       return res.status(401).json({ message: "Unauthorized" });
     }
     
-    // Signed-in users of every tier may use the app. Free (Associate) accounts
-    // have no subscription; their limits (seat count, paid models, house-key
-    // budget) are enforced per route via getTierLimits / isPaidModel, so a
-    // blanket "active subscription" gate here locked Free users out entirely.
+    // Signed-in users of every tier may use the app and read their data. A
+    // legacy "free" tier is "no plan": the board create/run routes reject it
+    // with plan_required unless the conversation carries a session credit.
     next();
   });
 }

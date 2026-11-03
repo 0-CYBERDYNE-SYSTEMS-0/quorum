@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenQuestion } from "../shared/schema";
 
-const { mockChatStream, mockCreateMessage, mockGetConversation, mockGetConversationExperts, mockGetConversationMessages, mockGetCompanyProfile, mockListOpenQuestions } = vi.hoisted(() => ({
+const { mockChatStream, mockCreateMessage, mockGetConversation, mockGetConversationExperts, mockGetConversationMessages, mockGetCompanyProfile, mockListOpenQuestions, mockGetUser } = vi.hoisted(() => ({
   mockChatStream: vi.fn(),
   mockCreateMessage: vi.fn(),
   mockGetConversation: vi.fn(),
@@ -9,6 +9,7 @@ const { mockChatStream, mockCreateMessage, mockGetConversation, mockGetConversat
   mockGetConversationMessages: vi.fn(),
   mockGetCompanyProfile: vi.fn(),
   mockListOpenQuestions: vi.fn(),
+  mockGetUser: vi.fn(),
 }));
 
 vi.mock("../server/ai-providers", () => ({
@@ -28,6 +29,8 @@ vi.mock("../server/storage", () => ({
     getConversationMessages: mockGetConversationMessages,
     getCompanyProfile: mockGetCompanyProfile,
     listOpenQuestions: mockListOpenQuestions,
+    getUser: mockGetUser,
+    getSessionCreditByConversationId: async () => undefined,
   },
 }));
 
@@ -61,6 +64,8 @@ describe("closing decision memo assumptions", () => {
     mockGetConversationMessages.mockReset().mockResolvedValue([]);
     mockGetCompanyProfile.mockReset().mockResolvedValue(undefined);
     mockListOpenQuestions.mockReset();
+    // Paid tier so the closing memo resolves its configured paid aux model.
+    mockGetUser.mockReset().mockResolvedValue({ id: 1, tier: "pro" });
     mockCreateMessage.mockImplementation(async (message: Record<string, unknown>) => ({
       ...message,
       id: 72,

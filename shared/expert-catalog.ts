@@ -2,6 +2,11 @@
  * Built-in board seats. One source of truth for the selector UI and director
  * prompts; avatars are inline SVG data URIs for offline and self-hosted use.
  */
+import {
+  BOARDROOM_FRONTIER_MODEL_ALLOWLIST,
+  HOUSE_KEY_PAID_MODEL_ALLOWLIST,
+} from "./models";
+
 export type ExpertCategory = "Strategy" | "Finance" | "Growth" | "Operations" | "Legal & Risk" | "People" | "Research" | "Support";
 
 export interface CatalogExpert {
@@ -16,13 +21,63 @@ export interface CatalogExpert {
 }
 
 // Default models must be live on OpenRouter and stream cleanly. Verified
-// 2026-10-25 against a house key: nemotron-3-super 404s at the provider,
-// gemma-4-31b is rate-limited, and nemotron-3.5-lightning errors mid-stream.
-// Dots and Laguna both stream reliably.
-const M_SUPER = "poolside/laguna-s-2.1:free";
-const M_GEMMA = "poolside/laguna-s-2.1:free";
-const M_GEMMA_S = "poolside/laguna-s-2.1:free";
-const M_VL = "poolside/laguna-s-2.1:free";
+// 2026-11-03 against https://openrouter.ai/api/v1/models (451 ids). Quorum has
+// no free plan, so every seat default is a listed paid slug from the fast
+// allowlist; no ':free' id may appear in the catalog.
+const M_SUPER = "deepseek/deepseek-v4.1-flash";
+const M_GEMMA = "z-ai/glm-5.3-flash";
+const M_GEMMA_S = "openai/gpt-6-luna";
+const M_VL = "deepseek/deepseek-v4.1-flash";
+
+/** Pro and a $5 Fast Session seat experts on a fast paid model. */
+export const FAST_PAID_DEFAULT_EXPERT_MODEL = "deepseek/deepseek-v4.1-flash";
+/** Boardroom and a $15 Boardroom Session seat experts on a frontier model. */
+export const FRONTIER_DEFAULT_EXPERT_MODEL = "anthropic/claude-sonnet-5.5";
+
+// Fail at import time if a default ever drifts outside its tier allowlist.
+if (!(HOUSE_KEY_PAID_MODEL_ALLOWLIST as readonly string[]).includes(FAST_PAID_DEFAULT_EXPERT_MODEL)) {
+  throw new Error("FAST_PAID_DEFAULT_EXPERT_MODEL must be in the fast paid allowlist");
+}
+if (!(BOARDROOM_FRONTIER_MODEL_ALLOWLIST as readonly string[]).includes(FRONTIER_DEFAULT_EXPERT_MODEL)) {
+  throw new Error("FRONTIER_DEFAULT_EXPERT_MODEL must be in the Boardroom frontier allowlist");
+}
+for (const [name, slug] of Object.entries({ M_SUPER, M_GEMMA, M_GEMMA_S, M_VL })) {
+  if (!(HOUSE_KEY_PAID_MODEL_ALLOWLIST as readonly string[]).includes(slug)) {
+    throw new Error(`Catalog default ${name} (${slug}) must be in the fast paid allowlist`);
+  }
+}
+
+/** Paid default for a board: frontier when the board may use frontier models. */
+export function defaultPaidExpertModel(allowFrontier: boolean): string {
+  return allowFrontier ? FRONTIER_DEFAULT_EXPERT_MODEL : FAST_PAID_DEFAULT_EXPERT_MODEL;
+}
+
+/**
+ * Expert default for a tier. Pro gets a fast paid model; Boardroom/Enterprise
+ * get a frontier model. A no-plan account cannot open a board, but if a stale
+ * row asks for a default it still gets the fast paid slug — never a ':free' id.
+ */
+export function defaultExpertModelForTier(
+  tier: string | null | undefined,
+  allowFrontier: boolean = tier === "boardroom" || tier === "enterprise",
+): string {
+  return defaultPaidExpertModel(allowFrontier);
+}
+
+/**
+ * Resolve a requested expert model for the board's billing context. No free
+ * model exists anywhere, so a ':free' request (stale client or stored row) is
+ * always rewritten to the context's paid default. Any other requested slug is
+ * kept and still passes the server allowlist gate.
+ */
+export function resolveExpertModelForContext(
+  model: string | null | undefined,
+  context: { paid: boolean; allowFrontier: boolean },
+): string {
+  const requested = model?.trim();
+  if (requested && !requested.endsWith(":free")) return requested;
+  return defaultPaidExpertModel(context.allowFrontier);
+}
 
 export const EXPERT_CATALOG: CatalogExpert[] = [
   { role: "Chief Strategy Officer", category: "Strategy", emoji: "🧭", color: "#455A64", defaultModel: M_SUPER, recommended: true,
@@ -109,5 +164,5 @@ export function findCatalogExpert(role: string): CatalogExpert | undefined {
   return EXPERT_CATALOG.find(e => e.role.toLowerCase() === r);
 }
 
-/** Tier caps, mirrored from server/tiers.ts for UI copy. */
-export const TIER_EXPERT_LIMITS = { free: 3, pro: 8, enterprise: 999 } as const;
+/** Tier caps, mirrored from server/tiers.ts for UI copy. No free plan. */
+export const TIER_EXPERT_LIMITS = { pro: 8, boardroom: 12, enterprise: 999 } as const;

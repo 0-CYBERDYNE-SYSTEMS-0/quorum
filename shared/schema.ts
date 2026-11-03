@@ -3,6 +3,14 @@ import { createInsertSchema } from "drizzle-zod";
 import { sql } from "drizzle-orm";
 import { z } from "zod";
 
+/**
+ * Canonical plan keys. Stored in users.tier as text (the column predates
+ * enums), but every server/client comparison goes through this list.
+ */
+export const USER_TIERS = ["free", "pro", "boardroom", "enterprise"] as const;
+export const userTierSchema = z.enum(USER_TIERS);
+export type UserTier = z.infer<typeof userTierSchema>;
+
 export const users = pgTable("users", {
   id: serial("id").primaryKey(),
   username: text("username").notNull().unique(),
@@ -59,8 +67,35 @@ export const conversations = pgTable("conversations", {
   // G13: optional maximum number of turns for the next autonomous run.
   // Nullable disables the cap; new conversations default to 25 turns.
   turnBudget: integer("turn_budget").default(25),
+  // Pricing v1: the one-time session credit this conversation is running on.
+  // Set once when a Free account creates the conversation; the credit's
+  // limits (seats, 25 chair messages, AI cap) apply for its whole life.
+  sessionCreditId: integer("session_credit_id"),
   createdAt: timestamp("created_at").defaultNow(),
 });
+
+/**
+ * Pricing v1 one-time session credits. A row is granted by a Stripe Checkout
+ * `payment` session (idempotent on the unique checkout session id) and is
+ * consumed by exactly one new conversation. `aiSpendUsd` tracks house-key
+ * spend inside that conversation against the credit's own cap.
+ */
+export const sessionCredits = pgTable("session_credits", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  // fast | boardroom
+  kind: text("kind").notNull(),
+  // available | used
+  status: text("status").notNull().default("available"),
+  stripeCheckoutSessionId: text("stripe_checkout_session_id").notNull().unique(),
+  conversationId: integer("conversation_id").references(() => conversations.id, { onDelete: "set null" }),
+  aiSpendUsd: doublePrecision("ai_spend_usd").notNull().default(0),
+  createdAt: timestamp("created_at").defaultNow(),
+  usedAt: timestamp("used_at"),
+});
+
+export type SessionCredit = typeof sessionCredits.$inferSelect;
+export type InsertSessionCredit = typeof sessionCredits.$inferInsert;
 
 export const experts = pgTable("experts", {
   id: serial("id").primaryKey(),
@@ -183,7 +218,7 @@ export type Artifact = z.infer<typeof artifactSchema>;
 
 // Schemas
 export const insertUserSchema = createInsertSchema(users, {
-  tier: z.enum(["free", "pro", "enterprise"]).optional(),
+  tier: userTierSchema.optional(),
 }).omit({
   id: true,
   stripeCustomerId: true,

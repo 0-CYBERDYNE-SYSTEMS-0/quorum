@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { Check, Loader2, Plus, Sparkles, UserRound, X } from "lucide-react";
 import type { Expert } from "@shared/schema";
-import { EXPERT_CATALOG, TIER_EXPERT_LIMITS, type CatalogExpert } from "@shared/expert-catalog";
+import { EXPERT_CATALOG, TIER_EXPERT_LIMITS, resolveExpertModelForContext, type CatalogExpert } from "@shared/expert-catalog";
 import { Btn, Chip, Field, Input, Modal, Monogram, TextArea } from "@/components/design";
 import { BOARD_PRESETS } from "@/lib/board";
+import { effectiveModelTier, isBoardroomOnlyModel, modelLabel, modelOptionsForTier } from "@/lib/model-options";
 import { cn } from "@/lib/utils";
 
 type SeatDraft = {
@@ -17,24 +18,26 @@ type SeatDraft = {
   custom?: boolean;
 };
 
-function toDraft(expert: Expert): SeatDraft {
+type ModelContext = { paid: boolean; allowFrontier: boolean };
+
+function toDraft(expert: Expert, context: ModelContext): SeatDraft {
   return {
     key: `existing-${expert.id}`,
     role: expert.role,
     name: expert.name,
-    model: expert.model,
+    model: resolveExpertModelForContext(expert.model, context),
     avatarUrl: expert.avatarUrl ?? "",
     customInstructions: expert.customInstructions ?? undefined,
     existingId: expert.id,
   };
 }
 
-function fromCatalog(entry: CatalogExpert): SeatDraft {
+function fromCatalog(entry: CatalogExpert, context: ModelContext): SeatDraft {
   return {
     key: `catalog-${entry.role}`,
     role: entry.role,
     name: entry.role,
-    model: entry.defaultModel,
+    model: resolveExpertModelForContext(entry.defaultModel, context),
     avatarUrl: entry.color,
   };
 }
@@ -44,6 +47,8 @@ export function BoardModal({
   onOpenChange,
   experts,
   tier,
+  creditKind,
+  seatLimit,
   onApply,
   onUpdateSeat,
 }: {
@@ -51,10 +56,20 @@ export function BoardModal({
   onOpenChange: (open: boolean) => void;
   experts: Expert[];
   tier: string;
+  /** A session-credit conversation uses the credit's model rules. */
+  creditKind?: "fast" | "boardroom" | null;
+  /** Overrides the plan cap for a conversation running on a session credit. */
+  seatLimit?: number;
   onApply: (adds: SeatDraft[], removes: number[]) => Promise<void>;
-  onUpdateSeat: (expertId: number, body: { customInstructions?: string }) => Promise<void>;
+  onUpdateSeat: (expertId: number, body: { customInstructions?: string; model?: string }) => Promise<void>;
 }) {
-  const limit = TIER_EXPERT_LIMITS[(tier as keyof typeof TIER_EXPERT_LIMITS)] ?? TIER_EXPERT_LIMITS.free;
+  const limit = seatLimit ?? TIER_EXPERT_LIMITS[(tier as keyof typeof TIER_EXPERT_LIMITS)] ?? 0;
+  const modelTier = effectiveModelTier(tier, creditKind);
+  const modelContext: ModelContext = {
+    paid: modelTier !== "free",
+    allowFrontier: modelTier === "boardroom" || modelTier === "enterprise",
+  };
+  const modelOptions = modelOptionsForTier(modelTier);
   const [drafts, setDrafts] = useState<SeatDraft[]>([]);
   const [saving, setSaving] = useState(false);
   const [category, setCategory] = useState<string>("All");
@@ -67,11 +82,12 @@ export function BoardModal({
 
   useEffect(() => {
     if (open) {
-      setDrafts(experts.map(toDraft));
+      setDrafts(experts.map((expert) => toDraft(expert, modelContext)));
       setCategory("All");
       setCustomOpen(false);
     }
-  }, [open, experts]);
+    // modelContext is derived from tier/creditKind; the primitives are the deps.
+  }, [open, experts, modelContext.paid, modelContext.allowFrontier]);
 
   const selectedRoles = useMemo(() => new Set(drafts.map((draft) => draft.role.toLowerCase())), [drafts]);
   const categories = useMemo(() => ["All", ...Array.from(new Set(EXPERT_CATALOG.map((entry) => entry.category)))], []);
@@ -83,7 +99,7 @@ export function BoardModal({
       const existing = current.find((draft) => draft.role.toLowerCase() === entry.role.toLowerCase());
       if (existing) return current.filter((draft) => draft !== existing);
       if (current.length >= limit) return current;
-      return [...current, fromCatalog(entry)];
+      return [...current, fromCatalog(entry, modelContext)];
     });
   };
 
@@ -92,7 +108,7 @@ export function BoardModal({
       .map((role) => EXPERT_CATALOG.find((entry) => entry.role === role))
       .filter((entry): entry is CatalogExpert => !!entry)
       .slice(0, limit)
-      .map((entry) => drafts.find((draft) => draft.role === entry.role) ?? fromCatalog(entry));
+      .map((entry) => drafts.find((draft) => draft.role === entry.role) ?? fromCatalog(entry, modelContext));
     setDrafts(next);
   };
 
@@ -104,7 +120,10 @@ export function BoardModal({
         key: `custom-${customRole.trim()}-${Date.now()}`,
         role: customRole.trim(),
         name: customName.trim() || customRole.trim(),
-        model: EXPERT_CATALOG[1]?.defaultModel ?? EXPERT_CATALOG[0].defaultModel,
+        model: resolveExpertModelForContext(
+          EXPERT_CATALOG[1]?.defaultModel ?? EXPERT_CATALOG[0].defaultModel,
+          modelContext,
+        ),
         avatarUrl: "#5B4A63",
         customInstructions: customBrief.trim() || undefined,
         custom: true,
@@ -125,9 +144,16 @@ export function BoardModal({
       for (const draft of drafts) {
         if (!draft.existingId) continue;
         const original = experts.find((expert) => expert.id === draft.existingId);
-        if (original && (original.customInstructions ?? "") !== (draft.customInstructions ?? "")) {
-          await onUpdateSeat(draft.existingId, { customInstructions: draft.customInstructions ?? "" });
+        if (!original) continue;
+        // An already-seated director keeps the settings just chosen: both the
+        // standing brief and the model must persist (a model change used to be
+        // dropped because only customInstructions was patched).
+        const body: { customInstructions?: string; model?: string } = {};
+        if ((original.customInstructions ?? "") !== (draft.customInstructions ?? "")) {
+          body.customInstructions = draft.customInstructions ?? "";
         }
+        if (original.model !== draft.model) body.model = draft.model;
+        if (Object.keys(body).length > 0) await onUpdateSeat(draft.existingId, body);
       }
       await onApply(adds, removes);
       onOpenChange(false);
@@ -295,8 +321,33 @@ export function BoardModal({
                       <div className="min-w-0 flex-1">
                         <p className="truncate text-[12px] font-medium text-ink">{draft.role}</p>
                         <p className="truncate text-[10.5px] text-faint-ink">
-                          {entry?.category ?? "Custom"} · {draft.model.split("/").pop()}
+                          {entry?.category ?? "Custom"} · {modelLabel(draft.model)}
+                          {isBoardroomOnlyModel(draft.model) && (
+                            <span className="ml-1 text-bronze">· Boardroom only</span>
+                          )}
                         </p>
+                        <label className="mt-1 flex items-center gap-1.5">
+                          <span className="sr-only">Model for {draft.role}</span>
+                          <select
+                            value={draft.model}
+                            onChange={(event) => {
+                              const model = event.target.value;
+                              setDrafts((current) =>
+                                current.map((item) => (item.key === draft.key ? { ...item, model } : item)),
+                              );
+                            }}
+                            className="w-full rounded border border-line bg-paper/70 px-1.5 py-1 text-[10.5px] text-ink-soft outline-none focus:border-bronze/50"
+                          >
+                            {!modelOptions.some((option) => option.id === draft.model) && (
+                              <option value={draft.model}>{modelLabel(draft.model)} (current)</option>
+                            )}
+                            {modelOptions.map((option) => (
+                              <option key={option.id} value={option.id}>
+                                {option.label}{option.boardroomOnly ? " · Boardroom" : ""}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
                       </div>
                       <button
                         type="button"

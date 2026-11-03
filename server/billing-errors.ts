@@ -6,7 +6,7 @@
 export type BillingErrorBody = { code: string; message: string };
 
 export const BILLING_UNAVAILABLE_MESSAGE =
-  "Subscriptions are temporarily unavailable. You can keep using the free plan; please try again later.";
+  "Subscriptions are temporarily unavailable. Your boards and data are safe; please try again later.";
 
 export function billingUnavailable(reason: string): { status: number; body: BillingErrorBody } {
   console.error(`[billing] unavailable: ${reason}`);

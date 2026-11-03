@@ -12,7 +12,7 @@ import axios from "axios";
 import { randomBytes } from "crypto";
 import { getProvider, OUTPUT_LIMIT_ERROR, escalatedOutputTokens, type ChatOptions } from "./ai-providers";
 import { MAX_LOGGED_PROVIDER_TEXT, redactAndTruncateLogText } from "./log-redaction";
-import { BUDGET_FALLBACK_MODEL, CLOSING_MEMO_MAX_TOKENS, DEFAULT_AUX_MODEL_FALLBACK_SLUG, DEFAULT_AUX_MODEL_SLUG, EXPERT_REPLY_MAX_TOKENS, UsageCapError } from "./usage-caps";
+import { CLOSING_MEMO_MAX_TOKENS, DEFAULT_AUX_MODEL_FALLBACK_SLUG, DEFAULT_AUX_MODEL_SLUG, EXPERT_REPLY_MAX_TOKENS, UsageCapError } from "./usage-caps";
 import { findCatalogExpert } from "@shared/expert-catalog";
 import { isDeferentialStancePosition } from "@shared/stance";
 import { DELIVERABLE_PLACEHOLDER, pendingDeliverableFor, pendingDeliverableByMessage } from "./pending-deliverables";
@@ -57,34 +57,76 @@ export const PLANNING_MAX_TOKENS = 4096;
 const EXPERT_HISTORY_MESSAGES = 8;
 
 function isPaidTier(tier: string | null | undefined): boolean {
-  return tier === "pro" || tier === "enterprise";
+  return tier === "pro" || tier === "boardroom" || tier === "enterprise";
 }
 
 /**
- * Ordered planning models for a tier. Paid tiers use a small paid slug (and one
- * fallback); free tiers stay on the free budget slug because a paid house-key
- * call is rejected for them. TOOL_PLANNING_MODEL overrides the whole chain.
+ * Ordered planning models. There is no free plan, so every board call uses the
+ * small paid aux slug (and one paid fallback). TOOL_PLANNING_MODEL overrides
+ * the chain, except that a ':free' override is never accepted.
  */
-export function planningModelsForTier(tier: string | null | undefined): string[] {
+export function planningModelsForTier(_tier: string | null | undefined, _sessionCredit = false): string[] {
   const override = process.env.TOOL_PLANNING_MODEL?.trim();
-  if (override) return [override];
-  if (!isPaidTier(tier)) return [BUDGET_FALLBACK_MODEL];
+  if (override && !override.endsWith(":free")) return [override];
   return [DEFAULT_AUX_MODEL_SLUG, DEFAULT_AUX_MODEL_FALLBACK_SLUG];
 }
 
-async function runExpertToolPhase(expert: Expert, question: string, userId?: number): Promise<ToolRun | null> {
+/**
+ * The paid aux model to use for a helper call. A paid context must never send
+ * a ':free' slug, so anything free (a paid account whose Moderator still runs a
+ * free model, or a stray env override) is replaced with the paid default.
+ */
+export function paidAuxModelFor(preferred?: string | null): string {
+  const candidate = preferred?.trim();
+  if (candidate && !candidate.endsWith(":free")) return candidate;
+  return DEFAULT_AUX_MODEL_SLUG;
+}
+
+type CreditLookupStorage = { getSessionCreditByConversationId?: (conversationId: number) => Promise<{ id: number } | undefined> };
+
+async function conversationCreditFor(conversationId?: number): Promise<{ id: number } | undefined> {
+  if (!conversationId) return undefined;
+  const lookup = (storage as unknown as CreditLookupStorage).getSessionCreditByConversationId;
+  if (typeof lookup !== "function") return undefined;
+  try {
+    return await lookup.call(storage, conversationId);
+  } catch (error) {
+    console.warn("[CREDITS] could not load conversation credit for model routing:", (error as Error).message);
+    return undefined;
+  }
+}
+
+/**
+ * True when helper calls for this conversation are billed to a paying
+ * customer: a paid tier, or a conversation funded by a $5/$15 session credit
+ * (whose Chair may have no plan).
+ */
+export async function isPaidAuxContext(userId?: number, conversationId?: number): Promise<boolean> {
+  if (await conversationCreditFor(conversationId)) return true;
+  if (!userId) return false;
+  try {
+    const user = await storage.getUser(userId);
+    return isPaidTier(user?.tier);
+  } catch (error) {
+    console.warn("[AUX] could not resolve user tier; keeping the configured aux model:", (error as Error).message);
+    return false;
+  }
+}
+
+async function runExpertToolPhase(expert: Expert, question: string, userId?: number, conversationId?: number): Promise<ToolRun | null> {
   if (!expertToolsEnabled() || expert.role === "Moderator" || expert.role === "File Creator") return null;
   let tier: string | undefined;
   try { tier = userId ? (await storage.getUser(userId))?.tier ?? undefined : undefined; } catch { tier = undefined; }
   const limit = toolCallLimitForTier(tier);
+  const credit = await conversationCreditFor(conversationId);
   let plan = "NONE";
   let planningFailed = false;
-  for (const model of planningModelsForTier(tier)) {
+  for (const model of planningModelsForTier(tier, Boolean(credit))) {
     try {
       const planning = await callOpenRouterAPI([
         { role: "system", content: buildToolPlanningPrompt(expert.role, question, limit) },
         { role: "user", content: "List your tool calls now (or NONE)." },
-      ], model, userId, false, { maxTokens: PLANNING_MAX_TOKENS });
+      ], model, userId, false, { maxTokens: PLANNING_MAX_TOKENS, conversationId });
       plan = planning.message.content ?? "NONE";
       planningFailed = false;
       break;
@@ -502,6 +544,9 @@ async function saveGeneratedDeliverable(
 function expertResponseErrorMessage(error: unknown, expertName: string, imageParts: ImagePart[]): string {
   if (isVisionRejection(error, imageParts)) return visionRejectionMessage(expertName);
   if (error instanceof SafeDeliverableError) return error.message;
+  // Plan caps are actionable ("switch experts to free models…"), so show the
+  // cap message instead of the generic incomplete-response text.
+  if (error instanceof UsageCapError) return error.message;
   return INCOMPLETE_EXPERT_RESPONSE_MESSAGE;
 }
 
@@ -1363,7 +1408,7 @@ export async function getExpertResponseStream(
    // array. The 12k-char truncation applies to the TEXT part only — the
    // base64 image parts are appended verbatim, never truncated.
    // Core tools: optional research phase (search / fetch) before answering.
-   const toolRun = await runExpertToolPhase(expert, referenceMessageContent, conversation?.userId);
+   const toolRun = await runExpertToolPhase(expert, referenceMessageContent, conversation?.userId, expert.conversationId);
    if (toolRun) messages.push({ role: "system", content: formatToolResultsForPrompt(toolRun) });
    if (retryInstruction?.trim()) messages.push({ role: "system", content: retryInstruction.trim() });
 
@@ -1384,9 +1429,9 @@ export async function getExpertResponseStream(
     providerRetry
       ? callExpertStreamWithResilience(
           messages, model, onStreamToken, conversation?.userId, webSearch,
-          { maxTokens: EXPERT_REPLY_MAX_TOKENS }, undefined, providerRetry,
+          { maxTokens: EXPERT_REPLY_MAX_TOKENS, conversationId: expert.conversationId }, undefined, providerRetry,
         )
-      : callOpenRouterAPIStream(messages, model, onStreamToken, conversation?.userId, webSearch, { maxTokens: EXPERT_REPLY_MAX_TOKENS });
+      : callOpenRouterAPIStream(messages, model, onStreamToken, conversation?.userId, webSearch, { maxTokens: EXPERT_REPLY_MAX_TOKENS, conversationId: expert.conversationId });
   try {
     let response: AIModelResponse;
     let stance: MessageStance | null = null;
@@ -1412,7 +1457,7 @@ export async function getExpertResponseStream(
     else if (expert.role === "File Creator") {
       // File Creator needs full response to parse JSON — use non-streaming
       const request = await prepareFileCreatorRequest(expert, messages, deliverableRequest);
-      response = await callOpenRouterAPI(messages, expert.model, conversation?.userId);
+      response = await callOpenRouterAPI(messages, expert.model, conversation?.userId, false, { conversationId: expert.conversationId });
       requireNonEmptyAssistantContent(response);
       stance = stripExpertStance(response, expert.role);
       const saved = await saveGeneratedDeliverable(response.message.content, expert, request);
@@ -1583,19 +1628,19 @@ export async function getExpertResponse(
       if (process.env.PERPLEXITY_API_KEY) {
         response = await callPerplexityAPI(referenceMessageContent, messages);
       } else {
-        response = await callOpenRouterAPI(messages, expert.model, conversation?.userId, paidWebPluginEnabled(), { maxTokens: EXPERT_REPLY_MAX_TOKENS });
+        response = await callOpenRouterAPI(messages, expert.model, conversation?.userId, paidWebPluginEnabled(), { maxTokens: EXPERT_REPLY_MAX_TOKENS, conversationId: expert.conversationId });
       }
     } 
     else if (expert.role === "File Creator") {
        const request = await prepareFileCreatorRequest(expert, messages, deliverableRequest);
-       response = await callOpenRouterAPI(messages, expert.model, conversation?.userId);
+       response = await callOpenRouterAPI(messages, expert.model, conversation?.userId, false, { conversationId: expert.conversationId });
        requireNonEmptyAssistantContent(response);
        stance = stripExpertStance(response, expert.role);
        const saved = await saveGeneratedDeliverable(response.message.content, expert, request);
        response.message.content = deliverableSuccessMessage(saved, request);
     }
     else {
-      response = await callOpenRouterAPI(messages, expert.model, conversation?.userId, false, { maxTokens: EXPERT_REPLY_MAX_TOKENS });
+      response = await callOpenRouterAPI(messages, expert.model, conversation?.userId, false, { maxTokens: EXPERT_REPLY_MAX_TOKENS, conversationId: expert.conversationId });
     }
 
     if (expert.role !== "File Creator") {
@@ -1665,25 +1710,22 @@ export async function getExpertResponse(
  * empty; the returned slug is trimmed.
  */
 /**
- * Auxiliary calls (routing, insights, closing memo) must be usable by every
- * tier. A paid DEFAULT_AUX_MODEL would otherwise make the moderator fail for
- * free accounts with "upgrade to Pro". Downgrade to the free budget model for
- * non-paid tiers instead of surfacing an upgrade error mid-session.
+ * Auxiliary calls (routing, insights, closing memo) always use a paid aux
+ * model. There is no free plan and no ':free' slug, so nothing may fall back
+ * to one.
  */
 export async function resolveAuxModelForUser(
   moderatorModel: string | null | undefined,
   firstExpertModel: string | null | undefined,
   userId?: number,
+  conversationId?: number,
 ): Promise<string | null> {
   const model = resolveAuxModel(moderatorModel, firstExpertModel);
-  if (!model || model.endsWith(":free") || !userId) return model;
-  try {
-    const user = await storage.getUser(userId);
-    if (user && user.tier !== "pro" && user.tier !== "enterprise") return BUDGET_FALLBACK_MODEL;
-  } catch (error) {
-    console.warn("[AUX] could not resolve user tier; keeping configured aux model:", (error as Error).message);
-  }
-  return model;
+  // No billing context at all (internal call): keep a paid configured model.
+  if (!userId && !conversationId) return model && model.endsWith(":free") ? paidAuxModelFor(model) : model;
+  if (await isPaidAuxContext(userId, conversationId)) return paidAuxModelFor(model);
+  if (!model || !model.endsWith(":free")) return model;
+  return paidAuxModelFor(model);
 }
 
 export function resolveAuxModel(
@@ -1875,7 +1917,7 @@ export async function generateInsights(conversationId: number, broadcastFn?: (co
     const moderatorExpert = experts.find(e => e.role === 'Moderator') ?? null;
     const firstExpertModel = experts.find(e => e.role !== 'Moderator')?.model ?? null;
     const conversation = await storage.getConversation(conversationId);
-    const auxModel = await resolveAuxModelForUser(moderatorExpert?.model ?? null, firstExpertModel, conversation?.userId);
+    const auxModel = await resolveAuxModelForUser(moderatorExpert?.model ?? null, firstExpertModel, conversation?.userId, conversationId);
     if (!auxModel) {
       console.error(`generateInsights: no aux model could be resolved for conversation ${conversationId} (no Moderator model, DEFAULT_AUX_MODEL unset, roster empty) — skipping insights.`);
       return;
@@ -1884,7 +1926,7 @@ export async function generateInsights(conversationId: number, broadcastFn?: (co
     const response = await callOpenRouterAPI([
       { role: "system", content: "You extract key insights from business board discussions. Respond only with the requested JSON format." },
       { role: "user", content: insightPrompt }
-    ], auxModel, conversation?.userId);
+    ], auxModel, conversation?.userId, false, { conversationId });
     
     try {
       const insightData = JSON.parse(response.message.content);
@@ -1990,13 +2032,13 @@ export async function getModeratorNextSpeakerSuggestion(
         // the orchestrator falls back to round-robin.
         const experts = await storage.getConversationExperts(moderatorExpert.conversationId);
         const firstExpertModel = experts.find(expert => expert.role !== "Moderator")?.model ?? null;
-        const auxModel = await resolveAuxModelForUser(moderatorExpert.model, firstExpertModel, conversation?.userId);
+        const auxModel = await resolveAuxModelForUser(moderatorExpert.model, firstExpertModel, conversation?.userId, moderatorExpert.conversationId);
         if (!auxModel) {
             console.error("getModeratorNextSpeakerSuggestion: no aux model could be resolved (Moderator has no model, DEFAULT_AUX_MODEL unset, roster empty) — falling back to round-robin.");
             return null;
         }
 
-        const response = await callOpenRouterAPI(messages, auxModel, conversation?.userId);
+        const response = await callOpenRouterAPI(messages, auxModel, conversation?.userId, false, { conversationId: moderatorExpert.conversationId });
         const responseContent = response?.message?.content;
         if (typeof responseContent !== "string" || !responseContent.trim()) {
             console.warn("Moderator returned no next-speaker text. Falling back to round-robin.");
@@ -2047,12 +2089,10 @@ export async function getModeratorNextSpeakerSuggestion(
 }
 
 /**
- * The paid aux model used when the closing memo's own model fails. Free-tier
- * calls already resolved to the free budget model (resolveAuxModelForUser), so
- * they stay there: a paid fallback would be rejected by the tier cap.
+ * The paid aux model used when the closing memo's own model fails. There is no
+ * free plan, so the chain is always paid.
  */
 export function closingSynthesisFallbackModel(closingModel: string): string | null {
-  if (closingModel === BUDGET_FALLBACK_MODEL) return null;
   if (closingModel === DEFAULT_AUX_MODEL_FALLBACK_SLUG) return null;
   return DEFAULT_AUX_MODEL_FALLBACK_SLUG;
 }
@@ -2102,7 +2142,7 @@ export async function generateClosingSynthesis(
     }
     const systemPrompt = generateSystemPrompt(moderatorExpert, availableRoles, companyProfile, charter);
     const firstExpertModel = experts.find(expert => expert.role !== "Moderator")?.model ?? null;
-    const closingModel = await resolveAuxModelForUser(moderatorExpert.model, firstExpertModel, conversation?.userId);
+    const closingModel = await resolveAuxModelForUser(moderatorExpert.model, firstExpertModel, conversation?.userId, conversationId);
 
     // Refresh the persisted transcript immediately before building the closing
     // prompt so the in-memory ledger cannot override the final stored stance.
@@ -2166,7 +2206,7 @@ export async function generateClosingSynthesis(
         }
         response = await callOpenRouterAPIStream(
           messages, attempt.model, onClosingToken, conversation?.userId, false,
-          { maxTokens: attempt.maxTokens },
+          { maxTokens: attempt.maxTokens, conversationId },
         );
         break;
       } catch (error) {

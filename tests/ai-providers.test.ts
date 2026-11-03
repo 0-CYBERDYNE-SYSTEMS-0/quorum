@@ -249,22 +249,21 @@ describe("AI Providers", () => {
       });
     });
 
-    it.each(["chat", "chatStream"] as const)("records the Poolside-to-dots-studio route and actual fallback for %s", async (method) => {
+    it.each(["chat", "chatStream"] as const)("records a paid primary model with no free fallback route for %s", async (method) => {
       process.env.OPENROUTER_API_KEY = "test-only-openrouter-key";
-      const requestedModel = "poolside/laguna-s-2.1:free";
-      const fallbackModel = "dots-studio/dots-3-note-preview:free";
+      const requestedModel = "z-ai/glm-5.3-flash";
       mockFetch.mockResolvedValueOnce(method === "chat"
         ? {
             ok: true,
             status: 200,
             json: async () => ({
-              model: fallbackModel,
-              provider: "Dots Studio",
+              model: requestedModel,
+              provider: "Mock Provider",
               choices: [{ message: { role: "assistant", content: "Answer." } }],
             }),
           }
         : mockSseResponse([
-            { model: fallbackModel, provider: "Dots Studio", choices: [{ delta: { content: "Answer." }, finish_reason: null }] },
+            { model: requestedModel, provider: "Mock Provider", choices: [{ delta: { content: "Answer." }, finish_reason: null }] },
             { choices: [{ delta: {}, finish_reason: "stop" }] },
           ]));
 
@@ -275,18 +274,18 @@ describe("AI Providers", () => {
         await provider.chatStream([{ role: "user", content: "Question" }], requestedModel, () => {});
       }
 
-      expect(provider.getUsageSnapshot().attempts[0]).toMatchObject({
+      const attempt = provider.getUsageSnapshot().attempts[0];
+      expect(attempt).toMatchObject({
         model: requestedModel,
         attemptedModel: requestedModel,
         requestModel: requestedModel,
-        routedModels: [requestedModel, fallbackModel],
-        fallbackModels: [fallbackModel],
-        responseModel: fallbackModel,
-        provider: "Dots Studio",
-        fallbackUsed: true,
+        responseModel: requestedModel,
+        provider: "Mock Provider",
         httpStatus: 200,
         result: "success",
       });
+      expect(attempt.routedModels ?? []).toEqual([requestedModel]);
+      expect(attempt.fallbackUsed ?? false).toBe(false);
     });
 
     it("logs the allowlisted provider and a redacted body excerpt from a 429 without headers or key text", async () => {
@@ -303,7 +302,7 @@ describe("AI Providers", () => {
       try {
         let caughtError: unknown;
         try {
-          await provider.chat([{ role: "user", content: prompt }], "poolside/laguna-s-2.1:free");
+          await provider.chat([{ role: "user", content: prompt }], "z-ai/glm-5.3-flash");
         } catch (error) {
           caughtError = error;
         }
@@ -311,8 +310,7 @@ describe("AI Providers", () => {
 
         const attempt = provider.getUsageSnapshot().attempts[0];
         expect(attempt).toMatchObject({
-          attemptedModel: "poolside/laguna-s-2.1:free",
-          routedModels: ["poolside/laguna-s-2.1:free", "dots-studio/dots-3-note-preview:free"],
+          attemptedModel: "z-ai/glm-5.3-flash",
           httpStatus: 429,
           providerStatus: 429,
           provider: "Mock Provider",
@@ -346,7 +344,7 @@ describe("AI Providers", () => {
       try {
         let caughtError: unknown;
         try {
-          await provider.chatStream([{ role: "user", content: prompt }], "poolside/laguna-s-2.1:free", () => {});
+          await provider.chatStream([{ role: "user", content: prompt }], "z-ai/glm-5.3-flash", () => {});
         } catch (error) {
           caughtError = error;
         }

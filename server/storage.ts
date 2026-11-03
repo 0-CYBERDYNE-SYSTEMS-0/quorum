@@ -1,10 +1,10 @@
-import { users, type User, type InsertUser, conversations, type Conversation, type InsertConversation, experts, type Expert, type InsertExpert, messages, type Message, type InsertMessage, openQuestions, type OpenQuestion, type InsertOpenQuestion, files, type File, type InsertFile, insights, type Insight, type InsertInsight, companyProfiles, type CompanyProfile, type InsertCompanyProfile, usageMonthly } from "@shared/schema";
+import { users, type User, type InsertUser, conversations, type Conversation, type InsertConversation, experts, type Expert, type InsertExpert, messages, type Message, type InsertMessage, openQuestions, type OpenQuestion, type InsertOpenQuestion, files, type File, type InsertFile, insights, type Insight, type InsertInsight, companyProfiles, type CompanyProfile, type InsertCompanyProfile, usageMonthly, sessionCredits, type SessionCredit } from "@shared/schema";
 import { encryptApiKey, decryptApiKey } from "./crypto";
 import createMemoryStore from "memorystore";
 import session from "express-session";
 import { Pool } from "pg";
 import { drizzle } from "drizzle-orm/node-postgres";
-import { eq, desc, asc, and, isNull, isNotNull, max, sql } from "drizzle-orm";
+import { eq, desc, asc, and, isNull, isNotNull, max, sql, count } from "drizzle-orm";
 import ConnectPgSimple from "connect-pg-simple";
 import type { DeliverableGenerationRequest, SaveDeliverableVersionResult } from "@shared/schema";
 
@@ -30,9 +30,14 @@ export interface IStorage {
   getUser(id: number): Promise<User | undefined>;
   getUserByUsername(username: string): Promise<User | undefined>;
   getUserByStripeSubscriptionId(subscriptionId: string): Promise<User | undefined>;
+  getUserByStripeCustomerId(customerId: string): Promise<User | undefined>;
   createUser(user: InsertUser): Promise<User>;
   updateUserStripeInfo(userId: number, stripeInfo: { stripeCustomerId: string, stripeSubscriptionId: string }): Promise<User>;
   updateSubscriptionStatus(userId: number, status: string): Promise<User>;
+  /** Pricing v1: set the plan key (free | pro | boardroom | enterprise). */
+  updateUserTier(userId: number, tier: string): Promise<User>;
+  /** Set plan and billing status together (webhook paths). */
+  updateUserPlan(userId: number, plan: { tier?: string; status?: string }): Promise<User>;
   getUserApiKey(userId: number): Promise<string | null>;
   setUserApiKey(userId: number, key: string): Promise<void>;
   removeUserApiKey(userId: number): Promise<void>;
@@ -41,6 +46,21 @@ export interface IStorage {
   getMonthlyUsage(userId: number, period: string): Promise<{ messageCount: number; aiSpendUsd: number }>;
   incrementMonthlyMessages(userId: number, period: string): Promise<number>;
   addMonthlyAiSpend(userId: number, period: string, usd: number): Promise<void>;
+
+  // Pricing v1: one-time session credits.
+  listSessionCredits(userId: number): Promise<SessionCredit[]>;
+  getSessionCreditByCheckoutSessionId(checkoutSessionId: string): Promise<SessionCredit | undefined>;
+  getSessionCreditByConversationId(conversationId: number): Promise<SessionCredit | undefined>;
+  /** Idempotent on the Stripe checkout session id. */
+  grantSessionCredit(input: { userId: number; kind: string; stripeCheckoutSessionId: string }): Promise<{ credit: SessionCredit; created: boolean }>;
+  /** Atomically move one available credit to `used`. Undefined means it was already spent. */
+  consumeSessionCredit(creditId: number, userId: number): Promise<SessionCredit | undefined>;
+  /** Link the consumed credit to the conversation it funds. */
+  attachSessionCreditToConversation(creditId: number, conversationId: number): Promise<SessionCredit | undefined>;
+  /** Return a consumed credit to `available` when conversation creation failed. */
+  releaseSessionCredit(creditId: number): Promise<void>;
+  addSessionCreditSpend(creditId: number, usd: number): Promise<void>;
+  countConversationUserMessages(conversationId: number): Promise<number>;
   
   // Conversation operations
   createConversation(conversation: InsertConversation): Promise<Conversation>;
@@ -184,6 +204,12 @@ export class MemStorage implements IStorage {
     );
   }
 
+  async getUserByStripeCustomerId(customerId: string): Promise<User | undefined> {
+    return Array.from(this.users.values()).find(
+      (user) => user.stripeCustomerId === customerId,
+    );
+  }
+
   async createUser(insertUser: InsertUser): Promise<User> {
     const id = this.userId++;
     const now = new Date();
@@ -226,6 +252,99 @@ export class MemStorage implements IStorage {
     
     this.users.set(userId, updatedUser);
     return updatedUser;
+  }
+
+  async updateUserTier(userId: number, tier: string): Promise<User> {
+    return this.updateUserPlan(userId, { tier });
+  }
+
+  async updateUserPlan(userId: number, plan: { tier?: string; status?: string }): Promise<User> {
+    const user = await this.getUser(userId);
+    if (!user) throw new Error(`User with ID ${userId} not found`);
+
+    const updatedUser: User = {
+      ...user,
+      ...(plan.tier !== undefined && { tier: plan.tier }),
+      ...(plan.status !== undefined && { subscriptionStatus: plan.status }),
+    };
+    this.users.set(userId, updatedUser);
+    return updatedUser;
+  }
+
+  // Pricing v1: one-time session credits (mem)
+  private sessionCredits = new Map<number, SessionCredit>();
+  private sessionCreditId = 1;
+
+  async listSessionCredits(userId: number): Promise<SessionCredit[]> {
+    return Array.from(this.sessionCredits.values())
+      .filter(credit => credit.userId === userId)
+      .sort((a, b) => (b.createdAt?.getTime() ?? 0) - (a.createdAt?.getTime() ?? 0));
+  }
+
+  async getSessionCreditByCheckoutSessionId(checkoutSessionId: string): Promise<SessionCredit | undefined> {
+    return Array.from(this.sessionCredits.values()).find(
+      credit => credit.stripeCheckoutSessionId === checkoutSessionId,
+    );
+  }
+
+  async getSessionCreditByConversationId(conversationId: number): Promise<SessionCredit | undefined> {
+    return Array.from(this.sessionCredits.values()).find(
+      credit => credit.conversationId === conversationId,
+    );
+  }
+
+  async grantSessionCredit(input: { userId: number; kind: string; stripeCheckoutSessionId: string }): Promise<{ credit: SessionCredit; created: boolean }> {
+    const existing = await this.getSessionCreditByCheckoutSessionId(input.stripeCheckoutSessionId);
+    if (existing) return { credit: existing, created: false };
+
+    const credit: SessionCredit = {
+      id: this.sessionCreditId++,
+      userId: input.userId,
+      kind: input.kind,
+      status: "available",
+      stripeCheckoutSessionId: input.stripeCheckoutSessionId,
+      conversationId: null,
+      aiSpendUsd: 0,
+      createdAt: new Date(),
+      usedAt: null,
+    };
+    this.sessionCredits.set(credit.id, credit);
+    return { credit, created: true };
+  }
+
+  async consumeSessionCredit(creditId: number, userId: number): Promise<SessionCredit | undefined> {
+    const credit = this.sessionCredits.get(creditId);
+    if (!credit || credit.userId !== userId || credit.status !== "available") return undefined;
+    const used: SessionCredit = { ...credit, status: "used", usedAt: new Date() };
+    this.sessionCredits.set(creditId, used);
+    return used;
+  }
+
+  async attachSessionCreditToConversation(creditId: number, conversationId: number): Promise<SessionCredit | undefined> {
+    const credit = this.sessionCredits.get(creditId);
+    if (!credit) return undefined;
+    const attached: SessionCredit = { ...credit, conversationId };
+    this.sessionCredits.set(creditId, attached);
+    return attached;
+  }
+
+  async releaseSessionCredit(creditId: number): Promise<void> {
+    const credit = this.sessionCredits.get(creditId);
+    if (!credit) return;
+    this.sessionCredits.set(creditId, { ...credit, status: "available", usedAt: null, conversationId: null });
+  }
+
+  async addSessionCreditSpend(creditId: number, usd: number): Promise<void> {
+    if (!(usd > 0)) return;
+    const credit = this.sessionCredits.get(creditId);
+    if (!credit) return;
+    this.sessionCredits.set(creditId, { ...credit, aiSpendUsd: credit.aiSpendUsd + usd });
+  }
+
+  async countConversationUserMessages(conversationId: number): Promise<number> {
+    return Array.from(this.messages.values()).filter(
+      message => message.conversationId === conversationId && message.role === "user",
+    ).length;
   }
 
   private usage = new Map<string, { messageCount: number; aiSpendUsd: number }>();
@@ -295,6 +414,7 @@ export class MemStorage implements IStorage {
       title: insertConversation.title ?? "New board session",
       charter: insertConversation.charter ?? null,
       orchestratorState: null,
+      sessionCreditId: insertConversation.sessionCreditId ?? null,
       turnBudget: insertConversation.turnBudget === undefined
         ? 25
         : normalizeTurnBudget(insertConversation.turnBudget) ?? null,
@@ -667,7 +787,7 @@ export class PostgresStorage implements IStorage {
     });
 
     this.db = drizzle(this.pool, {
-      schema: { users, conversations, experts, messages, openQuestions, files, insights, companyProfiles, usageMonthly },
+      schema: { users, conversations, experts, messages, openQuestions, files, insights, companyProfiles, usageMonthly, sessionCredits },
     });
 
     this.sessionStore = new PgSessionStore({
@@ -719,6 +839,11 @@ export class PostgresStorage implements IStorage {
     return result[0];
   }
 
+  async getUserByStripeCustomerId(customerId: string): Promise<User | undefined> {
+    const result = await this.db.select().from(users).where(eq(users.stripeCustomerId, customerId)).limit(1);
+    return result[0];
+  }
+
   async createUser(insertUser: InsertUser): Promise<User> {
     const result = await this.db.insert(users).values(insertUser).returning();
     return result[0];
@@ -742,6 +867,24 @@ export class PostgresStorage implements IStorage {
     const result = await this.db
       .update(users)
       .set({ subscriptionStatus: status })
+      .where(eq(users.id, userId))
+      .returning();
+
+    if (!result[0]) throw new Error(`User with ID ${userId} not found`);
+    return result[0];
+  }
+
+  async updateUserTier(userId: number, tier: string): Promise<User> {
+    return this.updateUserPlan(userId, { tier });
+  }
+
+  async updateUserPlan(userId: number, plan: { tier?: string; status?: string }): Promise<User> {
+    const result = await this.db
+      .update(users)
+      .set({
+        ...(plan.tier !== undefined && { tier: plan.tier }),
+        ...(plan.status !== undefined && { subscriptionStatus: plan.status }),
+      })
       .where(eq(users.id, userId))
       .returning();
 
@@ -774,6 +917,87 @@ export class PostgresStorage implements IStorage {
         target: [usageMonthly.userId, usageMonthly.period],
         set: { aiSpendUsd: sql`${usageMonthly.aiSpendUsd} + ${usd}` },
       });
+  }
+
+  // ── Pricing v1: one-time session credits ──────────────────────────────────
+
+  async listSessionCredits(userId: number): Promise<SessionCredit[]> {
+    return this.db.select().from(sessionCredits)
+      .where(eq(sessionCredits.userId, userId))
+      .orderBy(desc(sessionCredits.createdAt));
+  }
+
+  async getSessionCreditByCheckoutSessionId(checkoutSessionId: string): Promise<SessionCredit | undefined> {
+    const rows = await this.db.select().from(sessionCredits)
+      .where(eq(sessionCredits.stripeCheckoutSessionId, checkoutSessionId))
+      .limit(1);
+    return rows[0];
+  }
+
+  async getSessionCreditByConversationId(conversationId: number): Promise<SessionCredit | undefined> {
+    const rows = await this.db.select().from(sessionCredits)
+      .where(eq(sessionCredits.conversationId, conversationId))
+      .limit(1);
+    return rows[0];
+  }
+
+  async grantSessionCredit(input: { userId: number; kind: string; stripeCheckoutSessionId: string }): Promise<{ credit: SessionCredit; created: boolean }> {
+    // The unique index on stripe_checkout_session_id makes webhook replays a
+    // no-op: the second insert returns no row and we read back the original.
+    const inserted = await this.db.insert(sessionCredits)
+      .values({
+        userId: input.userId,
+        kind: input.kind,
+        status: "available",
+        stripeCheckoutSessionId: input.stripeCheckoutSessionId,
+      })
+      .onConflictDoNothing({ target: sessionCredits.stripeCheckoutSessionId })
+      .returning();
+    if (inserted[0]) return { credit: inserted[0], created: true };
+
+    const existing = await this.getSessionCreditByCheckoutSessionId(input.stripeCheckoutSessionId);
+    if (!existing) throw new Error("Session credit is already recorded but could not be read back.");
+    return { credit: existing, created: false };
+  }
+
+  async consumeSessionCredit(creditId: number, userId: number): Promise<SessionCredit | undefined> {
+    const rows = await this.db.update(sessionCredits)
+      .set({ status: "used", usedAt: new Date() })
+      .where(and(
+        eq(sessionCredits.id, creditId),
+        eq(sessionCredits.userId, userId),
+        eq(sessionCredits.status, "available"),
+      ))
+      .returning();
+    return rows[0];
+  }
+
+  async attachSessionCreditToConversation(creditId: number, conversationId: number): Promise<SessionCredit | undefined> {
+    const rows = await this.db.update(sessionCredits)
+      .set({ conversationId })
+      .where(eq(sessionCredits.id, creditId))
+      .returning();
+    return rows[0];
+  }
+
+  async releaseSessionCredit(creditId: number): Promise<void> {
+    await this.db.update(sessionCredits)
+      .set({ status: "available", usedAt: null, conversationId: null })
+      .where(eq(sessionCredits.id, creditId));
+  }
+
+  async addSessionCreditSpend(creditId: number, usd: number): Promise<void> {
+    if (!(usd > 0)) return;
+    await this.db.update(sessionCredits)
+      .set({ aiSpendUsd: sql`${sessionCredits.aiSpendUsd} + ${usd}` })
+      .where(eq(sessionCredits.id, creditId));
+  }
+
+  async countConversationUserMessages(conversationId: number): Promise<number> {
+    const rows = await this.db.select({ total: count() })
+      .from(messages)
+      .where(and(eq(messages.conversationId, conversationId), eq(messages.role, "user")));
+    return Number(rows[0]?.total ?? 0);
   }
 
   async getUserApiKey(userId: number): Promise<string | null> {

@@ -1,28 +1,25 @@
 /**
  * Tier System Unit Tests
  *
- * Covers:
- *  - isPaidModel() returns true for non-free models
- *  - getTierLimits() returns correct limits per tier
- *  - Expert addition blocked at tier limit (free tier = 3)
- *  - Paid model blocked for free tier
+ * Quorum has no free plan. A stored tier of "free" (or an unknown value) is a
+ * legacy "no plan" account: zero seats, zero messages, no house-key models.
  *
- * Uses vitest. Tests tier logic in isolation.
+ * Covers:
+ *  - isPaidModel() / isFreeModel() slug classification
+ *  - getTierLimits() returns correct limits per plan and no-plan defaults
+ *  - Expert addition blocked at each plan's cap
+ *  - Paid models allowed on paid plans and refused without one
  */
 
 import { describe, it, expect } from "vitest";
-import { isPaidModel, isFreeModel, getTierLimits, TIERS } from "../server/tiers";
+import { isPaidModel, isFreeModel, getTierLimits, TIERS, NO_PLAN_LIMITS } from "../server/tiers";
 
 describe("Tier System", () => {
-  // ─────────────────────────────────────────────────────────────────
-  // isPaidModel
-  // ─────────────────────────────────────────────────────────────────
-
   describe("isPaidModel()", () => {
     it("returns true for non-free models", () => {
-      expect(isPaidModel("deepseek/deepseek-v3")).toBe(true);
-      expect(isPaidModel("anthropic/claude-3.5-sonnet")).toBe(true);
-      expect(isPaidModel("openai/gpt-4o")).toBe(true);
+      expect(isPaidModel("deepseek/deepseek-v4.1-flash")).toBe(true);
+      expect(isPaidModel("anthropic/claude-sonnet-5.5")).toBe(true);
+      expect(isPaidModel("openai/gpt-6-luna")).toBe(true);
       expect(isPaidModel("local/llama3.1")).toBe(true);
     });
 
@@ -36,10 +33,6 @@ describe("Tier System", () => {
     });
   });
 
-  // ─────────────────────────────────────────────────────────────────
-  // isFreeModel (complementary)
-  // ─────────────────────────────────────────────────────────────────
-
   describe("isFreeModel()", () => {
     it("returns true for models ending with :free", () => {
       expect(isFreeModel("deepseek/deepseek-v3:free")).toBe(true);
@@ -47,22 +40,19 @@ describe("Tier System", () => {
     });
 
     it("returns false for paid models", () => {
-      expect(isFreeModel("anthropic/claude-3.5-sonnet")).toBe(false);
-      expect(isFreeModel("openai/gpt-4o")).toBe(false);
+      expect(isFreeModel("anthropic/claude-sonnet-5.5")).toBe(false);
+      expect(isFreeModel("openai/gpt-6-luna")).toBe(false);
     });
   });
 
-  // ─────────────────────────────────────────────────────────────────
-  // getTierLimits
-  // ─────────────────────────────────────────────────────────────────
-
   describe("getTierLimits()", () => {
-    it("returns correct limits for free tier", () => {
+    it("treats a stored 'free' tier as no plan", () => {
       const limits = getTierLimits("free");
-      expect(limits.maxExperts).toBe(3);
-      expect(limits.maxMessages).toBe(100);
+      expect(limits).toMatchObject(NO_PLAN_LIMITS);
+      expect(limits.maxExperts).toBe(0);
+      expect(limits.maxMessages).toBe(0);
       expect(limits.allowPaidModels).toBe(false);
-      expect(limits.name).toBe("Free");
+      expect(limits.name).toBe("No plan");
     });
 
     it("returns correct limits for pro tier", () => {
@@ -70,7 +60,17 @@ describe("Tier System", () => {
       expect(limits.maxExperts).toBe(8);
       expect(limits.maxMessages).toBe(1000);
       expect(limits.allowPaidModels).toBe(true);
-      expect(limits.name).toBe("Pro");
+      expect(limits.allowFrontierModels).toBe(false);
+      expect(limits.name).toBe("Executive");
+    });
+
+    it("returns correct limits for boardroom tier", () => {
+      const limits = getTierLimits("boardroom");
+      expect(limits.maxExperts).toBe(12);
+      expect(limits.maxMessages).toBe(3000);
+      expect(limits.allowPaidModels).toBe(true);
+      expect(limits.allowFrontierModels).toBe(true);
+      expect(limits.name).toBe("Boardroom");
     });
 
     it("returns correct limits for enterprise tier", () => {
@@ -81,134 +81,76 @@ describe("Tier System", () => {
       expect(limits.name).toBe("Enterprise");
     });
 
-    it("defaults to free tier for unknown tier names", () => {
+    it("defaults unknown tier names to no plan", () => {
       const limits = getTierLimits("nonexistent");
-      expect(limits.maxExperts).toBe(3);
+      expect(limits.maxExperts).toBe(0);
       expect(limits.allowPaidModels).toBe(false);
-      expect(limits.name).toBe("Free");
+      expect(limits.name).toBe("No plan");
     });
 
     it("returns a copy (mutation-safe)", () => {
-      const limits = getTierLimits("free");
+      const limits = getTierLimits("pro");
       limits.maxExperts = 999;
-      const fresh = getTierLimits("free");
-      expect(fresh.maxExperts).toBe(3);
+      const fresh = getTierLimits("pro");
+      expect(fresh.maxExperts).toBe(8);
     });
   });
 
-  // ─────────────────────────────────────────────────────────────────
-  // Tier constants
-  // ─────────────────────────────────────────────────────────────────
-
   describe("TIERS constant", () => {
-    it("has exactly three tiers", () => {
+    it("has exactly three paid tiers and no free entry", () => {
       expect(Object.keys(TIERS)).toHaveLength(3);
-      expect(TIERS).toHaveProperty("free");
+      expect(TIERS).not.toHaveProperty("free");
       expect(TIERS).toHaveProperty("pro");
+      expect(TIERS).toHaveProperty("boardroom");
       expect(TIERS).toHaveProperty("enterprise");
     });
 
-    it("free tier has lower limits than pro", () => {
-      expect(TIERS.free.maxExperts).toBeLessThan(TIERS.pro.maxExperts);
-      expect(TIERS.free.maxMessages).toBeLessThan(TIERS.pro.maxMessages);
-      expect(TIERS.free.allowPaidModels).toBe(false);
-      expect(TIERS.pro.allowPaidModels).toBe(true);
+    it("boardroom has more seats and messages than pro, and frontier access", () => {
+      expect(TIERS.boardroom.maxExperts).toBeGreaterThan(TIERS.pro.maxExperts);
+      expect(TIERS.boardroom.maxMessages).toBeGreaterThan(TIERS.pro.maxMessages);
+      expect(TIERS.pro.allowFrontierModels).toBe(false);
+      expect(TIERS.boardroom.allowFrontierModels).toBe(true);
     });
   });
 
-  // ─────────────────────────────────────────────────────────────────
-  // Business rule: expert addition blocked at tier limit
-  // ─────────────────────────────────────────────────────────────────
-
   describe("Expert limit enforcement (business rule)", () => {
-    it("blocks expert addition when free tier limit (3) is reached", () => {
-      const currentExperts = 3;
+    it("blocks any expert addition without a plan", () => {
+      const currentExperts = 0;
       const limits = getTierLimits("free");
-      const canAdd = currentExperts < limits.maxExperts;
-      expect(canAdd).toBe(false);
-    });
-
-    it("allows expert addition when under free tier limit", () => {
-      const currentExperts = 2;
-      const limits = getTierLimits("free");
-      const canAdd = currentExperts < limits.maxExperts;
-      expect(canAdd).toBe(true);
+      expect(currentExperts < limits.maxExperts).toBe(false);
     });
 
     it("allows up to 8 experts for pro tier", () => {
       const limits = getTierLimits("pro");
       expect(limits.maxExperts).toBe(8);
-      const canAddAt7 = 7 < limits.maxExperts;
-      const canAddAt8 = 8 < limits.maxExperts;
-      expect(canAddAt7).toBe(true);
-      expect(canAddAt8).toBe(false);
+      expect(7 < limits.maxExperts).toBe(true);
+      expect(8 < limits.maxExperts).toBe(false);
+    });
+
+    it("allows up to 12 experts for boardroom tier", () => {
+      const limits = getTierLimits("boardroom");
+      expect(limits.maxExperts).toBe(12);
+      expect(11 < limits.maxExperts).toBe(true);
+      expect(12 < limits.maxExperts).toBe(false);
     });
 
     it("allows many experts for enterprise tier", () => {
       const limits = getTierLimits("enterprise");
       expect(limits.maxExperts).toBe(999);
-      const canAddAt100 = 100 < limits.maxExperts;
-      expect(canAddAt100).toBe(true);
+      expect(100 < limits.maxExperts).toBe(true);
     });
   });
 
-  // ─────────────────────────────────────────────────────────────────
-  // Business rule: paid model blocked for free tier
-  // ─────────────────────────────────────────────────────────────────
-
   describe("Paid model blocking (business rule)", () => {
-    it("blocks paid models for free tier users", () => {
-      const modelId = "anthropic/claude-3.5-sonnet";
+    it("blocks paid models without a plan", () => {
       const limits = getTierLimits("free");
-      const isPaid = isPaidModel(modelId);
-      const allowed = limits.allowPaidModels || !isPaid;
-      expect(isPaid).toBe(true);
-      expect(allowed).toBe(false);
+      expect(limits.allowPaidModels).toBe(false);
     });
 
-    it("allows free models for free tier users", () => {
-      const modelId = "deepseek/deepseek-v3:free";
-      const limits = getTierLimits("free");
-      const isPaid = isPaidModel(modelId);
-      const allowed = limits.allowPaidModels || !isPaid;
-      expect(isPaid).toBe(false);
-      expect(allowed).toBe(true);
-    });
-
-    it("allows paid models for pro tier users", () => {
-      const modelId = "anthropic/claude-3.5-sonnet";
-      const limits = getTierLimits("pro");
-      const isPaid = isPaidModel(modelId);
-      const allowed = limits.allowPaidModels || !isPaid;
-      expect(isPaid).toBe(true);
-      expect(allowed).toBe(true);
-    });
-
-    it("allows paid models for enterprise tier users", () => {
-      const modelId = "openai/gpt-4o";
-      const limits = getTierLimits("enterprise");
-      const isPaid = isPaidModel(modelId);
-      const allowed = limits.allowPaidModels || !isPaid;
-      expect(isPaid).toBe(true);
-      expect(allowed).toBe(true);
-    });
-
-    it("blocks all non-free models for free tier regardless of provider", () => {
-      const paidModels = [
-        "deepseek/deepseek-v3",
-        "anthropic/claude-3.5-sonnet",
-        "openai/gpt-4o",
-        "google/gemini-pro",
-        "meta/llama-3.1-70b",
-      ];
-      const limits = getTierLimits("free");
-
-      for (const modelId of paidModels) {
-        const isPaid = isPaidModel(modelId);
-        const allowed = limits.allowPaidModels || !isPaid;
-        expect(isPaid).toBe(true);
-        expect(allowed).toBe(false);
-      }
+    it("allows paid models for pro and boardroom plans", () => {
+      expect(getTierLimits("pro").allowPaidModels).toBe(true);
+      expect(getTierLimits("boardroom").allowPaidModels).toBe(true);
+      expect(getTierLimits("enterprise").allowPaidModels).toBe(true);
     });
   });
 });
